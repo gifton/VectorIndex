@@ -127,97 +127,104 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         return best >= 0 ? best : nil
     }
 
-    // MARK: - Lloyd's KMeans (CPU)
+    // MARK: - Lloyd's KMeans using Kernel #12
     private func kmeans(centroids initial: [[Float]], maxIterations: Int) async throws -> [[Float]] {
         precondition(!initial.isEmpty)
-        var cents = initial
-        let k = cents.count
+        let k = initial.count
         let d = dimension
-        // Prepare arrays for sums and counts
-        var changed = true
-        var iter = 0
-        var assignments: [String:Int] = [:] // id -> centroid idx
-        while changed && iter < maxIterations {
-            iter += 1
-            changed = false
-            var sums = Array(repeating: Array(repeating: Float(0), count: d), count: k)
-            var counts = Array(repeating: 0, count: k)
+        let items: [[Float]] = store.map { $0.value.0 }
 
-            // Assignment step
-            for (id, (vec, _)) in store {
-                var best = 0
-                var bestD = Float.infinity
-                for (i, c) in cents.enumerated() {
-                    let dist = distance(vec, c, metric: metric)
-                    if dist < bestD { bestD = dist; best = i }
-                }
-                if assignments[id] != best { assignments[id] = best; changed = true }
-                // Accumulate
-                var sum = sums[best]
-                for j in 0..<d { sum[j] += vec[j] }
-                sums[best] = sum
-                counts[best] += 1
-            }
+        // Flatten data for kernel
+        let flatData = items.flatMap { $0 }
+        var flatCentroids = initial.flatMap { $0 }
 
-            // Update step
-            for i in 0..<k {
-                if counts[i] > 0 {
-                    var newc = cents[i]
-                    let inv = 1.0 / Float(counts[i])
-                    for j in 0..<d { newc[j] = sums[i][j] * inv }
-                    cents[i] = newc
-                } else {
-                    // Reseed empty centroid with the point having max error (farthest from its nearest centroid)
-                    var bestVec: [Float]? = nil
-                    var bestErr: Float = -Float.infinity
-                    for (_, (vec, _)) in store {
-                        var minD = Float.infinity
-                        for c in cents { let dd = distance(vec, c, metric: metric); if dd < minD { minD = dd } }
-                        if minD > bestErr { bestErr = minD; bestVec = vec }
-                    }
-                    if let v = bestVec { cents[i] = v }
-                }
-            }
+        // Configure mini-batch k-means
+        let cfg = KMeansMBConfig(
+            algo: .lloydMiniBatch,
+            batchSize: min(1024, items.count),  // Adaptive batch size
+            epochs: maxIterations,
+            subsampleN: 0,  // Use all data
+            tol: 1e-4,
+            decay: 0.01,
+            seed: 42,
+            streamID: 0,
+            prefetchDistance: 8,
+            layout: .aos,
+            aosoaRegisterBlock: 0,
+            computeAssignments: false
+        )
+
+        // Run kernel
+        let status = kmeans_minibatch_f32(
+            x: flatData,
+            n: Int64(items.count),
+            d: d,
+            kc: k,
+            initCentroids: flatCentroids,
+            cfg: cfg,
+            centroidsOut: &flatCentroids,
+            assignOut: nil,
+            statsOut: nil
+        )
+
+        guard status == .success else {
+            throw VectorError(.operationFailed)
         }
+
+        // Reshape flat centroids to [[Float]]
+        var cents: [[Float]] = []
+        cents.reserveCapacity(k)
+        for i in 0..<k {
+            let start = i * d
+            let end = start + d
+            cents.append(Array(flatCentroids[start..<end]))
+        }
+
         return cents
     }
 
-    // Seeded k‑means++ (D^2) sampling seeding
+    // Seeded k-means++ (D²) sampling using Kernel #11
     private func kmeansPlusPlusInitRandom(k: Int, seed: UInt64) -> [[Float]] {
         precondition(!store.isEmpty)
         let d = dimension
+        let items: [[Float]] = store.map { $0.value.0 }
+        let flatData = items.flatMap { $0 }
+
+        // Allocate output buffer
+        var flatCentroids = [Float](repeating: 0, count: k * d)
+
+        // Use Kernel #11 for seeding
+        let cfg = KMeansSeedConfig(
+            algorithm: .plusPlus,
+            k: k,
+            sampleSize: 0,
+            rngSeed: seed,
+            rngStreamID: 0,
+            strictFP: false,
+            prefetchDistance: 2,
+            oversamplingFactor: 2,
+            rounds: 5
+        )
+
+        _ = kmeansPlusPlusSeed(
+            data: flatData,
+            count: items.count,
+            dimension: d,
+            k: k,
+            config: cfg,
+            centroidsOut: &flatCentroids,
+            chosenIndicesOut: nil
+        )
+
+        // Reshape flat centroids to [[Float]]
         var cents: [[Float]] = []
         cents.reserveCapacity(k)
-        let items: [[Float]] = store.map { $0.value.0 }
-        struct RNG { var s: UInt64; mutating func next() -> UInt64 { s = 2862933555777941757 &* s &+ 3037000493; return s }; mutating func uniform() -> Float { Float(next() >> 11) / Float(1 << 53) } }
-        var rng = RNG(s: seed == 0 ? 1 : seed)
-        let firstIdx = min(Int(rng.uniform() * Float(items.count)), max(0, items.count-1))
-        cents.append(items[firstIdx])
-        while cents.count < k && cents.count < items.count {
-            var d2 = Array(repeating: Float(0), count: items.count)
-            var total: Float = 0
-            for i in 0..<items.count {
-                var minD = Float.infinity
-                for c in cents { let dist = distance(items[i], c, metric: metric); if dist < minD { minD = dist } }
-                let val = minD * minD
-                d2[i] = val
-                total += val
-            }
-            if total == 0 { break }
-            let r = rng.uniform() * total
-            var csum: Float = 0
-            var chosen = 0
-            for i in 0..<d2.count { csum += d2[i]; if r <= csum { chosen = i; break } }
-            if !cents.contains(where: { $0.elementsEqual(items[chosen]) }) {
-                cents.append(items[chosen])
-            } else {
-                var bestI = 0; var bestV = -Float.infinity
-                for i in 0..<d2.count { if d2[i] > bestV && !cents.contains(where: { $0.elementsEqual(items[i]) }) { bestV = d2[i]; bestI = i } }
-                cents.append(items[bestI])
-            }
+        for i in 0..<k {
+            let start = i * d
+            let end = start + d
+            cents.append(Array(flatCentroids[start..<end]))
         }
-        while cents.count < k { cents.append(cents.last ?? items.first!) }
-        for i in 0..<cents.count { if cents[i].count != d { cents[i] = Array(repeating: 0, count: d) } }
+
         return cents
     }
 

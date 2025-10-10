@@ -14,7 +14,7 @@ func distance(_ a: [Float], _ b: [Float], metric: SupportedDistanceMetric) -> Fl
     case .euclidean:
         let d2 = a.withUnsafeBufferPointer { ab in
             b.withUnsafeBufferPointer { bb in
-                FloatSIMD.distanceSquared(ab.baseAddress!, bb.baseAddress!, count: ab.count)
+                SwiftFloatSIMDProvider.distanceSquared(ab.baseAddress!, bb.baseAddress!, count: ab.count)
             }
         }
         return sqrt(d2)
@@ -24,9 +24,9 @@ func distance(_ a: [Float], _ b: [Float], metric: SupportedDistanceMetric) -> Fl
         var bmag2: Float = 0
         a.withUnsafeBufferPointer { ab in
             b.withUnsafeBufferPointer { bb in
-                dot = FloatSIMD.dot(ab.baseAddress!, bb.baseAddress!, count: ab.count)
-                amag2 = FloatSIMD.sumOfSquares(ab.baseAddress!, count: ab.count)
-                bmag2 = FloatSIMD.sumOfSquares(bb.baseAddress!, count: bb.count)
+                dot = SwiftFloatSIMDProvider.dot(ab.baseAddress!, bb.baseAddress!, count: ab.count)
+                amag2 = SwiftFloatSIMDProvider.sumOfSquares(ab.baseAddress!, count: ab.count)
+                bmag2 = SwiftFloatSIMDProvider.sumOfSquares(bb.baseAddress!, count: bb.count)
             }
         }
         let denom = sqrt(amag2 * bmag2)
@@ -36,7 +36,7 @@ func distance(_ a: [Float], _ b: [Float], metric: SupportedDistanceMetric) -> Fl
     case .dotProduct:
         let d = a.withUnsafeBufferPointer { ab in
             b.withUnsafeBufferPointer { bb in
-                FloatSIMD.dot(ab.baseAddress!, bb.baseAddress!, count: ab.count)
+                SwiftFloatSIMDProvider.dot(ab.baseAddress!, bb.baseAddress!, count: ab.count)
             }
         }
         return -d
@@ -46,8 +46,8 @@ func distance(_ a: [Float], _ b: [Float], metric: SupportedDistanceMetric) -> Fl
             b.withUnsafeBufferPointer { bb in
                 var diff = [Float](repeating: 0, count: ab.count)
                 return diff.withUnsafeMutableBufferPointer { db in
-                    FloatSIMD.subtract(ab.baseAddress!, bb.baseAddress!, result: db.baseAddress!, count: ab.count)
-                    return FloatSIMD.sumOfMagnitudes(db.baseAddress!, count: db.count)
+                    SwiftFloatSIMDProvider.subtract(ab.baseAddress!, bb.baseAddress!, result: db.baseAddress!, count: ab.count)
+                    return SwiftFloatSIMDProvider.sumOfMagnitudes(db.baseAddress!, count: db.count)
                 }
             }
         }
@@ -58,8 +58,8 @@ func distance(_ a: [Float], _ b: [Float], metric: SupportedDistanceMetric) -> Fl
             b.withUnsafeBufferPointer { bb in
                 var diff = [Float](repeating: 0, count: ab.count)
                 return diff.withUnsafeMutableBufferPointer { db in
-                    FloatSIMD.subtract(ab.baseAddress!, bb.baseAddress!, result: db.baseAddress!, count: ab.count)
-                    return FloatSIMD.maximumMagnitude(db.baseAddress!, count: db.count)
+                    SwiftFloatSIMDProvider.subtract(ab.baseAddress!, bb.baseAddress!, result: db.baseAddress!, count: ab.count)
+                    return SwiftFloatSIMDProvider.maximumMagnitude(db.baseAddress!, count: db.count)
                 }
             }
         }

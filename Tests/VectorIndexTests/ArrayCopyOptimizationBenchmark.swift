@@ -148,7 +148,7 @@ final class ArrayCopyOptimizationBenchmark: XCTestCase {
         
         // Insert vectors
         for i in 0..<vectorCount {
-            let vector = (0..<dimension).map { Float.random(in: 0...1) }
+            let vector = (0..<dimension).map { _ in Float.random(in: 0...1) }
             try await index.insert(id: "vec\(i)", vector: vector, metadata: nil)
         }
         

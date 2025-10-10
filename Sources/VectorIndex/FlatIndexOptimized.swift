@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import Darwin
 import VectorCore
 
 public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
@@ -23,6 +24,10 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
     
     // Track deleted offsets for reuse
     private var freeOffsets: Set<Int> = []
+
+    // Optional fused-cosine norms cache (lifetime-bound to this index)
+    private var cosineNormCache: IndexOps.Support.Norms.NormCache? = nil
+    private var cosineNormsHandle: IndexOps.Scoring.ScoreBlock.CosineNormsHandle? = nil
     
     public var count: Int { idToOffset.count }
     
@@ -98,12 +103,21 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         vectorStorage = newStorage
         idToOffset = newIdToOffset
         freeOffsets.removeAll()
+
+        // Invalidate cosine norm cache after compaction (layout changed)
+        cosineNormCache = nil
+        cosineNormsHandle = nil
     }
     
     public func search(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
+        }
+
+        // Fast path: if storage is compact/contiguous AoS and no filter, use microkernels
+        if filter == nil, let fast = fastSearchWithMicrokernels(query: query, k: k) {
+            return fast
         }
         
         var results: [(VectorID, Float)] = []
@@ -167,6 +181,8 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         idToOffset.removeAll(keepingCapacity: true)
         idToMetadata.removeAll(keepingCapacity: true)
         freeOffsets.removeAll()
+        cosineNormCache = nil
+        cosineNormsHandle = nil
     }
     
     public func statistics() async -> IndexStats {
@@ -203,7 +219,11 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         if let metadata = metadata {
             idToMetadata[id] = metadata
         }
-        
+
+        // Invalidate cosine cache on vector updates
+        cosineNormCache = nil
+        cosineNormsHandle = nil
+
         return true
     }
     
@@ -211,6 +231,9 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         for id in ids {
             try await remove(id: id)
         }
+        // Invalidate cosine cache on removals
+        cosineNormCache = nil
+        cosineNormsHandle = nil
     }
     
     // MARK: - Persistence
@@ -250,6 +273,146 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
     
     public func compact() async throws {
         try await optimize()
+    }
+}
+
+// MARK: - Microkernel fast path integration
+extension FlatIndexOptimized {
+    /// Attempt a fast search using microkernels when storage is compact and contiguous.
+    /// Falls back by throwing if layout isn't suitable.
+    fileprivate func fastSearchWithMicrokernels(query: [Float], k: Int) -> [SearchResult]? {
+        // Storage must be fully compact: no holes and contiguous offsets
+        guard freeOffsets.isEmpty, idToOffset.count > 0 else { return nil }
+        guard vectorStorage.count == idToOffset.count * dimension else { return nil }
+
+        // Only support metrics that map directly to kernels for now
+        guard metric == .euclidean || metric == .dotProduct || metric == .cosine else { return nil }
+
+        // IDs sorted by increasing storage offset so row index matches output order
+        let sorted = idToOffset.sorted { $0.value < $1.value }
+        // Validate contiguity
+        if let first = sorted.first?.value, first != 0 { return nil }
+        for i in 1..<sorted.count {
+            if sorted[i].value != sorted[i-1].value + dimension { return nil }
+        }
+
+        var distances = [Float](repeating: 0, count: sorted.count)
+        query.withUnsafeBufferPointer { qp in
+            vectorStorage.withUnsafeBufferPointer { xbp in
+                guard let qptr = qp.baseAddress, let xbptr = xbp.baseAddress else { return }
+                let norms = (metric == .cosine) ? cosineNormsHandle : nil
+                IndexOps.Scoring.ScoreBlock.run(q: qptr, xb: xbptr, n: sorted.count, d: dimension, metric: metric, out: &distances, cosineNorms: norms)
+                // Convert scores to distances as expected by API
+                switch metric {
+                case .euclidean:
+                    // distances currently hold L2^2, sqrt after top-K build
+                    break
+                case .dotProduct:
+                    for i in 0..<distances.count { distances[i] = -distances[i] }
+                case .cosine:
+                    for i in 0..<distances.count { distances[i] = 1.0 - distances[i] }
+                default:
+                    break
+                }
+            }
+        }
+
+        // Use Top-K selection instead of full sort
+        var idsIdx = [Int32](repeating: 0, count: sorted.count)
+        for i in 0..<sorted.count { idsIdx[i] = Int32(i) }
+
+        // Select ordering on raw scores produced by ScoreBlock:
+        // - Euclidean: L2^2 (smaller is better) => .min
+        // - DotProduct: dot (larger is better)   => .max (do NOT negate here)
+        // - Cosine: similarity in [-1,1] (larger is better) => .max (convert to distance on output)
+        let ordering = IndexOps.Selection.ordering(for: metric)
+        let heap = idsIdx.withUnsafeBufferPointer { ip -> IndexOps.Selection.TopKHeap in
+            distances.withUnsafeBufferPointer { sp in
+                return IndexOps.Selection.selectTopK(
+                    scores: sp.baseAddress!,
+                    ids: ip.baseAddress!,
+                    count: sorted.count,
+                    k: k,
+                    ordering: ordering
+                )
+            }
+        }
+
+        var h = heap
+        let merged = h.extractSorted() // best→worst
+        h.deallocate()
+
+        // Map indices back to external IDs and convert to API distance semantics
+        var results: [SearchResult] = []
+        results.reserveCapacity(merged.count)
+        for (score, idx32) in merged {
+            let idx = Int(idx32)
+            guard idx >= 0 && idx < sorted.count else { continue }
+            let id = sorted[idx].key
+            switch metric {
+            case .euclidean:
+                results.append(SearchResult(id: id, score: sqrt(score)))
+            case .dotProduct:
+                results.append(SearchResult(id: id, score: -score))
+            case .cosine:
+                results.append(SearchResult(id: id, score: 1.0 - score))
+            default:
+                results.append(SearchResult(id: id, score: score))
+            }
+            if results.count == k { break }
+        }
+        return results
+    }
+}
+
+// MARK: - Cosine fused norms adapter (example wiring)
+extension FlatIndexOptimized {
+    /// Build and enable a fused-cosine inverse-norm cache for the current storage layout.
+    /// Requires compact, contiguous AoS layout (same preconditions as the microkernel fast path).
+    /// On success, cosine fast path will use a fused single-pass kernel.
+    public func enableCosineFusedNormCache(dtype: IndexOps.Support.Norms.NormDType = .float16) async throws {
+        guard metric == .cosine else { return }
+        // Require compact contiguous storage
+        guard freeOffsets.isEmpty, idToOffset.count > 0 else { return }
+        guard vectorStorage.count == idToOffset.count * dimension else { return }
+
+        var nc = IndexOps.Support.Norms.NormCache(count: idToOffset.count, dimension: dimension, mode: .inv, invDType: dtype, epsilon: 1e-12)
+        nc.allocate()
+        let count = idToOffset.count
+        let dim = dimension
+        let eps = nc.epsilon
+        let invOut = nc.invRaw
+        let dt = dtype
+        vectorStorage.withUnsafeBufferPointer { xbp in
+            guard let src = xbp.baseAddress else { return }
+            // Ensure 64-byte alignment for the source pointer by copying into an aligned scratch buffer.
+            let total = count * dim * MemoryLayout<Float>.stride
+            var raw: UnsafeMutableRawPointer?
+            let rc = posix_memalign(&raw, 64, total)
+            guard rc == 0, let raw = raw else { return }
+            defer { free(raw) }
+            let dst = raw.assumingMemoryBound(to: Float.self)
+            dst.assign(from: src, count: count * dim)
+
+            IndexOps.Support.Norms.normsBuild(
+                vectors: UnsafePointer(dst),
+                count: count,
+                dimension: dim,
+                mode: IndexOps.Support.Norms.NormMode.inv,
+                epsilon: eps,
+                invOut: invOut,
+                sqOut: UnsafeMutablePointer<Float>? (nil),
+                invDType: dt
+            )
+        }
+        cosineNormsHandle = nc.toCosineNormsHandle()
+        cosineNormCache = nc
+    }
+
+    /// Disable fused-cosine norm cache and fall back to two-pass cosine.
+    public func disableCosineFusedNormCache() async {
+        cosineNormCache = nil
+        cosineNormsHandle = nil
     }
 }
 

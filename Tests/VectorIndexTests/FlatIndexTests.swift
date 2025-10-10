@@ -58,9 +58,9 @@ final class FlatIndexTests: XCTestCase {
 
     func testVariousMetrics() async throws {
         // Points in 2D to make metric behavior obvious
-        let a = [1.0, 0.0]
-        let b = [0.0, 1.0]
-        let q = [0.9, 0.1]
+        let a: [Float] = [1.0, 0.0]
+        let b: [Float] = [0.0, 1.0]
+        let q: [Float] = [0.9, 0.1]
 
         // Euclidean
         do {
@@ -102,11 +102,11 @@ final class FlatIndexTests: XCTestCase {
 
 // MARK: - Async throws expectation helper
 extension XCTestCase {
-    func XCTAssertThrowsErrorAsync(_ expression: @autoclosure () async throws -> Void, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) async {
+    /// Expect an async-throwing expression to throw, discarding any return value.
+    func XCTAssertThrowsErrorAsync<T>(_ expression: @autoclosure () async throws -> T, _ message: @autoclosure () -> String = "", file: StaticString = #filePath, line: UInt = #line) async {
         do {
-            try await expression()
+            _ = try await expression()
             XCTFail(message(), file: file, line: line)
         } catch { /* expected */ }
     }
 }
-

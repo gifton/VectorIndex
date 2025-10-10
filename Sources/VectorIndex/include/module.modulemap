@@ -1,0 +1,4 @@
+module CS2RNG {
+    header "../Operations/s_rng_dtype_helpers.h"
+    export *
+}

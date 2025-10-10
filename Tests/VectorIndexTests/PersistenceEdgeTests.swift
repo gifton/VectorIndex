@@ -58,9 +58,9 @@ final class PersistenceEdgeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
         let bad = Data("not json".utf8)
         try bad.write(to: url)
-        await XCTAssertThrowsErrorAsync({ try await FlatIndex.load(from: url) }())
-        await XCTAssertThrowsErrorAsync({ try await IVFIndex.load(from: url) }())
-        await XCTAssertThrowsErrorAsync({ try await HNSWIndex.load(from: url) }())
+        await XCTAssertThrowsErrorAsync(try await FlatIndex.load(from: url))
+        await XCTAssertThrowsErrorAsync(try await IVFIndex.load(from: url))
+        await XCTAssertThrowsErrorAsync(try await HNSWIndex.load(from: url))
     }
 
     func testHNSWCompactReducesDeleted() async throws {
