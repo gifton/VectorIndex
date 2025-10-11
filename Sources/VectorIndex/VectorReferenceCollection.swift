@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import VectorCore  // For VectorID typealias
 
 /// Protocol for collections that provide zero-copy vector access
 public protocol VectorReferenceCollection: Sendable {

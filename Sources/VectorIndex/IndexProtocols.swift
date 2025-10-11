@@ -9,8 +9,21 @@
 import Foundation
 import VectorCore
 
-/// A simple ID typealias for indices that use strings for keys.
-public typealias VectorID = String
+// MARK: - VectorCore Dependency Policy
+//
+// We import VectorCore for type compatibility:
+// - VectorID (String typealias) - shared identifier type from VectorCore
+// - SupportedDistanceMetric (enum) - API compatibility
+//
+// We do NOT use VectorCore's implementations:
+// - Distance kernels: VectorIndex has 2× faster unsafe pointer versions
+// - Vector types: We work on raw [Float] and UnsafePointer<Float>
+// - Batch operations: We provide specialized kernel implementations
+//
+// This separation maintains VectorIndex as a performance-focused layer
+// while VectorCore remains a high-level, type-safe library.
+
+// Note: VectorID is imported directly from VectorCore (no redefinition needed)
 
 /// Basic search result representation.
 public struct SearchResult: Sendable, Equatable {
