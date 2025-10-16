@@ -53,7 +53,7 @@ public struct L2SqrTelemetry {
 }
 
 public enum L2SqrTelemetryRecorder {
-    nonisolated(unsafe) public static var sink: ((L2SqrTelemetry) -> Void)?
+    public nonisolated(unsafe) static var sink: ((L2SqrTelemetry) -> Void)?
     @inline(__always) public static func record(_ t: L2SqrTelemetry) { sink?(t) }
 }
 

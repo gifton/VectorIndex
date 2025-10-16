@@ -21,6 +21,14 @@ let package = Package(
     ],
     targets: [
         .target(
+            name: "CAtomicsShim",
+            publicHeadersPath: "include"
+        ),
+        .target(
+            name: "CPQEncode",
+            publicHeadersPath: "include"
+        ),
+        .target(
             name: "CS2RNG",
             publicHeadersPath: "include",
             cSettings: [
@@ -30,8 +38,16 @@ let package = Package(
         .target(
             name: "VectorIndex",
             dependencies: [
+                "CAtomicsShim",
+                "CPQEncode",
                 "CS2RNG",
                 .product(name: "VectorCore", package: "VectorCore")
+            ],
+            exclude: [
+                // Exclude docs and scratch files relative to Sources/VectorIndex
+                "Kernels/ResidualKernel_FINAL_EVALUATION.md",
+                "Kernels/ResidualKernel_INTEGRATION_NOTES.md",
+                "Kernels/PQTrain.swift.new"
             ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
@@ -63,6 +79,10 @@ let package = Package(
         .testTarget(
             name: "VectorIndexTests",
             dependencies: ["VectorIndex"],
+            exclude: [
+                // Exclude temporary scratch tests (relative to Tests/VectorIndexTests)
+                "PQTrainTests.swift.tmp"
+            ],
             swiftSettings: [ .enableExperimentalFeature("StrictConcurrency") ]
         ),
     ]

@@ -414,6 +414,7 @@ public func pq_lut_residual_l2_f32(
 
 /// Build LUTs for a batch of queries: luts[qi][j*ks + k]. Parallelizes over queries
 /// if `opts.numThreads > 1`.
+@preconcurrency
 @inlinable
 public func pq_lut_batch_l2_f32(
     queries: UnsafePointer<Float>,                 // [nQ × d]

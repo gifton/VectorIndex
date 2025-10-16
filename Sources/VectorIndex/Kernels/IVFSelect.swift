@@ -238,6 +238,7 @@ public func ivf_select_beam_f32(
 ///   - opts: Optional configuration
 ///   - listIDsOut: Output list IDs [b × nprobe], row-major per query
 ///   - listScoresOut: Optional output scores [b × nprobe]
+@preconcurrency
 public func ivf_select_nprobe_batch_f32(
     Q: [Float],
     b: Int,
@@ -263,21 +264,23 @@ public func ivf_select_nprobe_batch_f32(
         listScoresOut = [Float](repeating: .nan, count: b * nprobe)
     }
 
-    // Process queries in parallel (no per-query copies!)
-    Q.withUnsafeBufferPointer { QPtr in
-        centroids.withUnsafeBufferPointer { centsPtr in
-            DispatchQueue.concurrentPerform(iterations: b) { i in
-                let qOffset = i * d
-                let outOffset = i * nprobe
+   
 
-                // Direct pointer slicing - no allocation!
-                let qSlice = UnsafeBufferPointer(
-                    start: QPtr.baseAddress! + qOffset,
-                    count: d
-                )
+    DispatchQueue.concurrentPerform(iterations: b) { i in
+        
+        // Prepare local output buffers to avoid mutating inout outputs inside concurrent closures.
+        var idsAll = listIDsOut // size b * nprobe (ensured above)
+        var scoresAll = listScoresOut // optional scores
+        let qOffset = i * d
+        let outOffset = i * nprobe
+
+        Q.withUnsafeBufferPointer { QPtr in
+            centroids.withUnsafeBufferPointer { centsPtr in
+                // Direct pointer slicing - no allocation
+                let qSlice = UnsafeBufferPointer(start: QPtr.baseAddress! + qOffset, count: d)
 
                 var localIDs = [Int32](repeating: -1, count: nprobe)
-                var localScores: [Float]? = listScoresOut != nil ? [Float](repeating: .nan, count: nprobe) : nil
+                var localScores: [Float]? = (scoresAll != nil) ? [Float](repeating: .nan, count: nprobe) : nil
 
                 selectNprobeSingleThread(
                     q: qSlice,
@@ -291,23 +294,19 @@ public func ivf_select_nprobe_batch_f32(
                     listScoresOut: &localScores
                 )
 
-                // Write to batch output (thread-safe: non-overlapping ranges)
+                // Write to local batch output (thread-safe: disjoint ranges per i)
                 for j in 0..<nprobe {
-                    listIDsOut[outOffset + j] = localIDs[j]
-                    if var scores = listScoresOut, let localSc = localScores {
-                        scores[outOffset + j] = localSc[j]
-                        // Note: This is safe because we're in a concurrent perform block
-                        // and each thread writes to disjoint ranges
-                    }
+                    idsAll[outOffset + j] = localIDs[j]
                 }
-                // Copy back scores if needed (awkward Swift limitation with inout)
-                if let localSc = localScores, listScoresOut != nil {
-                    for j in 0..<nprobe {
-                        listScoresOut![outOffset + j] = localSc[j]
-                    }
+                if let localSc = localScores, scoresAll != nil {
+                    for j in 0..<nprobe { scoresAll![outOffset + j] = localSc[j] }
                 }
             }
         }
+        
+        // Copy back to inout outputs
+        listIDsOut = idsAll
+        if listScoresOut != nil { listScoresOut = scoresAll }
     }
 }
 
@@ -355,7 +354,7 @@ private func selectNprobeSingleThread(
 
     // Select top-nprobe using heap-based partial top-k
     let actualK = min(nprobe, kc)
-    let heap: TopKHeap
+    let heap: any TopKHeap
     switch metric {
     case .l2:
         heap = MinHeap(capacity: actualK)
@@ -527,7 +526,7 @@ private func selectBeamSearch(
     }
 
     // 2. Select initial beam (top beamWidth by score)
-    let initialHeap: TopKHeap = (metric == .l2) ? MinHeap(capacity: beamWidth) : MaxHeap(capacity: beamWidth)
+    let initialHeap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: beamWidth) : MaxHeap(capacity: beamWidth)
     for i in 0..<kc {
         let score = scoreBuffer[i]
         if metric == .l2 && score.isInfinite && score > 0 { continue }
@@ -542,7 +541,7 @@ private func selectBeamSearch(
     }
 
     // 3. Result set (priority queue of all discovered candidates)
-    let resultHeap: TopKHeap = (metric == .l2) ? MinHeap(capacity: max(beamWidth, nprobe)) : MaxHeap(capacity: max(beamWidth, nprobe))
+    let resultHeap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: max(beamWidth, nprobe)) : MaxHeap(capacity: max(beamWidth, nprobe))
     for item in beam {
         resultHeap.insert(id: item.id, score: item.score)
     }
@@ -613,6 +612,7 @@ private struct PartitionResult {
     let scores: [Float]
 }
 
+@preconcurrency
 private func partitionAndSelectParallel(
     q: [Float],
     d: Int,
@@ -666,7 +666,7 @@ private func partitionAndSelectParallel(
                 }
 
                 // Select top-k within partition
-                let heap: TopKHeap = (metric == .l2) ? MinHeap(capacity: nprobe) : MaxHeap(capacity: nprobe)
+                let heap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: nprobe) : MaxHeap(capacity: nprobe)
                 for i in 0..<count {
                     let globalID = Int32(start + i)
                     let score = localScores[i]
@@ -705,7 +705,7 @@ private func mergePartitions(
     listScoresOut: inout [Float]?
 ) {
     // K-way merge using heap
-    let heap: TopKHeap = (metric == .l2) ? MinHeap(capacity: nprobe) : MaxHeap(capacity: nprobe)
+    let heap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: nprobe) : MaxHeap(capacity: nprobe)
 
     for partition in partitions {
         for i in 0..<partition.ids.count {
@@ -937,7 +937,9 @@ private final class ScoreBufferPool: @unchecked Sendable {
         defer { lock.unlock() }
 
         if var pool = pools[size], !pool.isEmpty {
-            return pool.removeLast()
+            let buf = pool.removeLast()
+            pools[size] = pool
+            return buf
         }
 
         // Allocate new buffer
@@ -952,8 +954,10 @@ private final class ScoreBufferPool: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
 
-        if pools[size, default: []].count < maxPoolSize {
-            pools[size, default: []].append(buffer)
+        var pool = pools[size] ?? []
+        if pool.count < maxPoolSize {
+            pool.append(buffer)
+            pools[size] = pool
         } else {
             // Pool full: deallocate
             baseAddr.deallocate()

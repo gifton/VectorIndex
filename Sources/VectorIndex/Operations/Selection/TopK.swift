@@ -44,7 +44,7 @@ public extension IndexOps {
             }
         }
         public enum TopKTelemetryRecorder {
-            nonisolated(unsafe) public static var sink: ((TopKTelemetry) -> Void)?
+            public nonisolated(unsafe) static var sink: ((TopKTelemetry) -> Void)?
             @inline(__always) public static func record(_ t: TopKTelemetry) { sink?(t) }
         }
 
@@ -87,7 +87,7 @@ public extension IndexOps {
             }
             @inline(__always) private mutating func _siftUp(from idx: Int) -> Int {
                 guard idx>0 else { return 0 }
-                var sifts=0; var child=idx; var score=scores[child]; var id=ids[child]
+                var sifts=0; var child=idx; let score=scores[child]; let id=ids[child]
                 while child>0 { let parent=(child-1)>>1; let pScore=scores[parent], pId=ids[parent]
                     if ordering.isWorse(score, id, than: pScore, pId) { scores[child]=pScore; ids[child]=pId; child=parent; sifts &+= 1 } else { break }
                 }

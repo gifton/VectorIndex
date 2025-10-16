@@ -127,7 +127,9 @@ final class IVFSelectTests: XCTestCase {
         let centroidNorms = (0..<kc).map { i -> Float in
             let base = i * d
             var normSq: Float = 0
-            vDSP_svesq(centroids[base..<(base+d)], 1, &normSq, vDSP_Length(d))
+            centroids[base..<(base+d)].withUnsafeBufferPointer { ptr in
+                vDSP_svesq(ptr.baseAddress!, 1, &normSq, vDSP_Length(d))
+            }
             return sqrt(max(normSq, 1e-10))
         }
 
@@ -187,7 +189,9 @@ final class IVFSelectTests: XCTestCase {
         let centroidNorms = (0..<kc).map { i -> Float in
             let base = i * d
             var normSq: Float = 0
-            vDSP_svesq(centroids[base..<(base+d)], 1, &normSq, vDSP_Length(d))
+            centroids[base..<(base+d)].withUnsafeBufferPointer { ptr in
+                vDSP_svesq(ptr.baseAddress!, 1, &normSq, vDSP_Length(d))
+            }
             return normSq
         }
 
@@ -315,6 +319,7 @@ final class IVFSelectTests: XCTestCase {
 
         var ids1 = [Int32](repeating: -1, count: nprobe)
         var ids2 = [Int32](repeating: -1, count: nprobe)
+        var nilScores: [Float]? = nil
 
         // Run twice
         ivf_select_nprobe_f32(
@@ -322,7 +327,7 @@ final class IVFSelectTests: XCTestCase {
             metric: .l2, nprobe: nprobe,
             opts: IVFSelectOpts(),
             listIDsOut: &ids1,
-            listScoresOut: nil
+            listScoresOut: &nilScores
         )
 
         ivf_select_nprobe_f32(
@@ -330,7 +335,7 @@ final class IVFSelectTests: XCTestCase {
             metric: .l2, nprobe: nprobe,
             opts: IVFSelectOpts(),
             listIDsOut: &ids2,
-            listScoresOut: nil
+            listScoresOut: &nilScores
         )
 
         // Results must be identical and deterministic (prefer smaller IDs)
@@ -503,13 +508,14 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVectors(n: kc, d: d)
 
         var ids = [Int32](repeating: -1, count: nprobe)
+        var nilScores: [Float]? = nil
 
         ivf_select_nprobe_f32(
             q: q, d: d, centroids: centroids, kc: kc,
             metric: .l2, nprobe: nprobe,
             opts: IVFSelectOpts(),
             listIDsOut: &ids,
-            listScoresOut: nil
+            listScoresOut: &nilScores
         )
 
         // Should return all IDs (in some order)
@@ -557,13 +563,14 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVector(d: d)
 
         var ids = [Int32](repeating: -1, count: nprobe)
+        var nilScores: [Float]? = nil
 
         ivf_select_nprobe_f32(
             q: q, d: d, centroids: centroids, kc: kc,
             metric: .l2, nprobe: nprobe,
             opts: IVFSelectOpts(),
             listIDsOut: &ids,
-            listScoresOut: nil
+            listScoresOut: &nilScores
         )
 
         XCTAssertEqual(ids[0], 0, "Single centroid should be selected")

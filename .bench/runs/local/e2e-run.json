@@ -1,0 +1,82 @@
+{
+  "cases" : [
+    {
+      "buildSeconds" : 0.007292417,
+      "dim" : 64,
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 300,
+      "name" : "Flat",
+      "optimizeSeconds" : 0,
+      "params" : {
+
+      },
+      "q" : 40,
+      "recallAvg" : 1,
+      "searchAvgMs" : 3.054239575000001,
+      "searchP95Ms" : 4.2822499999999994,
+      "throughputQps" : 327.4137393102176
+    },
+    {
+      "buildSeconds" : 4.526194,
+      "dim" : 64,
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 300,
+      "name" : "HNSW",
+      "optimizeSeconds" : 0,
+      "params" : {
+        "efc" : "200",
+        "efs" : "64",
+        "m" : "16"
+      },
+      "q" : 40,
+      "recallAvg" : 1,
+      "searchAvgMs" : 3.9651593249999997,
+      "searchP95Ms" : 6.022833,
+      "throughputQps" : 252.19667560268843
+    },
+    {
+      "buildSeconds" : 0.003719791,
+      "dim" : 64,
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 300,
+      "name" : "IVF",
+      "optimizeSeconds" : 0.72691625,
+      "params" : {
+        "nlist" : "64",
+        "nprobe" : "8"
+      },
+      "q" : 40,
+      "recallAvg" : 0.625,
+      "searchAvgMs" : 1.988918825,
+      "searchP95Ms" : 2.6112919999999997,
+      "throughputQps" : 502.78572832151656
+    }
+  ],
+  "flags" : {
+    "abOnly" : false,
+    "dim" : 64,
+    "efc" : 200,
+    "efs" : 64,
+    "index" : "all",
+    "k" : 10,
+    "m" : 16,
+    "metric" : "euclidean",
+    "n" : 300,
+    "nlist" : 64,
+    "nprobe" : 8,
+    "output" : ".bench\/runs\/local\/e2e-run.json",
+    "progressFormat" : "json",
+    "q" : 40,
+    "seed" : 42
+  },
+  "meta" : {
+    "cpu" : "Apple M2",
+    "device" : "Mac14,7",
+    "memoryGB" : 16,
+    "os" : "macOS 26.0.1",
+    "timestamp" : "2025-10-15T22:52:57Z"
+  }
+}

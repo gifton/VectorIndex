@@ -60,7 +60,7 @@ func runTrial(c: Cfg, q: UnsafePointer<Float>, xb: UnsafePointer<Float>, xbNorm:
 }
 
 func main() {
-    var cfg = parseArgs()
+    let cfg = parseArgs()
     print("L2Sqr microbench — n=\(cfg.n) d=\(cfg.d) trials=\(cfg.trials) threads=\(cfg.threads) algo=\(cfg.algo)")
 
     // Allocate data
@@ -111,4 +111,3 @@ func main() {
 }
 
 main()
-

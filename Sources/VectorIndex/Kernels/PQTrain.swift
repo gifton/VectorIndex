@@ -50,6 +50,7 @@ public struct PQTrainStats {
 }
 
 @discardableResult
+@preconcurrency
 public func pq_train_f32(
     x: [Float],
     n: Int64,
@@ -97,19 +98,20 @@ public func pq_train_f32(
     var perSubspaceResults = [SubspaceResults](repeating: SubspaceResults(), count: m)
 
     // Pre-allocate local copies to avoid capturing inout parameters
-    var localCodebooks = codebooksOut
-    var localNorms = centroidNormsOut
+    _ = codebooksOut
+    _ = centroidNormsOut
 
     let t0 = nowSec()
 
     let group = DispatchGroup()
     let q = cfg.numThreads == 1 ? DispatchQueue(label: "pq.train.serial") :
                                   DispatchQueue(label: "pq.train.concurrent", attributes: .concurrent)
+    let cfgLocal = cfg  // capture immutable copy for concurrent tasks
 
     for j in 0..<m {
         q.async(group: group) {
-            var rng = Xoroshiro128(splitFrom: cfg.seed, streamID: UInt64(cfg.streamID), taskID: UInt64(j))
-            let (idx, ns) = buildSampleIndex(n: n, sampleN: cfg.sampleN, rng: &rng)
+            var rng = Xoroshiro128(splitFrom: cfgLocal.seed, streamID: UInt64(cfgLocal.streamID), taskID: UInt64(j))
+            let (idx, ns) = buildSampleIndex(n: n, sampleN: cfgLocal.sampleN, rng: &rng)
 
             let tInitS = nowSec()
             var Cj = [Float](repeating: 0, count: ks * dsub)
@@ -145,19 +147,19 @@ public func pq_train_f32(
             var iters = 0
             var emptiesFixed = 0
 
-            switch cfg.algo {
+            switch cfgLocal.algo {
             case .minibatch:
                 minibatchKMeansSubspace(
                     x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
                     coarse: coarseCentroids, assign: assignments,
-                    cfg: cfg, rng: &rng, C: &Cj,
+                    cfg: cfgLocal, rng: &rng, C: &Cj,
                     outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
                 )
             case .lloyd:
                 lloydKMeansSubspace(
                     x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
                     coarse: coarseCentroids, assign: assignments,
-                    cfg: cfg, C: &Cj,
+                    cfg: cfgLocal, C: &Cj,
                     outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
                 )
             }
@@ -165,7 +167,7 @@ public func pq_train_f32(
 
             // Compute norms if needed
             var normsJ: [Float]? = nil
-            if cfg.computeCentroidNorms {
+            if cfgLocal.computeCentroidNorms {
                 var norms = [Float](repeating: 0, count: ks)
                 for k in 0..<ks {
                     var s: Float = 0

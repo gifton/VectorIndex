@@ -233,7 +233,7 @@ public func mipsHybridScoreBlock(
     if !storage.r2.isStale, let augBase = storage.vectors {
         // Explicit: augment query, then use L2^2 block
         // (min L2^2 equals max inner-product ranking; squared is fine)
-        var augQRaw: UnsafeMutableRawPointer? = UnsafeMutableRawPointer.allocate(
+        let augQRaw: UnsafeMutableRawPointer? = UnsafeMutableRawPointer.allocate(
             byteCount: storage.paddedDim * MemoryLayout<Float>.stride,
             alignment: 64
         )
@@ -265,7 +265,6 @@ public func mipsHybridScoreBlock(
 
 // MARK: - Helper: SIMD L2 norm (sum of squares)
 
-@usableFromInline
 @inlinable
 internal func l2NormSquaredSIMD(_ x: UnsafePointer<Float>, _ d: Int) -> Float {
     let w = 4
@@ -303,7 +302,6 @@ internal func l2NormSquaredSIMD(_ x: UnsafePointer<Float>, _ d: Int) -> Float {
 
 // MARK: - Helper: SIMD inner product (dot)
 
-@usableFromInline
 @inlinable
 internal func innerProductSIMD(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ d: Int) -> Float {
     let w = 4
@@ -347,7 +345,6 @@ internal func innerProductSIMD(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Flo
 
 /// If your project already includes the L2 microkernel (#01) this shim will
 /// naturally inline to it; otherwise a generic fallback is used.
-@usableFromInline
 @inlinable
 internal func l2sqrBlock_dispatch(
     query: UnsafePointer<Float>,
@@ -366,7 +363,6 @@ internal func l2sqrBlock_dispatch(
     #endif
 }
 
-@usableFromInline
 @inlinable
 internal func generic_l2sqrBlock(
     query q: UnsafePointer<Float>,

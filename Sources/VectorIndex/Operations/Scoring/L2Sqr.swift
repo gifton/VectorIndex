@@ -39,14 +39,14 @@ public extension IndexOps.Scoring {
 
             // MARK: Telemetry (unchanged API for callers in this module)
             public struct Telemetry {
-                nonisolated(unsafe) public static var enabled: Bool = false
-                nonisolated(unsafe) private(set) public static var rowsProcessed: UInt64 = 0
-                nonisolated(unsafe) private(set) public static var bytesRead: UInt64 = 0
-                nonisolated(unsafe) private(set) public static var usedDotFastPath: UInt64 = 0
-                nonisolated(unsafe) private(set) public static var lastD: Int = 0
+                public nonisolated(unsafe) static var enabled: Bool = false
+                public nonisolated(unsafe) private(set) static var rowsProcessed: UInt64 = 0
+                public nonisolated(unsafe) private(set) static var bytesRead: UInt64 = 0
+                public nonisolated(unsafe) private(set) static var usedDotFastPath: UInt64 = 0
+                public nonisolated(unsafe) private(set) static var lastD: Int = 0
 
                 @inline(__always)
-                nonisolated(unsafe) public static func record(rows: Int, d: Int, usedDot: Bool, bytes: UInt64) {
+                public static func record(rows: Int, d: Int, usedDot: Bool, bytes: UInt64) {
                     guard enabled else { return }
                     rowsProcessed &+= UInt64(rows)
                     bytesRead &+= bytes
@@ -54,7 +54,7 @@ public extension IndexOps.Scoring {
                     lastD = d
                 }
 
-                nonisolated(unsafe) public static func reset() {
+                public static func reset() {
                     rowsProcessed = 0
                     bytesRead = 0
                     usedDotFastPath = 0

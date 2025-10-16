@@ -3,6 +3,13 @@ import VectorCore
 @testable import VectorIndex
 
 final class PerformanceBenchmarks: XCTestCase {
+    private let enableBenchmarks: Bool = ProcessInfo.processInfo.environment["RUN_BENCHMARKS"] == "1"
+
+    override func setUpWithError() throws {
+        if !enableBenchmarks {
+            throw XCTSkip("Benchmarks disabled by default. Set RUN_BENCHMARKS=1 to enable.")
+        }
+    }
     
     // Generate random normalized vectors
     func generateVectors(_ count: Int, dimension: Int) -> [[Float]] {

@@ -346,7 +346,7 @@ public extension IndexOps.Scoring {
                 }
             }
             public enum TelemetryRecorder {
-                nonisolated(unsafe) public static var sink: ((Telemetry) -> Void)?
+                public nonisolated(unsafe) static var sink: ((Telemetry) -> Void)?
                 @inline(__always) public static func record(_ t: Telemetry) { sink?(t) }
             }
 

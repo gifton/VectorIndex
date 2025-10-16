@@ -96,7 +96,7 @@ public final class ReservoirAdapter {
 
         batchIDs.withUnsafeBufferPointer { ids in
             batchScores.withUnsafeBufferPointer { scores in
-                reservoir.pushBatch(
+                _ = reservoir.pushBatch(
                     ids: ids.baseAddress!,
                     scores: scores.baseAddress!,
                     count: ids.count,

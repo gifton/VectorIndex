@@ -5,6 +5,13 @@ import Accelerate
 @testable import VectorIndex
 
 final class IVFSelectBenchmarks: XCTestCase {
+    private let enableBenchmarks: Bool = ProcessInfo.processInfo.environment["RUN_BENCHMARKS"] == "1"
+
+    override func setUpWithError() throws {
+        if !enableBenchmarks {
+            throw XCTSkip("Benchmarks disabled by default. Set RUN_BENCHMARKS=1 to enable.")
+        }
+    }
 
     // MARK: - Performance Targets from Spec
 
@@ -521,7 +528,9 @@ final class IVFSelectBenchmarks: XCTestCase {
         (0..<kc).map { i in
             let base = i * d
             var normSq: Float = 0
-            vDSP_svesq(centroids[base..<(base+d)], 1, &normSq, vDSP_Length(d))
+            centroids[base..<(base+d)].withUnsafeBufferPointer { ptr in
+                vDSP_svesq(ptr.baseAddress!, 1, &normSq, vDSP_Length(d))
+            }
             return normSq
         }
     }

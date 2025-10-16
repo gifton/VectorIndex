@@ -338,7 +338,7 @@ extension FlatIndexOptimized {
             }
         }
 
-        var h = heap
+        let h = heap
         let merged = h.extractSorted() // best→worst
         h.deallocate()
 
@@ -392,7 +392,7 @@ extension FlatIndexOptimized {
             guard rc == 0, let raw = raw else { return }
             defer { free(raw) }
             let dst = raw.assumingMemoryBound(to: Float.self)
-            dst.assign(from: src, count: count * dim)
+            dst.update(from: src, count: count * dim)
 
             IndexOps.Support.Norms.normsBuild(
                 vectors: UnsafePointer(dst),

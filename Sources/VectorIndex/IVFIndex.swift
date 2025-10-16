@@ -33,6 +33,21 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     // Local storage for now (CPU baseline)
     private var store: [VectorID: ([Float], [String:String]?)] = [:]
 
+    // Kernel #30 integration (optional)
+    private var kernel30: IVFListHandle? = nil
+    private var kernel30Mmap: IndexMmap? = nil
+    // Kernel #50 integration (ID remap + registry)
+    private var idMap50: IDMap? = nil
+    private var idRegistry: ExternalIDRegistry? = nil
+    // Kernel #30 helpers for IVF-Flat rerank (#40):
+    // Mapping arrays (internalID -> list, offset). Kept in sync during ingestion.
+    private var id2List30: [Int32] = []
+    private var id2Offset30: [Int32] = []
+    // Per-list internalID vectors to enumerate candidates efficiently (list offset -> internalID).
+    private var internalIDsByList30: [[Int64]] = []
+    // If true, mapping arrays cover all existing vectors; false when opening durable containers with preexisting data.
+    private var mappingComplete30: Bool = true
+
     public var count: Int { store.count }
 
     public init(dimension: Int, metric: SupportedDistanceMetric = .euclidean, config: Configuration = .init()) {
@@ -80,6 +95,171 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             try await insert(id: item.id, vector: item.vector, metadata: item.metadata)
         }
         // TODO: bulk assignment
+    }
+
+    // MARK: - Kernel #30 Ingestion (Optional)
+
+    /// Configure Kernel #30 storage. If `durablePath` is provided, opens mmap container and enables durable writes.
+    public func enableKernel30Storage(format: IVFFormat, k_c: Int, m: Int = 0, durablePath: String? = nil, opts inOpts: IVFAppendOpts? = nil) async throws {
+        var opts = inOpts ?? .default
+        opts.format = format
+        if let durablePath {
+            opts.durable = true
+            var mo = MmapOpts(); mo.readOnly = false
+            let mmap = try IndexMmap.open(path: durablePath, opts: mo)
+            self.kernel30Mmap = mmap
+            self.kernel30 = try ivf_create_mmap(k_c: k_c, m: m, d: (format == .flat ? dimension : 0), mmap: mmap, opts: opts)
+            // Attempt to load IDMap from durable container if present
+            if let blob = mmap.readIDMapBlob(), blob.count > 0 {
+                if let loaded = try? deserializeIDMap(blob) {
+                    self.idMap50 = loaded
+                }
+            }
+        } else {
+            opts.durable = false
+            self.kernel30 = try IVFListHandle(k_c: k_c, m: m, d: (format == .flat ? dimension : 0), opts: opts)
+        }
+        // Initialize ID map and registry for #50 if not present
+        if self.idRegistry == nil { self.idRegistry = ExternalIDRegistry() }
+        if self.idMap50 == nil {
+            // Capacity hint: reserve across lists; use a conservative minimum
+            let capHint = max(1024, opts.reserve_min * max(1, k_c))
+            self.idMap50 = idmapInit(capacityHint: capHint, opts: .default)
+        }
+        // Initialize per-list tracking for IVF-Flat rerank path
+        self.internalIDsByList30 = Array(repeating: [], count: max(k_c, 0))
+        self.id2List30.removeAll(keepingCapacity: false)
+        self.id2Offset30.removeAll(keepingCapacity: false)
+        self.mappingComplete30 = true
+        // If durable with pre-existing data, mark mapping incomplete
+        if let h = self.kernel30 {
+            var anyPreexisting = false
+            for lid in 0..<h.k_c {
+                if let stats = try? h.getListStats(listID: Int32(lid)) {
+                    if stats.length > 0 { anyPreexisting = true }
+                }
+            }
+            if anyPreexisting { self.mappingComplete30 = false }
+        }
+    }
+
+    /// Ingest encoded PQ vectors via Kernel #30.
+    public func ingestEncodedPQ(listIDs: [Int32], externalIDs: [UInt64], codes: [UInt8], m: Int, opts inOpts: IVFAppendOpts? = nil) async throws {
+        guard let h = kernel30 else { throw VectorError(.operationFailed) }
+        var localOpts = inOpts ?? h.opts
+        localOpts.format = .pq8 // caller may pass .pq4 via codes packing/opts
+        let n = listIDs.count
+        precondition(externalIDs.count == n)
+        // Map external IDs -> internal dense IDs via #50
+        if let idMap = idMap50 {
+            var assigned = [Int64](repeating: 0, count: n)
+            _ = try externalIDs.withUnsafeBufferPointer { extPtr in
+                try assigned.withUnsafeMutableBufferPointer { dst in
+                    try idmapAppend(idMap, externalIDs: extPtr.baseAddress!, count: n, internalIDsOut: dst.baseAddress)
+                }
+            }
+            // Ingest into kernel #30 and verify internal IDs remain aligned
+            var returned = [Int64](repeating: -1, count: n)
+            try ivf_append(list_ids: listIDs, external_ids: externalIDs, codes: codes, n: n, m: m, index: h, opts: localOpts, internalIDsOut: &returned)
+            // Best-effort sanity check (should match 1:1)
+            #if DEBUG
+            if assigned != returned {
+                // If mismatch, this indicates counter drift between kernels
+                throw VectorError(.operationFailed)
+            }
+            #endif
+            // Persist IDMap snapshot if durable
+            persistKernel30IDMapSnapshot()
+        } else {
+            // Fallback without ID map
+            try ivf_append(list_ids: listIDs, external_ids: externalIDs, codes: codes, n: n, m: m, index: h, opts: localOpts, internalIDsOut: nil)
+        }
+    }
+
+    /// Ingest IVF-Flat vectors via Kernel #30.
+    public func ingestFlat(listIDs: [Int32], externalIDs: [UInt64], vectors: [Float], opts inOpts: IVFAppendOpts? = nil) async throws {
+        guard let h = kernel30, h.format == .flat else { throw VectorError(.operationFailed) }
+        let n = listIDs.count
+        precondition(vectors.count == n * dimension)
+        let localOpts = inOpts ?? h.opts
+        precondition(externalIDs.count == n)
+        if let idMap = idMap50 {
+            // Snapshot pre-append lengths per list to compute offsets
+            var oldLen: [Int32: Int] = [:]
+            var perListCounts: [Int32: Int] = [:]
+            for lid in listIDs {
+                if oldLen[lid] == nil {
+                    if let st = try? h.getListStats(listID: lid) { oldLen[lid] = st.length } else { oldLen[lid] = 0 }
+                }
+                perListCounts[lid] = 0
+            }
+            var assigned = [Int64](repeating: 0, count: n)
+            _ = try externalIDs.withUnsafeBufferPointer { extPtr in
+                try assigned.withUnsafeMutableBufferPointer { dst in
+                    try idmapAppend(idMap, externalIDs: extPtr.baseAddress!, count: n, internalIDsOut: dst.baseAddress)
+                }
+            }
+            var returned = [Int64](repeating: -1, count: n)
+            try ivf_append_flat(list_ids: listIDs, external_ids: externalIDs, xb: vectors, n: n, d: dimension, index: h, opts: localOpts, internalIDsOut: &returned)
+            #if DEBUG
+            if assigned != returned { throw VectorError(.operationFailed) }
+            #endif
+            // Update mapping arrays incrementally
+            // Ensure id2 arrays large enough
+            let maxID = Int((returned.max() ?? -1))
+            if maxID >= 0 {
+                if id2List30.count <= maxID { id2List30.append(contentsOf: repeatElement(-1, count: maxID + 1 - id2List30.count)) }
+                if id2Offset30.count <= maxID { id2Offset30.append(contentsOf: repeatElement(-1, count: maxID + 1 - id2Offset30.count)) }
+            }
+            // Prepare per-list internalIDs storage if we are in a fresh mapping session
+            if mappingComplete30 {
+                // Ensure per-list vectors are at least oldLen
+                for (lid, len) in oldLen {
+                    let i = Int(lid)
+                    if internalIDsByList30.indices.contains(i) {
+                        if internalIDsByList30[i].count < len {
+                            internalIDsByList30[i].reserveCapacity(len)
+                            // Append placeholders for legacy region; we cannot reconstruct past internalIDs.
+                            // Since mappingComplete30 implies no preexisting data, this block should rarely run.
+                            while internalIDsByList30[i].count < len { internalIDsByList30[i].append(-1) }
+                        }
+                    }
+                }
+            }
+            // Assign per element
+            for idx in 0..<n {
+                let lid = listIDs[idx]
+                let base = oldLen[lid] ?? 0
+                let localIdx = perListCounts[lid, default: 0]
+                perListCounts[lid] = localIdx + 1
+                let off = base + localIdx
+                let iid = returned[idx]
+                let ii = Int(iid)
+                if ii >= 0 {
+                    id2List30[ii] = lid
+                    id2Offset30[ii] = Int32(off)
+                    if mappingComplete30 {
+                        let l = Int(lid)
+                        if internalIDsByList30.indices.contains(l) {
+                            if internalIDsByList30[l].count == off {
+                                internalIDsByList30[l].append(iid)
+                            } else if internalIDsByList30[l].count < off {
+                                internalIDsByList30[l].reserveCapacity(off + 1)
+                                while internalIDsByList30[l].count < off { internalIDsByList30[l].append(-1) }
+                                internalIDsByList30[l].append(iid)
+                            } else {
+                                // Should not happen; keep safe
+                                internalIDsByList30[l][off] = iid
+                            }
+                        }
+                    }
+                }
+            }
+            // Persist IDMap snapshot if durable
+            persistKernel30IDMapSnapshot()
+        } else {
+            try ivf_append_flat(list_ids: listIDs, external_ids: externalIDs, xb: vectors, n: n, d: dimension, index: h, opts: localOpts, internalIDsOut: nil)
+        }
     }
 
     public func optimize() async throws {
@@ -232,6 +412,11 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
+        }
+        // Kernel #30 IVF-Flat accelerated path with exact rerank (#40).
+        if let h = kernel30, h.format == .flat, mappingComplete30,
+           (metric == .euclidean || metric == .dotProduct || metric == .cosine) {
+            return try await searchKernel30Flat(query: query, k: k, filter: filter)
         }
         // If we have centroids/lists, probe; else linear scan
         if !centroids.isEmpty && !lists.isEmpty {
@@ -505,5 +690,173 @@ extension IVFIndex {
         }
         
         return finalResults
+    }
+
+    // MARK: - Utilities (#50) — Map internal IDs to public VectorIDs
+    public func mapInternalToPublicIDs(_ internalIDs: [Int64]) -> [VectorID] {
+        guard let idMap = idMap50 else { return [] }
+        var outs: [VectorID] = []
+        outs.reserveCapacity(internalIDs.count)
+        for iid in internalIDs {
+            let ext = idmapExternalFor(idMap, internalID: iid)
+            if let s = idRegistry?.getString(ext) {
+                outs.append(s)
+            } else {
+                // If registry unused for this ingest path, represent as numeric string
+                outs.append(String(ext))
+            }
+        }
+        return outs
+    }
+}
+
+// MARK: - Kernel #30 IVF-Flat exact rerank integration (#40)
+extension IVFIndex {
+    // Synthetic candidate ID encoder: high 32 bits = listID, low 32 bits = offset
+    @inline(__always) private func packCandID(list: Int32, offset: Int32) -> Int64 {
+        (Int64(list) << 32) | (Int64(UInt32(bitPattern: offset)))
+    }
+    @inline(__always) private func unpackCandID(_ id: Int64) -> (Int32, Int32) {
+        let list = Int32(truncatingIfNeeded: id >> 32)
+        let off = Int32(truncatingIfNeeded: id & 0xFFFF_FFFF)
+        return (list, off)
+    }
+
+    private func searchKernel30Flat(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
+        guard let h = kernel30, h.format == .flat else { return [] }
+        // 1) Select lists to probe
+        let kc = h.k_c
+        var probeLists: [Int32] = []
+        if !centroids.isEmpty && (centroids.count == kc) && (centroids.first?.count == dimension) {
+            var ids: [Int32] = []
+            var scores: [Float]? = nil
+            let metricSel: IVFMetric = (metric == .euclidean) ? .l2 : (metric == .dotProduct ? .ip : .cosine)
+            // Flatten centroids [[Float]] -> [Float]
+            let flatC = centroids.flatMap { $0 }
+            ivf_select_nprobe_f32(q: query, d: dimension, centroids: flatC, kc: kc, metric: metricSel, nprobe: min(config.nprobe, kc), listIDsOut: &ids, listScoresOut: &scores)
+            probeLists = ids
+        } else {
+            // Fallback: probe all lists
+            probeLists = (0..<kc).map { Int32($0) }
+        }
+
+        // 2) Build per-list info and candidate internal IDs
+        var listBases: [Int32: UnsafePointer<Float>] = [:]
+        var listLengths: [Int32: Int] = [:]
+        var idPtrsU64: [Int32: UnsafePointer<UInt64>] = [:]
+        var idPtrsU32: [Int32: UnsafePointer<UInt32>] = [:]
+        var candInternalIDs: [Int64] = []
+        candInternalIDs.reserveCapacity(1024)
+        for lid in probeLists {
+            let (len, idsU64, idsU32, _, xbPtr) = try h.readList(listID: lid)
+            guard let xb = xbPtr, len > 0 else { continue }
+            listBases[lid] = xb
+            listLengths[lid] = len
+            if let p64 = idsU64 { idPtrsU64[lid] = p64 }
+            if let p32 = idsU32 { idPtrsU32[lid] = p32 }
+            // Map list offsets -> internal dense IDs via internalIDsByList30
+            let li = Int(lid)
+            guard internalIDsByList30.indices.contains(li) else { continue }
+            let listVec = internalIDsByList30[li]
+            candInternalIDs.reserveCapacity(candInternalIDs.count + len)
+            for off in 0..<len {
+                let iid = listVec[off]
+                if iid >= 0 { candInternalIDs.append(iid) }
+            }
+        }
+        guard !candInternalIDs.isEmpty else { return [] }
+
+        // 3) Build IVFListVecs reader and run exact rerank without materializing all vectors
+        let Nint = max(id2List30.count, id2Offset30.count)
+        // Build lists array of length kc; unused lists get len=0 and a safe dummy base
+        var lists: [IndexOps.Rerank.IVFListVecsReader.List] = []
+        lists.reserveCapacity(kc)
+        var dummy: [Float] = [0]
+        let d = dimension
+        for li in 0..<kc {
+            let lid = Int32(li)
+            if let base = listBases[lid], let len = listLengths[lid] {
+                lists.append(.init(base: base, len: len))
+            } else {
+                let base = dummy.withUnsafeMutableBufferPointer { $0.baseAddress! }
+                lists.append(.init(base: UnsafePointer(base), len: 0))
+            }
+        }
+        var topScores = [Float](repeating: 0, count: k)
+        var topIDs = [Int64](repeating: -1, count: k)
+        query.withUnsafeBufferPointer { qbp in
+            id2List30.withUnsafeBufferPointer { lptr in
+                id2Offset30.withUnsafeBufferPointer { optr in
+                    lists.withUnsafeBufferPointer { lsbp in
+                        candInternalIDs.withUnsafeBufferPointer { cidbp in
+                            let reader = IndexOps.Rerank.IVFListVecsReader(
+                                lists: Array(lsbp),
+                                id2List: lptr.baseAddress!,
+                                id2Offset: optr.baseAddress!,
+                                N: Nint,
+                                dim: d,
+                                invNorms: nil,
+                                sqNorms: nil
+                            )
+                            let opts = IndexOps.Rerank.RerankOpts(
+                                backend: .ivfListVecs,
+                                gatherTile: 128,
+                                reorderBySegment: true,
+                                haveInvNorms: false,
+                                haveSqNorms: false,
+                                returnSorted: true,
+                                skipMissing: true,
+                                prefetchDistance: 8,
+                                strictFP: false,
+                                enableParallel: true,
+                                parallelThreshold: 2048,
+                                maxConcurrency: 0
+                            )
+                            topScores.withUnsafeMutableBufferPointer { sb in
+                                topIDs.withUnsafeMutableBufferPointer { ib in
+                                    IndexOps.Rerank.rerank_exact_topk(
+                                        q: qbp.baseAddress!, d: d, metric: metric,
+                                        candIDs: cidbp.baseAddress!, C: candInternalIDs.count, K: k,
+                                        reader: reader, opts: opts,
+                                        topScores: sb.baseAddress!, topIDs: ib.baseAddress!
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 4) Map internal IDs to external VectorIDs and apply optional filter
+        var results: [SearchResult] = []
+        results.reserveCapacity(k)
+        outer: for i in 0..<topIDs.count {
+            let iid = topIDs[i]
+            if iid < 0 { break }
+            var ext: UInt64 = 0
+            if let idMap = self.idMap50 { ext = idmapExternalFor(idMap, internalID: iid) } else { ext = 0 }
+            let vid: VectorID = idRegistry?.getString(ext) ?? String(ext)
+            if let filter = filter {
+                let meta = store[vid]?.1
+                if !filter(meta) { continue }
+            }
+            results.append(SearchResult(id: vid, score: topScores[i]))
+            if results.count == k { break outer }
+        }
+        return results
+    }
+}
+
+// MARK: - Durable IDMap snapshot helpers
+extension IVFIndex {
+    private func persistKernel30IDMapSnapshot() {
+        guard let mmap = self.kernel30Mmap, let map = self.idMap50 else { return }
+        do {
+            let blob = try serializeIDMap(map)
+            try mmap.writeIDMapBlob(blob)
+        } catch {
+            // Best-effort only; ignore failures
+        }
     }
 }

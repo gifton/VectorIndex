@@ -15,6 +15,9 @@
 //===----------------------------------------------------------------------===//
 
 import Foundation
+#if canImport(CPQEncode)
+import CPQEncode
+#endif
 
 // MARK: - Public Options & Layout
 
@@ -78,6 +81,25 @@ public func pq_encode_u8_f32(
     let opts = optsPtr?.pointee ?? PQEncodeOpts()
     let layout = opts.outputLayout
 
+    #if canImport(CPQEncode)
+    if _useCPQEncode && layout == .aOS {
+        var cOpts = opts._toC(ks: ks, layout: layout)
+        if opts.useDotTrick {
+            let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
+                maybeSq: opts.centroidSqNorms, codebooks: codebooks, m: m, ks: ks, dsub: dsub
+            )
+            CPQEncode.cpq_encode_u8_f32_with_csq(
+                x, n64, CInt(d), CInt(m), CInt(ks), codebooks, centroidSq, codes, &cOpts
+            )
+        } else {
+            CPQEncode.cpq_encode_u8_f32(
+                x, n64, CInt(d), CInt(m), CInt(ks), codebooks, codes, &cOpts
+            )
+        }
+        return
+    }
+    #endif
+
     // Prepare centroid squared-norms [m*ks] if needed (for dot trick).
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: codebooks, m: m, ks: ks, dsub: dsub
@@ -94,6 +116,56 @@ public func pq_encode_u8_f32(
                 ks: ks,
                 dsub: dsub,
                 useDot: opts.useDotTrick
+            )
+            storeU8(code: UInt8(truncatingIfNeeded: q),
+                    into: codes, layout: layout, i: i, j: j, n: n, m: m)
+        }
+    }
+}
+
+// 8-bit encoding (ks = 256) with precomputed centroid squared-norms (csq).
+// Dot-trick path only. AoS routes to C fast path; SoA stays in Swift.
+@inlinable
+public func pq_encode_u8_f32_withCSQ(
+    _ x: UnsafePointer<Float>,
+    _ n64: Int64,
+    _ d32: Int32,
+    _ m32: Int32,
+    _ ks32: Int32,                                 // must be 256
+    _ codebooks: UnsafePointer<Float>,             // [m × ks × dsub]
+    _ centroidSq: UnsafePointer<Float>,            // [m × ks]
+    _ codes: UnsafeMutablePointer<UInt8>,          // [n × m] or [m × n]
+    _ optsPtr: UnsafePointer<PQEncodeOpts>?        // nullable
+) {
+    let n = Int(n64), d = Int(d32), m = Int(m32), ks = Int(ks32)
+    precondition(d % m == 0, "d must be divisible by m")
+    precondition(ks == 256, "ks must be 256 for u8 encoding")
+
+    let dsub = d / m
+    let opts = optsPtr?.pointee ?? PQEncodeOpts()
+    let layout = opts.outputLayout
+
+    #if canImport(CPQEncode)
+    if _useCPQEncode && layout == .aOS {
+        var cOpts = opts._toC(ks: ks, layout: layout)
+        CPQEncode.cpq_encode_u8_f32_with_csq(
+            x, n64, CInt(d), CInt(m), CInt(ks), codebooks, centroidSq, codes, &cOpts
+        )
+        return
+    }
+    #endif
+
+    // Swift path (SoA or when C backend is disabled)
+    for i in 0..<n {
+        let xRow = x + i*d
+        for j in 0..<m {
+            let q = argminCode_u8(
+                xSub: xRow + j*dsub,
+                codebook_j: codebooks + (j*ks*dsub),
+                centroidSq_j: centroidSq + (j*ks),
+                ks: ks,
+                dsub: dsub,
+                useDot: true
             )
             storeU8(code: UInt8(truncatingIfNeeded: q),
                     into: codes, layout: layout, i: i, j: j, n: n, m: m)
@@ -121,6 +193,16 @@ public func pq_encode_u4_f32(
     let dsub = d / m
     let opts = optsPtr?.pointee ?? PQEncodeOpts()
     let layout = opts.outputLayout
+
+    #if canImport(CPQEncode)
+    if _useCPQEncode && layout == .aOS {
+        var cOpts = opts._toC(ks: ks, layout: layout)
+        CPQEncode.cpq_encode_u4_f32(
+            x, n64, CInt(d), CInt(m), CInt(ks), codebooks, codesPacked, &cOpts
+        )
+        return
+    }
+    #endif
 
     // Prepare centroid squared-norms [m*ks] if needed.
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
@@ -176,6 +258,25 @@ public func pq_encode_residual_u8_f32(
     let opts = optsPtr?.pointee ?? PQEncodeOpts()
     let layout = opts.outputLayout
 
+    #if canImport(CPQEncode)
+    if _useCPQEncode && layout == .aOS {
+        var cOpts = opts._toC(ks: ks, layout: layout)
+        if opts.useDotTrick {
+            let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
+                maybeSq: opts.centroidSqNorms, codebooks: residualCodebooks, m: m, ks: ks, dsub: dsub
+            )
+            CPQEncode.cpq_encode_residual_u8_f32_with_csq(
+                x, n64, CInt(d), CInt(m), CInt(ks), residualCodebooks, centroidSq, coarseCentroids, assignments, codes, &cOpts
+            )
+        } else {
+            CPQEncode.cpq_encode_residual_u8_f32(
+                x, n64, CInt(d), CInt(m), CInt(ks), residualCodebooks, coarseCentroids, assignments, codes, &cOpts
+            )
+        }
+        return
+    }
+    #endif
+
     // Centroid squared-norms [m*ks] (for residual codebooks).
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: residualCodebooks, m: m, ks: ks, dsub: dsub
@@ -208,6 +309,63 @@ public func pq_encode_residual_u8_f32(
     }
 }
 
+// Residual IVF-PQ (u8) with precomputed centroid squared-norms (csq).
+// Dot-trick path only. AoS routes to C fast path; SoA stays in Swift.
+@inlinable
+public func pq_encode_residual_u8_f32_withCSQ(
+    _ x: UnsafePointer<Float>,
+    _ n64: Int64,
+    _ d32: Int32,
+    _ m32: Int32,
+    _ ks32: Int32,                                // 256
+    _ residualCodebooks: UnsafePointer<Float>,    // [m × ks × dsub]
+    _ centroidSq: UnsafePointer<Float>,           // [m × ks]
+    _ coarseCentroids: UnsafePointer<Float>,      // [kc × d]
+    _ assignments: UnsafePointer<Int32>,          // [n]
+    _ codes: UnsafeMutablePointer<UInt8>,         // [n × m] or [m × n]
+    _ optsPtr: UnsafePointer<PQEncodeOpts>?
+) {
+    let n = Int(n64), d = Int(d32), m = Int(m32), ks = Int(ks32)
+    precondition(d % m == 0, "d must be divisible by m")
+    precondition(ks == 256, "ks must be 256 for residual u8 encoding")
+
+    let dsub = d / m
+    let opts = optsPtr?.pointee ?? PQEncodeOpts()
+    let layout = opts.outputLayout
+
+    #if canImport(CPQEncode)
+    if _useCPQEncode && layout == .aOS {
+        var cOpts = opts._toC(ks: ks, layout: layout)
+        CPQEncode.cpq_encode_residual_u8_f32_with_csq(
+            x, n64, CInt(d), CInt(m), CInt(ks), residualCodebooks, centroidSq, coarseCentroids, assignments, codes, &cOpts
+        )
+        return
+    }
+    #endif
+
+    // Swift path (SoA or when C backend is disabled)
+    let rBuf = UnsafeMutablePointer<Float>.allocate(capacity: dsub)
+    defer { rBuf.deallocate() }
+    for i in 0..<n {
+        let xRow = x + i*d
+        let coarse = coarseCentroids + Int(assignments[i]) * d
+        for j in 0..<m {
+            // r_j = x_j - g_j
+            let xSub = xRow + j*dsub
+            let gSub = coarse + j*dsub
+            for t in 0..<dsub { rBuf[t] = xSub[t] - gSub[t] }
+            let q = argminCodeResidual_u8(
+                rSub: rBuf,
+                codebook_j: residualCodebooks + (j*ks*dsub),
+                centroidSq_j: centroidSq + (j*ks),
+                ks: ks, dsub: dsub, useDot: true
+            )
+            storeU8(code: UInt8(truncatingIfNeeded: q),
+                    into: codes, layout: layout, i: i, j: j, n: n, m: m)
+        }
+    }
+}
+
 // Residual IVF-PQ (u4): packed, two nibbles per byte.
 @inlinable
 public func pq_encode_residual_u4_f32(
@@ -230,6 +388,16 @@ public func pq_encode_residual_u4_f32(
     let dsub = d / m
     let opts = optsPtr?.pointee ?? PQEncodeOpts()
     let layout = opts.outputLayout
+
+    #if canImport(CPQEncode)
+    if _useCPQEncode && layout == .aOS {
+        var cOpts = opts._toC(ks: ks, layout: layout)
+        CPQEncode.cpq_encode_residual_u4_f32(
+            x, n64, CInt(d), CInt(m), CInt(ks), residualCodebooks, coarseCentroids, assignments, codesPacked, &cOpts
+        )
+        return
+    }
+    #endif
 
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: residualCodebooks, m: m, ks: ks, dsub: dsub
