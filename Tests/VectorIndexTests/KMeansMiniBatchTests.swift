@@ -581,7 +581,8 @@ final class KMeansMiniBatchTests: XCTestCase {
         let cfg = KMeansMBConfig(
             algo: .lloydMiniBatch,
             batchSize: 20,
-            epochs: 10
+            epochs: 10,
+            computeAssignments: true  // Required to populate assignOut buffer
         )
 
         var centroids = initCentroids
@@ -677,9 +678,15 @@ final class KMeansMiniBatchTests: XCTestCase {
     }
 
     // MARK: - Performance Tests
+    //
+    // NOTE: Performance benchmarks are DISABLED by default as they use XCTest's
+    // measure{} blocks which run 10 iterations each. With nil initialization, each
+    // iteration runs k-means++ seeding which can take several minutes on large datasets.
+    // To enable for performance profiling, comment out the `throw XCTSkip(...)` line.
 
     /// Measure mini-batch k-means performance on moderate dataset
-    func testPerformanceModerate() {
+    func testPerformanceModerate() throws {
+        throw XCTSkip("Performance benchmark - enable manually for profiling (runs 10 iterations, can take several minutes)")
         let n = 5000
         let d = 64
         let k = 50
@@ -707,7 +714,8 @@ final class KMeansMiniBatchTests: XCTestCase {
     }
 
     /// Measure mini-batch k-means performance on large dataset
-    func testPerformanceLarge() {
+    func testPerformanceLarge() throws {
+        throw XCTSkip("Performance benchmark - enable manually for profiling (runs 10 iterations, can take several minutes)")
         let n = 20000
         let d = 128
         let k = 256

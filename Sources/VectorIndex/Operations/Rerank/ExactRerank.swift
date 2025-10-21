@@ -299,6 +299,14 @@ public extension IndexOps.Rerank {
         // Parallel path: partition by tiles
         let tiles = (C + tile - 1) / tile
         let workers = opts.maxConcurrency > 0 ? opts.maxConcurrency : max(1, min(tiles, ProcessInfo.processInfo.activeProcessorCount))
+
+        // Wrap non-Sendable references safely for capture
+        struct _SendableBox<T>: @unchecked Sendable { let value: T }
+        let readerBox = _SendableBox(value: reader)
+        let qAddr = UInt(bitPattern: q)
+        let outAddr = UInt(bitPattern: scoresOut)
+        let maskAddr = presentMaskOut.map { UInt(bitPattern: $0) } ?? 0
+
         DispatchQueue.concurrentPerform(iterations: workers) { w in
             var t = w
             while t < tiles {
@@ -316,25 +324,30 @@ public extension IndexOps.Rerank {
                 var origIdx = [Int](repeating: -1, count: chunk)
                 for j in 0..<chunk { tmpIDs[j] = order[start + j].id; origIdx[j] = order[start + j].idx }
 
+                let readerLocal = readerBox.value
+
                 if opts.prefetchDistance > 0 {
-                    prefetchLookahead(order: order, base: start, count: chunk, d: d, reader: reader, distance: opts.prefetchDistance)
+                    prefetchLookahead(order: order, base: start, count: chunk, d: d, reader: readerLocal, distance: opts.prefetchDistance)
                 }
 
                 tmpIDs.withUnsafeBufferPointer { idPtr in
-                    _ = reader.fetchMany(ids: idPtr.baseAddress!, count: chunk, dst: scratch, present: present)
+                    _ = readerLocal.fetchMany(ids: idPtr.baseAddress!, count: chunk, dst: scratch, present: present)
                 }
 
-                scoreTile(q: q, d: d, metric: metric, n: chunk, qNorm: qNorm, xb: scratch, out: tileScores, reader: reader, opts: opts)
+                let qLocal = UnsafePointer<Float>(bitPattern: qAddr)!
+                scoreTile(q: qLocal, d: d, metric: metric, n: chunk, qNorm: qNorm, xb: scratch, out: tileScores, reader: readerLocal, opts: opts)
 
                 // Scatter back to global outputs (disjoint indices across tiles)
+                let scoresOutLocal = UnsafeMutablePointer<Float>(bitPattern: outAddr)!
+                let presentMaskLocal: UnsafeMutablePointer<UInt8>? = (maskAddr != 0) ? UnsafeMutablePointer<UInt8>(bitPattern: maskAddr)! : nil
                 for j in 0..<chunk {
                     let dstIdx = origIdx[j]
                     if present[j] == 0 {
-                        scoresOut[dstIdx] = _missingSentinel(metric)
-                        presentMaskOut?.advanced(by: dstIdx).pointee = 0
+                        scoresOutLocal[dstIdx] = _missingSentinel(metric)
+                        presentMaskLocal?.advanced(by: dstIdx).pointee = 0
                     } else {
-                        scoresOut[dstIdx] = tileScores[j]
-                        presentMaskOut?.advanced(by: dstIdx).pointee = 1
+                        scoresOutLocal[dstIdx] = tileScores[j]
+                        presentMaskLocal?.advanced(by: dstIdx).pointee = 1
                     }
                 }
 

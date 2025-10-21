@@ -1,0 +1,37 @@
+disabled_rules:
+  - trailing_whitespace
+  - todo
+  - function_parameter_count
+  - file_length
+  - type_body_length
+  - line_length
+  - cyclomatic_complexity
+  - identifier_name
+  - nesting
+  - large_tuple
+  - function_body_length
+
+opt_in_rules:
+  - empty_count
+  - empty_string
+  - fatal_error_message
+  - redundant_nil_coalescing
+  - redundant_void_return
+  - unused_import
+  - implicit_return
+  - discouraged_optional_boolean
+
+included:
+  - Sources/VectorIndex
+  - Tests/VectorIndexTests
+
+excluded:
+  - Sources/CAtomicsShim
+  - Sources/CPQEncode
+  - Sources/CS2RNG
+  - Sources/VectorIndexBenchmarks
+  - kernel-specs
+  - migration-docs
+  - tools
+
+reporter: "xcode"

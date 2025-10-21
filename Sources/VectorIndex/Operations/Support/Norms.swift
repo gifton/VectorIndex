@@ -1,6 +1,10 @@
 import Foundation
 import simd
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
 public extension IndexOps.Support {
     enum Norms {

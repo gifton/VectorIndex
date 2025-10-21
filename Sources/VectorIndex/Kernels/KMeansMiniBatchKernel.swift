@@ -33,19 +33,16 @@ import Foundation
 
 // MARK: - Public enums / config
 
-@frozen
 public enum KMeansAlgorithmMB: Sendable {
     case lloydMiniBatch
     case onlineEWMA
 }
 
-@frozen
 public enum VectorLayoutMB: Sendable {
     case aos         // [n × d] row-major (fast path)
     case aosoaR      // [n/R][d][R] (correctness path in this kernel)
 }
 
-@frozen
 public struct KMeansMBConfig: Sendable {
     public let algo: KMeansAlgorithmMB
     public let batchSize: Int
@@ -92,7 +89,6 @@ public struct KMeansMBConfig: Sendable {
     public static let `default` = KMeansMBConfig()
 }
 
-@frozen
 public struct KMeansMBStats: Sendable {
     public let epochsCompleted: Int
     public let batchesProcessed: Int64
@@ -132,7 +128,6 @@ public struct KMeansMBStats: Sendable {
 }
 
 // Return status (C-like codes for bridging)
-@frozen
 public enum KMeansMBStatus: Int32, Sendable {
     case success = 0
     case invalidDim = -1
@@ -749,7 +744,6 @@ public func kmeans_minibatch_f32(
 
 // MARK: - Stateful Streaming API
 
-@frozen
 public struct KMeansUpdateOpts: Sendable {
     public var decay: Float          // 0 -> use state's default
     public var normalizeCentroids: Bool

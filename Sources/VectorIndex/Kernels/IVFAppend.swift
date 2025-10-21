@@ -166,8 +166,8 @@ public final class IVFListHandle {
     public let format: IVFFormat
     public var opts: IVFAppendOpts
     fileprivate var storage: StorageBackend
-    // Optional mmap handle when durable mode is used
-    public var mmapHandle: IndexMmap? = nil
+    // Optional mmap handle when durable mode is used (internal - low-level persistence)
+    internal var mmapHandle: IndexMmap? = nil
     fileprivate var lists: [IVFList] = []
     private var nextInternalID: Int64 = 0
     fileprivate let globalLock: any ListLock = makeLock()
@@ -256,9 +256,9 @@ public final class IVFListHandle {
 
 @inline(__always) public func ivf_destroy(_ index: IVFListHandle) { /* ARC */ }
 
-// Create an IVF handle attached to an existing mmap index for durable appends.
+// Create an IVF handle attached to an existing mmap index for durable appends (internal - low-level mmap API).
 @inline(__always)
-public func ivf_create_mmap(k_c: Int, m: Int, d: Int, mmap: IndexMmap, opts: IVFAppendOpts? = nil) throws -> IVFListHandle {
+internal func ivf_create_mmap(k_c: Int, m: Int, d: Int, mmap: IndexMmap, opts: IVFAppendOpts? = nil) throws -> IVFListHandle {
     var o = opts ?? .default
     let h = try IVFListHandle(k_c: k_c, m: m, d: d, opts: o)
     h.storage = .mmap

@@ -333,7 +333,14 @@ internal func _vi_km11_sampleProportionalToWeight(
         }
     }
 
-    precondition(totalWeight > 0, "Total weight must be positive")
+    // Edge case: If all weights are zero (e.g., all data points are identical),
+    // fall back to uniform random selection. This occurs when all remaining points
+    // are at the same location as already-chosen centroids (D² = 0 for all points).
+    // Mathematically, uniform selection is the correct behavior when the weighted
+    // distribution is undefined.
+    if totalWeight <= 0 {
+        return rng.nextInt(bound: n)
+    }
 
     // Draw uniform random value in [0, totalWeight)
     let threshold = rng.nextDouble() * totalWeight

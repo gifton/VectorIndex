@@ -449,38 +449,43 @@ public func pq_lut_batch_l2_f32(
             )
         }
     } else {
-        // Coarse-grained parallelism across queries (throughput path)
+        // Parallelism across queries while avoiding non-Sendable pointer captures.
         let threads = max(1, inOpts.numThreads)
-        let group = DispatchGroup()
-        let queue = DispatchQueue.global(qos: .userInitiated)
-
-        // Chunk queries evenly
         let chunk = (nQueries + threads - 1) / threads
-        for t in 0..<threads {
+
+        // Capture stable numeric addresses (Sendable) and reconstruct pointers inside closures.
+        let queriesAddr = UInt(bitPattern: queries)
+        let lutsAddr = UInt(bitPattern: luts)
+        let codebooksAddr = UInt(bitPattern: codebooks)
+        let centroidNormsAddr = centroidNorms.map { UInt(bitPattern: $0) } ?? 0
+
+        DispatchQueue.concurrentPerform(iterations: threads) { t in
             let start = t * chunk
             let end = min(nQueries, start + chunk)
-            if start >= end { continue }
-            group.enter()
-            queue.async {
-                for qid in start..<end {
-                    let qPtr = queries + qid * d
-                    let lutPtr = luts + qid * perLUT
-                    pq_lut_l2_f32(
-                        query: qPtr,
-                        dimension: d,
-                        m: m,
-                        ks: ks,
-                        codebooks: codebooks,
-                        out: lutPtr,
-                        centroidNorms: centroidNorms,
-                        qSubNorms: nil,
-                        opts: inOpts
-                    )
-                }
-                group.leave()
+            if start >= end { return }
+
+            // Reconstruct pointers locally (no captured non-Sendable state)
+            let qBase = UnsafePointer<Float>(bitPattern: queriesAddr)!
+            let lBase = UnsafeMutablePointer<Float>(bitPattern: lutsAddr)!
+            let cbBase = UnsafePointer<Float>(bitPattern: codebooksAddr)!
+            let cnBase: UnsafePointer<Float>? = (centroidNormsAddr != 0) ? UnsafePointer<Float>(bitPattern: centroidNormsAddr)! : nil
+
+            for qid in start..<end {
+                let qPtr = qBase + qid * d
+                let lutPtr = lBase + qid * perLUT
+                pq_lut_l2_f32(
+                    query: qPtr,
+                    dimension: d,
+                    m: m,
+                    ks: ks,
+                    codebooks: cbBase,
+                    out: lutPtr,
+                    centroidNorms: cnBase,
+                    qSubNorms: nil,
+                    opts: inOpts
+                )
             }
         }
-        group.wait()
     }
 
     _ = dsub // silence unused var in certain build flags

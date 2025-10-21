@@ -6,7 +6,11 @@
 //
 
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 import VectorCore
 
 public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {

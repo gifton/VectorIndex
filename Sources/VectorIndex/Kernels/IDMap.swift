@@ -5,7 +5,7 @@ import Foundation
 public enum HashTableImpl: Sendable { case swissTable, robinHood, linearProbing }
 public enum IDMapConcurrency: Sendable { case singleWriter, rwLock }
 
-public struct IDMapOpts: Sendable {
+internal struct IDMapOpts: Sendable {
     public var allowReplace: Bool = false
     public var hashTableImpl: HashTableImpl = .swissTable
     public var capacityHint: Int = 1_000
@@ -26,7 +26,7 @@ public struct IDMapStats {
     public let tombstoneCount: Int64
 }
 
-public enum IDMapError: Error { case duplicateExternalID(UInt64), tableFull, excessiveProbing, badBucketCount, invalidInternalID(Int64) }
+internal enum IDMapError: Error { case duplicateExternalID(UInt64), tableFull, excessiveProbing, badBucketCount, invalidInternalID(Int64) }
 
 public final class TombstoneSet {
     private var bits: [UInt64]
@@ -234,21 +234,21 @@ private final class Bloom {
  
 
 // Initialization & lifecycle
-public func idmapInit(capacityHint: Int, opts: IDMapOpts = .default) -> IDMap {
+internal func idmapInit(capacityHint: Int, opts: IDMapOpts = IDMapOpts()) -> IDMap {
     let denseCap = max(1, capacityHint)
     let buckets = max(16, nextPow2(Int(Double(denseCap) / max(0.1, min(opts.maxLoadFactor, 0.95)))))
     let impl = IDMap.Impl(extByIntCap: denseCap, hashBuckets: buckets, opts: opts)
     return IDMap(impl: impl)
 }
-public func idmapFree(_ map: IDMap) { map.impl.rwLock = nil; map.impl.extByInt.removeAll(keepingCapacity: false); map.impl.retired.removeAll(keepingCapacity: false) }
+internal func idmapFree(_ map: IDMap) { map.impl.rwLock = nil; map.impl.extByInt.removeAll(keepingCapacity: false); map.impl.retired.removeAll(keepingCapacity: false) }
 
 // Core ops
-public func idmapAppend(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, internalIDsOut: UnsafeMutablePointer<Int64>?) throws -> Int {
+internal func idmapAppend(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, internalIDsOut: UnsafeMutablePointer<Int64>?) throws -> Int {
     var dummy = [UInt8](repeating: 0, count: n)
     return try idmapAppendWithMask(map, externalIDs: externalIDs, count: n, internalIDsOut: internalIDsOut, foundMask: &dummy)
 }
 
-public func idmapAppendWithMask(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, internalIDsOut: UnsafeMutablePointer<Int64>?, foundMask: UnsafeMutablePointer<UInt8>?) throws -> Int {
+internal func idmapAppendWithMask(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, internalIDsOut: UnsafeMutablePointer<Int64>?, foundMask: UnsafeMutablePointer<UInt8>?) throws -> Int {
     let impl = map.impl
     if let lock = impl.rwLock { lock.writeLock(); defer { lock.writeUnlock() } }
     let base = impl.nextInternal.fetchAndAdd(Int64(n))
@@ -310,7 +310,7 @@ public func idmapAppendWithMask(_ map: IDMap, externalIDs: UnsafePointer<UInt64>
     return found
 }
 
-public func idmapLookupBatch(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, internalIDsOut: UnsafeMutablePointer<Int64>, foundMask: UnsafeMutablePointer<UInt8>?) -> Int {
+internal func idmapLookupBatch(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, internalIDsOut: UnsafeMutablePointer<Int64>, foundMask: UnsafeMutablePointer<UInt8>?) -> Int {
     let impl = map.impl
     if let lock = impl.rwLock { lock.readLock(); defer { lock.readUnlock() } }
     var foundCnt = 0
@@ -320,26 +320,26 @@ public func idmapLookupBatch(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, c
 
 @inline(__always) public func idmapExternalFor(_ map: IDMap, internalID: Int64) -> UInt64 { let impl = map.impl; precondition(internalID >= 0 && internalID < impl.count, "internalID out of range"); return impl.extByInt[Int(internalID)] }
 
-public func idmapExternalForBatch(_ map: IDMap, internalIDs: UnsafePointer<Int64>, count n: Int, externalIDsOut: UnsafeMutablePointer<UInt64>) { let impl = map.impl; for i in 0..<n { let id = internalIDs[i]; externalIDsOut[i] = (id >= 0 && id < impl.count) ? impl.extByInt[Int(id)] : 0 } }
+internal func idmapExternalForBatch(_ map: IDMap, internalIDs: UnsafePointer<Int64>, count n: Int, externalIDsOut: UnsafeMutablePointer<UInt64>) { let impl = map.impl; for i in 0..<n { let id = internalIDs[i]; externalIDsOut[i] = (id >= 0 && id < impl.count) ? impl.extByInt[Int(id)] : 0 } }
 
-public func idmapErase(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, tombstones: TombstoneSet?) -> Int { let impl = map.impl; if let lock = impl.rwLock { lock.writeLock(); defer { lock.writeUnlock() } } ; var del=0; for i in 0..<n { let key = externalIDs[i]; let (ok, _) = impl.hashTable.erase(key); if ok { // fallback scan to find old internal ID
+internal func idmapErase(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count n: Int, tombstones: TombstoneSet?) -> Int { let impl = map.impl; if let lock = impl.rwLock { lock.writeLock(); defer { lock.writeUnlock() } } ; var del=0; for i in 0..<n { let key = externalIDs[i]; let (ok, _) = impl.hashTable.erase(key); if ok { // fallback scan to find old internal ID
             var old: Int64 = -1
             for j in 0..<impl.count { if impl.extByInt[Int(j)] == key { old = j; break } }
             if old >= 0 { (tombstones ?? impl.tombstones)?.set(old) }
             del &+= 1 }
     } ; return del }
 
-public func idmapRehash(_ map: IDMap, newBucketCount: Int) throws { let impl = map.impl; let buckets = max(16, nextPow2(newBucketCount)); var newTable = HashTable.allocate(buckets: buckets, impl: impl.opts.hashTableImpl); for i in 0..<impl.count { if impl.tombstones?.isSet(i) == true { continue } ; let ext = impl.extByInt[Int(i)]; if ext == 0 && i != 0 { continue } ; _ = try newTable.insert(ext, i) } ; if let lock = impl.rwLock { lock.writeLock(); let old = impl.hashTable; impl.hashTable = newTable; lock.writeUnlock(); impl.retired.append(old) } else { let old = impl.hashTable; impl.hashTable = newTable; _ = old } }
+internal func idmapRehash(_ map: IDMap, newBucketCount: Int) throws { let impl = map.impl; let buckets = max(16, nextPow2(newBucketCount)); var newTable = HashTable.allocate(buckets: buckets, impl: impl.opts.hashTableImpl); for i in 0..<impl.count { if impl.tombstones?.isSet(i) == true { continue } ; let ext = impl.extByInt[Int(i)]; if ext == 0 && i != 0 { continue } ; _ = try newTable.insert(ext, i) } ; if let lock = impl.rwLock { lock.writeLock(); let old = impl.hashTable; impl.hashTable = newTable; lock.writeUnlock(); impl.retired.append(old) } else { let old = impl.hashTable; impl.hashTable = newTable; _ = old } }
 
-public func idmapRebuildFromDense(_ map: IDMap) throws { let impl = map.impl; let target = max(16, nextPow2(Int(Double(max(1, Int(impl.count))) / max(0.1, min(impl.opts.maxLoadFactor, 0.95))))); try idmapRehash(map, newBucketCount: target) }
+internal func idmapRebuildFromDense(_ map: IDMap) throws { let impl = map.impl; let target = max(16, nextPow2(Int(Double(max(1, Int(impl.count))) / max(0.1, min(impl.opts.maxLoadFactor, 0.95))))); try idmapRehash(map, newBucketCount: target) }
 
-public func idmapGetStats(_ map: IDMap) -> IDMapStats { let impl = map.impl; let lf = Double(impl.hashTable.count) / Double(max(1, impl.hashTable.bucketCount)); let avg = impl.probeOps > 0 ? Double(impl.probeTotal) / Double(impl.probeOps) : 0.0; let tomb = (impl.tombstones != nil) ? estimateTombstones(impl) : 0; return IDMapStats(count: impl.count, capacity: impl.capacity, hashTableSize: impl.hashTable.bucketCount, loadFactor: lf, avgProbeLength: avg, maxProbeLength: impl.probeMax, tombstoneCount: Int64(tomb)) }
+internal func idmapGetStats(_ map: IDMap) -> IDMapStats { let impl = map.impl; let lf = Double(impl.hashTable.count) / Double(max(1, impl.hashTable.bucketCount)); let avg = impl.probeOps > 0 ? Double(impl.probeTotal) / Double(impl.probeOps) : 0.0; let tomb = (impl.tombstones != nil) ? estimateTombstones(impl) : 0; return IDMapStats(count: impl.count, capacity: impl.capacity, hashTableSize: impl.hashTable.bucketCount, loadFactor: lf, avgProbeLength: avg, maxProbeLength: impl.probeMax, tombstoneCount: Int64(tomb)) }
 private func estimateTombstones(_ impl: IDMap.Impl) -> Int { var t=0; if let ts = impl.tombstones { for i in 0..<impl.count { if ts.isSet(i) { t &+= 1 } } } ; return t }
 
 @inline(__always) private func growDenseArray(_ impl: IDMap.Impl, newCapacity: Int) throws { if Int64(newCapacity) <= impl.capacity { return } ; let newCap = max(Int(impl.capacity) << 1, newCapacity); impl.extByInt.append(contentsOf: repeatElement(0, count: newCap - impl.extByInt.count)); impl.capacity = Int64(impl.extByInt.count) }
 
 private struct IDMapHeader { var nTotal: Int64; var capacity: Int64; var version: UInt32; var reserved: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) }
-public func serializeIDMap(_ map: IDMap) throws -> Data {
+internal func serializeIDMap(_ map: IDMap) throws -> Data {
     let impl = map.impl
     var data = Data()
     var header = IDMapHeader(nTotal: impl.count, capacity: impl.capacity, version: 1,
@@ -357,4 +357,4 @@ public func serializeIDMap(_ map: IDMap) throws -> Data {
     if rem2 != 0 { data.append(contentsOf: [UInt8](repeating: 0, count: 64 - rem2)) }
     return data
 }
-public func deserializeIDMap(_ blob: Data, opts: IDMapOpts = .default) throws -> IDMap { var offs = 0; func read<T>(_ type: T.Type) -> T { let size = MemoryLayout<T>.size; let v: T = blob.withUnsafeBytes { raw in let ptr = raw.baseAddress!.advanced(by: offs).assumingMemoryBound(to: T.self); return ptr.pointee }; offs &+= size; return v } ; let _: IDMapHeader = read(IDMapHeader.self); let rem = offs & 63; if rem != 0 { offs &+= (64 - rem) } ; let n = Int(blob.count - offs) / MemoryLayout<UInt64>.size; var extByInt = [UInt64](repeating: 0, count: max(n, 1)); extByInt.withUnsafeMutableBytes { dst in let bytes = n * MemoryLayout<UInt64>.size; blob.copyBytes(to: dst, from: offs..<(offs + bytes)) } ; let buckets = max(16, nextPow2(Int(Double(max(1, n)) / max(0.1, min(opts.maxLoadFactor, 0.95))))); let impl = IDMap.Impl(extByIntCap: max(n, 1), hashBuckets: buckets, opts: opts); impl.extByInt = extByInt; impl.count = Int64(n); impl.capacity = Int64(extByInt.count); let map = IDMap(impl: impl); try idmapRebuildFromDense(map); return map }
+internal func deserializeIDMap(_ blob: Data, opts: IDMapOpts = IDMapOpts()) throws -> IDMap { var offs = 0; func read<T>(_ type: T.Type) -> T { let size = MemoryLayout<T>.size; let v: T = blob.withUnsafeBytes { raw in let ptr = raw.baseAddress!.advanced(by: offs).assumingMemoryBound(to: T.self); return ptr.pointee }; offs &+= size; return v } ; let _: IDMapHeader = read(IDMapHeader.self); let rem = offs & 63; if rem != 0 { offs &+= (64 - rem) } ; let n = Int(blob.count - offs) / MemoryLayout<UInt64>.size; var extByInt = [UInt64](repeating: 0, count: max(n, 1)); extByInt.withUnsafeMutableBytes { dst in let bytes = n * MemoryLayout<UInt64>.size; blob.copyBytes(to: dst, from: offs..<(offs + bytes)) } ; let buckets = max(16, nextPow2(Int(Double(max(1, n)) / max(0.1, min(opts.maxLoadFactor, 0.95))))); let impl = IDMap.Impl(extByIntCap: max(n, 1), hashBuckets: buckets, opts: opts); impl.extByInt = extByInt; impl.count = Int64(n); impl.capacity = Int64(extByInt.count); let map = IDMap(impl: impl); try idmapRebuildFromDense(map); return map }

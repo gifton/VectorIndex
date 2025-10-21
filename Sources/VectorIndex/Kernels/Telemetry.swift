@@ -19,12 +19,16 @@
 //
 
 import Foundation
+#if canImport(Darwin)
 import Darwin
+#elseif canImport(Glibc)
+import Glibc
+#endif
 
-// MARK: - Public Types
+// MARK: - Internal Types (Benchmarking/Debugging Only)
 
 /// Timer identifiers for different query stages
-public enum TelemetryTimerId: Int, CaseIterable {
+internal enum TelemetryTimerId: Int, CaseIterable {
   case t_lut_build = 0
   case t_scan_adc
   case t_score_flat
@@ -37,92 +41,92 @@ public enum TelemetryTimerId: Int, CaseIterable {
 }
 
 /// Optimization flags tracking which code paths were used
-public struct TelemetryFlags: OptionSet, Sendable {
-  public let rawValue: UInt64
-  public init(rawValue: UInt64) { self.rawValue = rawValue }
-  public static let used_dot_trick         = TelemetryFlags(rawValue: 1 << 0)
-  public static let used_cosine            = TelemetryFlags(rawValue: 1 << 1)
-  public static let used_interleaved_codes = TelemetryFlags(rawValue: 1 << 2)
-  public static let used_u4                = TelemetryFlags(rawValue: 1 << 3)
-  public static let used_prefetch          = TelemetryFlags(rawValue: 1 << 4)
-  public static let used_heap_merge        = TelemetryFlags(rawValue: 1 << 5)
+internal struct TelemetryFlags: OptionSet, Sendable {
+  let rawValue: UInt64
+  init(rawValue: UInt64) { self.rawValue = rawValue }
+  static let used_dot_trick         = TelemetryFlags(rawValue: 1 << 0)
+  static let used_cosine            = TelemetryFlags(rawValue: 1 << 1)
+  static let used_interleaved_codes = TelemetryFlags(rawValue: 1 << 2)
+  static let used_u4                = TelemetryFlags(rawValue: 1 << 3)
+  static let used_prefetch          = TelemetryFlags(rawValue: 1 << 4)
+  static let used_heap_merge        = TelemetryFlags(rawValue: 1 << 5)
 }
 
 /// Per-query statistics (returned to caller after query completion)
-public struct QueryStats {
+internal struct QueryStats {
   // Identity / configuration
-  public var metric: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+  var metric: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) // 16 bytes
-  public var d: Int32 = 0
-  public var m: Int32 = 0
-  public var ks: Int32 = 0
-  public var nprobe: Int32 = 0
-  public var C: Int32 = 0
-  public var K: Int32 = 0
+  var d: Int32 = 0
+  var m: Int32 = 0
+  var ks: Int32 = 0
+  var nprobe: Int32 = 0
+  var C: Int32 = 0
+  var K: Int32 = 0
 
   // Work
-  public var kc_scored: UInt64 = 0
-  public var lists_routed: UInt64 = 0
-  public var lists_scanned: UInt64 = 0
-  public var codes_scanned: UInt64 = 0
-  public var vecs_scored: UInt64 = 0
-  public var candidates_emitted: UInt64 = 0
-  public var candidates_unique: UInt64 = 0
-  public var candidates_kept: UInt64 = 0
-  public var topk_selected: UInt64 = 0
+  var kc_scored: UInt64 = 0
+  var lists_routed: UInt64 = 0
+  var lists_scanned: UInt64 = 0
+  var codes_scanned: UInt64 = 0
+  var vecs_scored: UInt64 = 0
+  var candidates_emitted: UInt64 = 0
+  var candidates_unique: UInt64 = 0
+  var candidates_kept: UInt64 = 0
+  var topk_selected: UInt64 = 0
 
   // Saturation / quality
-  public var reservoir_tau: Double = 0
-  public var heap_sifts: UInt64 = 0
-  public var quickselect_calls: UInt64 = 0
-  public var dup_ratio: Double = 0
-  public var beam_expansions: UInt64 = 0
+  var reservoir_tau: Double = 0
+  var heap_sifts: UInt64 = 0
+  var quickselect_calls: UInt64 = 0
+  var dup_ratio: Double = 0
+  var beam_expansions: UInt64 = 0
 
   // Bytes
-  public var bytes_lut: UInt64 = 0
-  public var bytes_codes: UInt64 = 0
-  public var bytes_vecs: UInt64 = 0
-  public var bytes_ids: UInt64 = 0
-  public var bytes_norms: UInt64 = 0
+  var bytes_lut: UInt64 = 0
+  var bytes_codes: UInt64 = 0
+  var bytes_vecs: UInt64 = 0
+  var bytes_ids: UInt64 = 0
+  var bytes_norms: UInt64 = 0
 
   // Timers (ns)
-  public var t_lut_build: UInt64 = 0
-  public var t_scan_adc: UInt64 = 0
-  public var t_score_flat: UInt64 = 0
-  public var t_topk: UInt64 = 0
-  public var t_merge: UInt64 = 0
-  public var t_dedup: UInt64 = 0
-  public var t_reservoir: UInt64 = 0
-  public var t_rerank: UInt64 = 0
-  public var t_total: UInt64 = 0
+  var t_lut_build: UInt64 = 0
+  var t_scan_adc: UInt64 = 0
+  var t_score_flat: UInt64 = 0
+  var t_topk: UInt64 = 0
+  var t_merge: UInt64 = 0
+  var t_dedup: UInt64 = 0
+  var t_reservoir: UInt64 = 0
+  var t_rerank: UInt64 = 0
+  var t_total: UInt64 = 0
 
   // Flags
-  public var flags: TelemetryFlags = []
+  var flags: TelemetryFlags = []
 }
 
 /// Query context (passed at begin_query)
 public struct QueryCtx {
-  public var metric: String? = nil
-  public var d: Int32 = 0
-  public var m: Int32 = 0
-  public var ks: Int32 = 0
-  public var nprobe: Int32 = 0
-  public var C: Int32 = 0
-  public var K: Int32 = 0
-  public init(metric: String? = nil, d: Int32, m: Int32, ks: Int32, nprobe: Int32, C: Int32, K: Int32) {
+  var metric: String? = nil
+  var d: Int32 = 0
+  var m: Int32 = 0
+  var ks: Int32 = 0
+  var nprobe: Int32 = 0
+  var C: Int32 = 0
+  var K: Int32 = 0
+  init(metric: String? = nil, d: Int32, m: Int32, ks: Int32, nprobe: Int32, C: Int32, K: Int32) {
     self.metric = metric; self.d = d; self.m = m; self.ks = ks; self.nprobe = nprobe; self.C = C; self.K = K
   }
 }
 
 /// Telemetry configuration
 public struct TelemetryConfig {
-  public var enabled: Bool
-  public var sampleRate: Double           // [0,1]
-  public var maxHistBuckets: Int          // default 64, capped at 128
-  public var sink: ((QueryStats) -> Void)?// optional callback per query
-  public var persistSnapshot: Bool
-  public var persistPath: String?
-  public init(enabled: Bool = false, sampleRate: Double = 0.0, maxHistBuckets: Int = 64,
+  var enabled: Bool
+  var sampleRate: Double           // [0,1]
+  var maxHistBuckets: Int          // default 64, capped at 128
+  var sink: ((QueryStats) -> Void)?// optional callback per query
+  var persistSnapshot: Bool
+  var persistPath: String?
+  init(enabled: Bool = false, sampleRate: Double = 0.0, maxHistBuckets: Int = 64,
               sink: ((QueryStats) -> Void)? = nil, persistSnapshot: Bool = false, persistPath: String? = nil) {
     self.enabled = enabled; self.sampleRate = sampleRate; self.maxHistBuckets = maxHistBuckets
     self.sink = sink; self.persistSnapshot = persistSnapshot; self.persistPath = persistPath
@@ -132,72 +136,72 @@ public struct TelemetryConfig {
 /// Global telemetry aggregates (snapshot-able)
 public struct TelemetryGlobal {
   // Totals
-  public var queries_total: UInt64 = 0
-  public var queries_sampled: UInt64 = 0
+  var queries_total: UInt64 = 0
+  var queries_sampled: UInt64 = 0
 
   // Work sums
-  public var work_kc_scored: UInt64 = 0
-  public var work_lists_routed: UInt64 = 0
-  public var work_lists_scanned: UInt64 = 0
-  public var work_codes_scanned: UInt64 = 0
-  public var work_vecs_scored: UInt64 = 0
-  public var work_candidates_emitted: UInt64 = 0
-  public var work_candidates_unique: UInt64 = 0
-  public var work_candidates_kept: UInt64 = 0
-  public var work_topk_selected: UInt64 = 0
+  var work_kc_scored: UInt64 = 0
+  var work_lists_routed: UInt64 = 0
+  var work_lists_scanned: UInt64 = 0
+  var work_codes_scanned: UInt64 = 0
+  var work_vecs_scored: UInt64 = 0
+  var work_candidates_emitted: UInt64 = 0
+  var work_candidates_unique: UInt64 = 0
+  var work_candidates_kept: UInt64 = 0
+  var work_topk_selected: UInt64 = 0
 
   // Bytes sums
-  public var bytes_lut: UInt64 = 0
-  public var bytes_codes: UInt64 = 0
-  public var bytes_vecs: UInt64 = 0
-  public var bytes_ids: UInt64 = 0
-  public var bytes_norms: UInt64 = 0
+  var bytes_lut: UInt64 = 0
+  var bytes_codes: UInt64 = 0
+  var bytes_vecs: UInt64 = 0
+  var bytes_ids: UInt64 = 0
+  var bytes_norms: UInt64 = 0
 
   // Time sums
-  public var time_ns: [UInt64] = Array(repeating: 0, count: TelemetryTimerId.allCases.count)
+  var time_ns: [UInt64] = Array(repeating: 0, count: TelemetryTimerId.allCases.count)
 
   // Flags counters
-  public var flag_used_dot_trick: UInt64 = 0
-  public var flag_used_cosine: UInt64 = 0
-  public var flag_used_interleaved_codes: UInt64 = 0
-  public var flag_used_u4: UInt64 = 0
-  public var flag_used_prefetch: UInt64 = 0
-  public var flag_used_heap_merge: UInt64 = 0
+  var flag_used_dot_trick: UInt64 = 0
+  var flag_used_cosine: UInt64 = 0
+  var flag_used_interleaved_codes: UInt64 = 0
+  var flag_used_u4: UInt64 = 0
+  var flag_used_prefetch: UInt64 = 0
+  var flag_used_heap_merge: UInt64 = 0
 
   // Ring
-  public var ring_cap: UInt32 = 1024
+  var ring_cap: UInt32 = 1024
 }
 
 /// Light query stats for ring buffer (compact representation)
-public struct QueryStatsLight {
-  public var metric: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
+internal struct QueryStatsLight {
+  var metric: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
                       UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
-  public var d: Int32 = 0
-  public var m: Int32 = 0
-  public var ks: Int32 = 0
-  public var nprobe: Int32 = 0
-  public var C: Int32 = 0
-  public var K: Int32 = 0
-  public var lists_scanned: UInt64 = 0
-  public var codes_scanned: UInt64 = 0
-  public var kc_scored: UInt64 = 0
-  public var t_total: UInt64 = 0
+  var d: Int32 = 0
+  var m: Int32 = 0
+  var ks: Int32 = 0
+  var nprobe: Int32 = 0
+  var C: Int32 = 0
+  var K: Int32 = 0
+  var lists_scanned: UInt64 = 0
+  var codes_scanned: UInt64 = 0
+  var kc_scored: UInt64 = 0
+  var t_total: UInt64 = 0
 }
 
 // MARK: - API Surface (names follow spec)
 
-public func telem_init(_ cfg: TelemetryConfig?) { Telemetry._init(cfg ?? TelemetryConfig()) }
-public func telem_shutdown() { Telemetry._shutdown() }
-public func telem_thread_init() { Telemetry._threadInit() }
-public func telem_begin_query(_ qctx: QueryCtx?) { Telemetry._beginQuery(qctx) }
-public func telem_end_query(_ out: UnsafeMutablePointer<QueryStats>?) { Telemetry._endQuery(copyTo: out) }
-public func telem_snapshot_json(_ buf: UnsafeMutablePointer<CChar>?, _ cap: Int) -> Int {
+internal func telem_init(_ cfg: TelemetryConfig?) { Telemetry._init(cfg ?? TelemetryConfig()) }
+internal func telem_shutdown() { Telemetry._shutdown() }
+internal func telem_thread_init() { Telemetry._threadInit() }
+internal func telem_begin_query(_ qctx: QueryCtx?) { Telemetry._beginQuery(qctx) }
+internal func telem_end_query(_ out: UnsafeMutablePointer<QueryStats>?) { Telemetry._endQuery(copyTo: out) }
+internal func telem_snapshot_json(_ buf: UnsafeMutablePointer<CChar>?, _ cap: Int) -> Int {
   Telemetry._snapshotJSON(into: buf, cap: cap)
 }
-public func telem_snapshot_struct(_ out: UnsafeMutablePointer<TelemetryGlobal>?) -> Int {
+internal func telem_snapshot_struct(_ out: UnsafeMutablePointer<TelemetryGlobal>?) -> Int {
   Telemetry._snapshotStruct(out)
 }
-public func telem_snapshot_to_file(_ path: UnsafePointer<CChar>?) -> Int {
+internal func telem_snapshot_to_file(_ path: UnsafePointer<CChar>?) -> Int {
   Telemetry._snapshotToFile(path)
 }
 
@@ -213,28 +217,28 @@ public enum TelemetryBytes { case lut, codes, vecs, ids, norms }
 public enum TelemetryDoubleField { case reservoir_tau, dup_ratio }
 public enum TelemetryU64Field { case candidates_emitted, candidates_unique, candidates_kept }
 
-public func TELEM_INC(_ c: TelemetryCounter, _ v: UInt64 = 1) { Telemetry._inc(c, v) }
-public func TELEM_ADD_BYTES(_ b: TelemetryBytes, _ v: UInt64) { Telemetry._addBytes(b, v) }
-public func TELEM_SET(_ f: TelemetryDoubleField, _ value: Double) { Telemetry._setDouble(f, value) }
-public func TELEM_SET64(_ f: TelemetryU64Field, _ value: UInt64) { Telemetry._setU64(f, value) }
-public func TELEM_FLAG(_ f: TelemetryFlags) { Telemetry._flag(f) }
+internal func TELEM_INC(_ c: TelemetryCounter, _ v: UInt64 = 1) { Telemetry._inc(c, v) }
+internal func TELEM_ADD_BYTES(_ b: TelemetryBytes, _ v: UInt64) { Telemetry._addBytes(b, v) }
+internal func TELEM_SET(_ f: TelemetryDoubleField, _ value: Double) { Telemetry._setDouble(f, value) }
+internal func TELEM_SET64(_ f: TelemetryU64Field, _ value: UInt64) { Telemetry._setU64(f, value) }
+internal func TELEM_FLAG(_ f: TelemetryFlags) { Telemetry._flag(f) }
 
 /// RAII timer guard (automatically stops timer on deinit)
 public struct TelemetryTimerGuard: ~Copyable {
   internal let id: TelemetryTimerId
   internal let t0: UInt64
-  public init(_ id: TelemetryTimerId) { self.id = id; self.t0 = Telemetry._nowNs() }
+  init(_ id: TelemetryTimerId) { self.id = id; self.t0 = Telemetry._nowNs() }
   deinit { Telemetry._addTimer(id, delta: Telemetry._nowNs() &- t0) }
 }
-@discardableResult public func TELEM_TIMER_GUARD(_ id: TelemetryTimerId) -> TelemetryTimerGuard { TelemetryTimerGuard(id) }
+@discardableResult internal func TELEM_TIMER_GUARD(_ id: TelemetryTimerId) -> TelemetryTimerGuard { TelemetryTimerGuard(id) }
 
 /// Manual timer token (start/end pair)
 public struct TelemetryTimerToken {
   internal let id: TelemetryTimerId
   internal let t0: UInt64
 }
-public func TELEM_TIMER_START(_ id: TelemetryTimerId) -> TelemetryTimerToken { .init(id: id, t0: Telemetry._nowNs()) }
-public func TELEM_TIMER_END(_ token: TelemetryTimerToken) { Telemetry._addTimer(token.id, delta: Telemetry._nowNs() &- token.t0) }
+internal func TELEM_TIMER_START(_ id: TelemetryTimerId) -> TelemetryTimerToken { .init(id: id, t0: Telemetry._nowNs()) }
+internal func TELEM_TIMER_END(_ token: TelemetryTimerToken) { Telemetry._addTimer(token.id, delta: Telemetry._nowNs() &- token.t0) }
 
 // MARK: - Implementation
 

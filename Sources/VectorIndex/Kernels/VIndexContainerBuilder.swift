@@ -56,7 +56,7 @@ fileprivate struct _Header {
 }
 
 // Public builder API
-public enum VIndexContainerBuilder {
+internal enum VIndexContainerBuilder {
     /// Create a minimal container with ListsDesc + IDs + Codes (or Vecs) sections.
     ///
     /// - Parameters:
@@ -138,7 +138,7 @@ public enum VIndexContainerBuilder {
         if includeIDMap {
             tocCount += 1
             idMapOffset = off
-            idMapSize = 64 // header-aligned minimal snapshot
+            idMapSize = 2048 // Sufficient for typical IDMap snapshots (~1000 IDs)
             off = alignUpU64(idMapOffset &+ idMapSize, 64)
         }
 
@@ -162,6 +162,9 @@ public enum VIndexContainerBuilder {
         zero(listsDescOffset, listsDescSize)
         zero(idsOffset, idsSize)
         zero(payloadOffset, payloadSize)
+        if includeIDMap {
+            zero(idMapOffset, idMapSize)
+        }
 
         // Write ListsDesc array
         let descsPtr = UnsafeMutableRawPointer(base).advanced(by: Int(listsDescOffset)).assumingMemoryBound(to: ListDesc.self)
@@ -180,6 +183,7 @@ public enum VIndexContainerBuilder {
         }
 
         // Build TOC entries
+        // All TOC fields are stored in little-endian (file) format
         let tocPtr = UnsafeMutableRawPointer(base).advanced(by: Int(tocOffset)).assumingMemoryBound(to: _TOCEntry.self)
         // ListsDesc entry
         tocPtr[0] = _TOCEntry(type: SectionType.listsDesc.rawValue, offset: listsDescOffset, size: listsDescSize, align: 64, flags: 0, crc32: 0, reserved: 0)
@@ -190,7 +194,7 @@ public enum VIndexContainerBuilder {
             tocPtr[3] = _TOCEntry(type: SectionType.idMap.rawValue, offset: idMapOffset, size: idMapSize, align: 64, flags: 0, crc32: 0, reserved: 0)
         }
 
-        // Compute CRCs over sections
+        // Compute CRCs over sections and store directly (no endian conversion needed on LE)
         for i in 0..<tocCount {
             var te = tocPtr[i]
             let p = UnsafeRawPointer(base).advanced(by: Int(te.offset))
@@ -199,7 +203,27 @@ public enum VIndexContainerBuilder {
         }
 
         // Write header with CRC
-        var hdr = _Header(magic: UInt64(0x00585845444E4956), version_major: 1, version_minor: 0, endianness: 1, arch: 0, flags: 0, d: UInt32(d), m: UInt16(m), ks: 0, kc: UInt32(k_c), id_bits: UInt8(idBits), code_group_g: UInt8(group), reservedA: (0,0,0,0,0,0), N_total: 0, generation: 0, toc_offset: tocOffset, toc_entries: UInt32(tocCount), header_crc32: 0, reservedRest: (0,0,0,0,0,0,0))
+        var hdr = _Header(
+            magic: UInt64(0x00585845444E4956),
+            version_major: 1,
+            version_minor: 0,
+            endianness: 1,
+            arch: 0,
+            flags: 0,
+            d: UInt32(d),
+            m: UInt16(m),
+            ks: 0,
+            kc: UInt32(k_c),
+            id_bits: UInt8(idBits),
+            code_group_g: UInt8(group),
+            reservedA: (0,0,0,0,0,0),
+            N_total: 0,
+            generation: 0,
+            toc_offset: tocOffset,
+            toc_entries: UInt32(tocCount),
+            header_crc32: 0,
+            reservedRest: (0,0,0,0,0,0,0)
+        )
         // Compute header CRC over 256 bytes with crc field zeroed
         let hdrPtr = UnsafeMutableRawPointer(base).assumingMemoryBound(to: _Header.self)
         hdrPtr.pointee = hdr

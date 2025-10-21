@@ -62,13 +62,13 @@ private struct CRC32 {
 // magic: "VINDEX\0\0" (LE)
 private let VINDEX_MAGIC = UInt64(0x00585845444E4956)
 
-public enum SectionType: UInt32 {
+internal enum SectionType: UInt32, Sendable {
     case centroids = 1, codebooks = 2, centroidNorms = 3, listsDesc = 4
     case ids = 5, codes = 6, vecs = 7, normsInv = 8, normsSq = 9
     case idMap = 10, tombstones = 11, telemetry = 12, freeList = 13, walAnchor = 14
 }
 
-public struct ListDesc {
+internal struct ListDesc {
     var format: UInt8
     var group_g: UInt8
     var id_bits: UInt8
@@ -135,13 +135,18 @@ private struct VIndexHeader {
 }
 
 @inline(__always) private func computeHeaderCRC(_ raw: UnsafeRawPointer) -> UInt32 {
+    // Copy header and zero the CRC field using struct field access (same as builder)
     var buf = [UInt8](repeating: 0, count: 256)
     memcpy(&buf, raw, 256)
-    buf[252] = 0; buf[253] = 0; buf[254] = 0; buf[255] = 0
-    return buf.withUnsafeBytes { CRC32.hash($0.baseAddress!, 256) }
+    // Zero the CRC field at its actual offset (68-71) via struct overlay
+    return buf.withUnsafeMutableBytes { bufPtr in
+        let hdrPtr = bufPtr.baseAddress!.assumingMemoryBound(to: VIndexHeader.self)
+        hdrPtr.pointee.header_crc32 = 0
+        return CRC32.hash(bufPtr.baseAddress!, 256)
+    }
 }
 
-public struct MmapOpts {
+internal struct MmapOpts {
     public var readOnly: Bool = true
     public var verifyCRCs: Bool = true
     public var adviseSequential: Bool = true
@@ -149,7 +154,7 @@ public struct MmapOpts {
     public init() {}
 }
 
-public struct AppendReservation {
+internal struct AppendReservation {
     public let listID: Int
     public let oldLen: Int
     public let addLen: Int
@@ -161,7 +166,7 @@ public struct AppendReservation {
     let vecsStride: Int
 }
 
-public enum VIndexError: Error {
+internal enum VIndexError: Error {
     case openFailed(errno: Int32)
     case statFailed(errno: Int32)
     case mmapFailed(errno: Int32)
@@ -176,7 +181,7 @@ public enum VIndexError: Error {
     case walIOFailed(errno: Int32)
 }
 
-public final class IndexMmap {
+internal final class IndexMmap {
     public let path: String
     public let fd: Int32
     public private(set) var fileSize: UInt64
@@ -426,7 +431,9 @@ public final class IndexMmap {
         let p = slice(te)
         let sz = Int(te.sizeHost(fileEndian))
         let newCRC = CRC32.hash(p, sz)
-        te.crc32 = fromHost(newCRC, fileEndian: fileEndian)
+        // Store CRC directly without endian conversion (same as builder)
+        // Builder writes CRC in native format, reader applies toHost() during validation
+        te.crc32 = newCRC
         let mutToc = UnsafeMutablePointer<TOCEntry>(mutating: toc)
         mutToc.advanced(by: i).pointee = te
         // Sync the TOC entry cache

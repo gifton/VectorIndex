@@ -17,7 +17,7 @@ let package = Package(
         ),
     ],
     dependencies: [
-        .package(url: "https://github.com/gifton/VectorCore", from: "0.1.0")
+        .package(url: "https://github.com/gifton/VectorCore", from: "0.1.2")
     ],
     targets: [
         .target(

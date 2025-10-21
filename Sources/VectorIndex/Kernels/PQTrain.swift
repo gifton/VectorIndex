@@ -49,6 +49,30 @@ public struct PQTrainStats {
     public var bytesRead: Int64 = 0
 }
 
+private final class SubspaceAccumulator: @unchecked Sendable {
+    private var storage: [SubspaceResults?]
+    private let lock = NSLock()
+    init(count: Int) { storage = Array(repeating: nil, count: count) }
+    func set(_ index: Int, _ value: SubspaceResults) {
+        lock.lock(); defer { lock.unlock() }
+        storage[index] = value
+    }
+    func get(_ index: Int) -> SubspaceResults? { storage[index] }
+}
+
+// Thread-local results for each subspace
+@preconcurrency
+struct SubspaceResults {
+    var timeInit: Double = 0
+    var timeTrain: Double = 0
+    var distortion: Double = 0
+    var iters: Int = 0
+    var emptiesFixed: Int = 0
+    var bytesRead: Int64 = 0
+    var codebook: [Float] = []
+    var norms: [Float]? = nil
+}
+
 @discardableResult
 @preconcurrency
 public func pq_train_f32(
@@ -82,20 +106,8 @@ public func pq_train_f32(
     if centroidNormsOut != nil && cfg.computeCentroidNorms == false {
         cfg.computeCentroidNorms = true
     }
-
-    // Thread-local results for each subspace
-    struct SubspaceResults {
-        var timeInit: Double = 0
-        var timeTrain: Double = 0
-        var distortion: Double = 0
-        var iters: Int = 0
-        var emptiesFixed: Int = 0
-        var bytesRead: Int64 = 0
-        var codebook: [Float] = []
-        var norms: [Float]? = nil
-    }
-
-    var perSubspaceResults = [SubspaceResults](repeating: SubspaceResults(), count: m)
+    
+    let resultAcc = SubspaceAccumulator(count: m)
 
     // Pre-allocate local copies to avoid capturing inout parameters
     _ = codebooksOut
@@ -180,8 +192,8 @@ public func pq_train_f32(
                 normsJ = norms
             }
 
-            // Store results (each task writes to unique index j, no race condition)
-            perSubspaceResults[j] = SubspaceResults(
+            // Store results via accumulator to avoid mutating captured var in concurrent code
+            let res = SubspaceResults(
                 timeInit: tInitE - tInitS,
                 timeTrain: tTrainE - tTrainS,
                 distortion: distortion,
@@ -191,6 +203,7 @@ public func pq_train_f32(
                 codebook: Cj,
                 norms: normsJ
             )
+            resultAcc.set(j, res)
         }
     }
     group.wait()
@@ -207,7 +220,7 @@ public func pq_train_f32(
     )
 
     for j in 0..<m {
-        let result = perSubspaceResults[j]
+        let result = resultAcc.get(j) ?? SubspaceResults()
 
         // Copy codebook
         let cbOffset = j * ks * dsub
@@ -478,7 +491,7 @@ private func kmeansppSeedSubspace(
 ) {
     // Create local var copies for &array[index] syntax
     var x = x
-    var coarse = coarse
+    let coarse = coarse
 
     let nI = Int(n)
     var i0 = Int(rng.uniformF64() * Double(n))
@@ -596,7 +609,7 @@ private func lloydKMeansSubspace(
 ) {
     // Create local var copies for &array[index] syntax
     var x = x
-    var coarse = coarse
+    let coarse = coarse
 
     let nI = Int(n)
     var prevDist = Double.infinity
@@ -726,7 +739,7 @@ private func minibatchKMeansSubspace(
 ) {
     // Create local var copies for &array[index] syntax
     var x = x
-    var coarse = coarse
+    let coarse = coarse
 
     let nI = Int(n)
     var idx = [UInt32](repeating: 0, count: nI)
@@ -823,7 +836,7 @@ private func minibatchKMeansSubspaceChunk(
 ) {
     // Create local var copies for &array[index] syntax
     var xChunk = xChunk
-    var coarse = coarse
+    let coarse = coarse
 
     let nI = Int(n)
     if nI == 0 { return }

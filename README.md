@@ -28,7 +28,7 @@ try await hnsw.batchInsert(items)
 let nn = try await hnsw.search(query: queryEmbedding, k: 10, filter: nil)
 
 // IVF approximate index
-let ivf = IVFIndex(dimension: 768, metric: .euclidean, config: .init(nlist: 256, nprobe: 8, seed: 42))
+let ivf = IVFIndex(dimension: 768, metric: .euclidean, config: .init(nlist: 256, nprobe: 8))
 try await ivf.batchInsert(items)
 try await ivf.optimize() // builds centroids + lists
 let ivfRes = try await ivf.search(query: queryEmbedding, k: 10, filter: nil)

@@ -624,17 +624,18 @@ private func partitionAndSelectParallel(
     threads: Int
 ) -> [PartitionResult] {
     let blocks = threads
-    var results = Array(repeating: PartitionResult(ids: [], scores: []), count: blocks)
+    let accumulator = PartitionAccumulator(count: blocks)
 
-    q.withUnsafeBufferPointer { qPtr in
-        centroids.withUnsafeBufferPointer { centsPtr in
-            DispatchQueue.concurrentPerform(iterations: blocks) { b in
-                let (start, count) = partitionRange(kc: kc, blocks: blocks, blockIndex: b)
-                if count == 0 {
-                    results[b] = PartitionResult(ids: [], scores: [])
-                    return
-                }
+    DispatchQueue.concurrentPerform(iterations: blocks) { b in
+        let (start, count) = partitionRange(kc: kc, blocks: blocks, blockIndex: b)
+        if count == 0 {
+            accumulator.set(b, PartitionResult(ids: [], scores: []))
+            return
+        }
 
+        // Acquire local pointers for the duration of this closure
+        q.withUnsafeBufferPointer { qPtr in
+            centroids.withUnsafeBufferPointer { centsPtr in
                 // Score this partition
                 let localScores = ScoreBufferPool.shared.acquire(size: count)
                 defer { ScoreBufferPool.shared.release(localScores) }
@@ -678,15 +679,16 @@ private func partitionAndSelectParallel(
                 }
 
                 let sorted = heap.extractSorted()
-                results[b] = PartitionResult(
+                let part = PartitionResult(
                     ids: sorted.map { $0.id },
                     scores: sorted.map { $0.score }
                 )
+                accumulator.set(b, part)
             }
         }
     }
 
-    return results
+    return accumulator.toArray()
 }
 
 private func partitionRange(kc: Int, blocks: Int, blockIndex: Int) -> (start: Int, count: Int) {
@@ -723,6 +725,20 @@ private func mergePartitions(
     for i in actualK..<nprobe {
         listIDsOut[i] = -1
         listScoresOut?[i] = .nan
+    }
+}
+
+// Thread-safe accumulator to avoid mutating captured arrays inside concurrent closures
+private final class PartitionAccumulator: @unchecked Sendable {
+    private var storage: [PartitionResult?]
+    private let lock = NSLock()
+    init(count: Int) { storage = Array(repeating: nil, count: count) }
+    func set(_ index: Int, _ value: PartitionResult) {
+        lock.lock(); defer { lock.unlock() }
+        storage[index] = value
+    }
+    func toArray() -> [PartitionResult] {
+        return storage.map { $0 ?? PartitionResult(ids: [], scores: []) }
     }
 }
 

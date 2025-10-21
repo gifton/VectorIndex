@@ -24,7 +24,7 @@ import CPQEncode
 
 extension PQEncodeOpts {
     @inline(__always) @usableFromInline internal func _toC(ks: Int, layout: PQCodeLayout) -> CPQEncode.PQEncodeOpts {
-        var c = CPQEncode.PQEncodeOpts(
+        let c = CPQEncode.PQEncodeOpts(
             layout: CPQEncode.PQLayout(rawValue: 0),
             use_dot_trick: self.useDotTrick,
             precompute_x_norm2: self.useDotTrick,
