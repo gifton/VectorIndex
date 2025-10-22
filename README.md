@@ -67,6 +67,28 @@ IVF:
 - `nprobe`: probed lists per query; higher → better recall, slower search
 - `seed`: RNG seed for KMeans++ (deterministic tests)
 
+## Error Handling
+
+VectorIndex 0.1.0+ uses structured error handling with `VectorIndexError`:
+
+```swift
+do {
+    let index = try IVFListHandle(k_c: 10, m: 0, d: 128, opts: .default)
+    let stats = try kmeansPlusPlusSeed(data: vectors, count: n, dimension: d, k: 10, ...)
+} catch let error as VectorIndexError {
+    // Rich error information
+    print("Error: \(error.message)")
+    print("Recovery: \(error.recoveryMessage)")
+    print("Recoverable: \(error.kind.isRecoverable)")
+
+    // Structured metadata for debugging
+    print("Operation: \(error.context.operation)")
+    print("Details: \(error.context.additionalInfo)")
+}
+```
+
+See [ERRORS.md](ERRORS.md) for complete error handling guide.
+
 ## Concurrency
 
 - All indices are actors; methods are `async` and actor‑isolated.
@@ -75,3 +97,7 @@ IVF:
 ## Acceleration
 
 - The package is CPU‑only by design. A future bridge (e.g., `VectorIndexAccelerate`) can inject GPU‑accelerated distance providers for IVF building and scoring.
+
+## Known Issues
+
+See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for documented issues in 0.1.0-alpha.

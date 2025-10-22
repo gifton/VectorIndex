@@ -386,7 +386,9 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             rounds: 5
         )
 
-        _ = kmeansPlusPlusSeed(
+        // Safe to force-try: store.isEmpty precondition ensures n >= 1,
+        // and k is validated by caller to be reasonable
+        _ = try! kmeansPlusPlusSeed(
             data: flatData,
             count: items.count,
             dimension: d,

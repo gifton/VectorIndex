@@ -173,10 +173,83 @@ public final class IVFListHandle {
     fileprivate let globalLock: any ListLock = makeLock()
     @inline(__always) public var codeBytesPerVector: Int { switch format { case .pq8: return m; case .pq4: precondition(m % 2 == 0); return m >> 1; case .flat: return d * MemoryLayout<Float>.stride } }
 
+    /// Create IVF index handle with specified configuration
+    ///
+    /// - Throws:
+    ///   - `VectorIndexError(.invalidParameter)`: If k_c ≤ 0
+    ///   - `VectorIndexError(.invalidParameter)`: If d ≤ 0 for flat format
+    ///   - `VectorIndexError(.invalidParameter)`: If m ≠ 0 for flat format
+    ///   - `VectorIndexError(.invalidParameter)`: If m ≤ 0 or d ≠ 0 for PQ format
+    ///   - `VectorIndexError(.invalidParameter)`: If group not 4 or 8
+    ///   - `VectorIndexError(.invalidParameter)`: If m not divisible by group
+    ///   - `IVFError(.allocationFailed)`: If memory allocation fails
+    ///
+    /// - Parameters:
+    ///   - k_c: Number of partitions (must be > 0)
+    ///   - m: Number of PQ subspaces (must be 0 for flat, > 0 for PQ)
+    ///   - d: Vector dimension (must be > 0 for flat, 0 for PQ)
+    ///   - opts: Configuration options
     public init(k_c: Int, m: Int, d: Int, opts: IVFAppendOpts = .default) throws {
-        precondition(k_c > 0)
-        if opts.format == .flat { precondition(d > 0); precondition(m == 0) }
-        else { precondition(m > 0 && d == 0); precondition(opts.group == 4 || opts.group == 8); precondition(m % opts.group == 0) }
+        // Validate k_c
+        guard k_c > 0 else {
+            throw ErrorBuilder.invalidParameter(
+                operation: "ivf_create",
+                name: "k_c",
+                value: "\(k_c)",
+                constraint: "must be > 0"
+            )
+        }
+
+        // Validate format-specific parameters
+        if opts.format == .flat {
+            // Flat format: d > 0, m == 0
+            guard d > 0 else {
+                throw ErrorBuilder.invalidParameter(
+                    operation: "ivf_create",
+                    name: "d",
+                    value: "\(d)",
+                    constraint: "must be > 0 for flat format"
+                )
+            }
+            guard m == 0 else {
+                throw ErrorBuilder.invalidParameter(
+                    operation: "ivf_create",
+                    name: "m",
+                    value: "\(m)",
+                    constraint: "must be 0 for flat format"
+                )
+            }
+        } else {
+            // PQ format: m > 0, d == 0
+            guard m > 0 && d == 0 else {
+                throw ErrorBuilder(.invalidParameter, operation: "ivf_create")
+                    .message("For PQ format: m must be > 0 and d must be 0")
+                    .info("m", "\(m)")
+                    .info("d", "\(d)")
+                    .info("format", "\(opts.format)")
+                    .build()
+            }
+
+            // Validate group size
+            guard opts.group == 4 || opts.group == 8 else {
+                throw ErrorBuilder.invalidParameter(
+                    operation: "ivf_create",
+                    name: "group",
+                    value: "\(opts.group)",
+                    constraint: "must be 4 or 8"
+                )
+            }
+
+            // Validate m divisible by group
+            guard m % opts.group == 0 else {
+                throw ErrorBuilder(.invalidParameter, operation: "ivf_create")
+                    .message("m must be divisible by group size")
+                    .info("m", "\(m)")
+                    .info("group", "\(opts.group)")
+                    .build()
+            }
+        }
+
         self.k_c = k_c; self.m = m; self.d = d; self.opts = opts; self.format = opts.format; self.storage = .heap
         self.lists.reserveCapacity(k_c)
         let initCap = max(0, opts.reserve_min)

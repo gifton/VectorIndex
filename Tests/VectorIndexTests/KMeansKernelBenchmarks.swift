@@ -23,7 +23,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: &data,
                 count: n,
                 dimension: d,
@@ -50,7 +50,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: &data,
                 count: n,
                 dimension: d,
@@ -76,7 +76,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: &data,
                 count: n,
                 dimension: d,
@@ -102,7 +102,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: &data,
                 count: n,
                 dimension: d,
@@ -128,7 +128,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: &data,
                 count: n,
                 dimension: d,
@@ -421,7 +421,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
         measure {
             // Phase 1: K-means++ seeding
             var initCentroids = [Float](repeating: 0, count: k * d)
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: &data,
                 count: n,
                 dimension: d,

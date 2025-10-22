@@ -22,7 +22,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data,
             count: n,
             dimension: d,
@@ -71,7 +71,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         // Run seeding twice with same seed
         var centroids1 = [Float](repeating: 0, count: k * d)
         var indices1 = [Int](repeating: -1, count: k)
-        let stats1 = kmeansPlusPlusSeed(
+        let stats1 = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed),
             centroidsOut: &centroids1,
@@ -80,7 +80,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids2 = [Float](repeating: 0, count: k * d)
         var indices2 = [Int](repeating: -1, count: k)
-        let stats2 = kmeansPlusPlusSeed(
+        let stats2 = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed),
             centroidsOut: &centroids2,
@@ -108,7 +108,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         // Run with different seeds
         var indices1 = [Int](repeating: -1, count: k)
         var centroids1 = [Float](repeating: 0, count: k * d)
-        _ = kmeansPlusPlusSeed(
+        _ = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 111),
             centroidsOut: &centroids1,
@@ -117,7 +117,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var indices2 = [Int](repeating: -1, count: k)
         var centroids2 = [Float](repeating: 0, count: k * d)
-        _ = kmeansPlusPlusSeed(
+        _ = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 222),
             centroidsOut: &centroids2,
@@ -157,7 +157,7 @@ final class KMeansPPSeedingTests: XCTestCase {
             var centroids = [Float](repeating: 0, count: k * d)
             var indices = [Int](repeating: -1, count: k)
 
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: data, count: n, dimension: d, k: k,
                 config: KMeansSeedConfig(k: k, rngSeed: seed),
                 centroidsOut: &centroids,
@@ -192,7 +192,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroid = [Float](repeating: 0, count: d)
         var chosenIndex = [Int](repeating: -1, count: 1)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 999),
             centroidsOut: &centroid,
@@ -219,7 +219,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -246,7 +246,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -280,7 +280,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 555),
             centroidsOut: &centroids,
@@ -309,7 +309,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         // Run with different stream IDs
         var indices0 = [Int](repeating: -1, count: k)
         var centroids0 = [Float](repeating: 0, count: k * d)
-        _ = kmeansPlusPlusSeed(
+        _ = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed, rngStreamID: 0),
             centroidsOut: &centroids0,
@@ -318,7 +318,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var indices1 = [Int](repeating: -1, count: k)
         var centroids1 = [Float](repeating: 0, count: k * d)
-        _ = kmeansPlusPlusSeed(
+        _ = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed, rngStreamID: 1),
             centroidsOut: &centroids1,
@@ -345,7 +345,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids = [Float](repeating: 0, count: k * d)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -374,7 +374,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids = [Float](repeating: 0, count: k * d)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -403,7 +403,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids = [Float](repeating: 0, count: k * d)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -433,7 +433,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = kmeansPlusPlusSeed(
+        let stats = try! kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -461,7 +461,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: data, count: n, dimension: d, k: k,
                 config: .default,
                 centroidsOut: &centroids,
@@ -484,7 +484,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = kmeansPlusPlusSeed(
+            _ = try! kmeansPlusPlusSeed(
                 data: data, count: n, dimension: d, k: k,
                 config: .default,
                 centroidsOut: &centroids,

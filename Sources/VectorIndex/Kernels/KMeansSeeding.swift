@@ -148,11 +148,17 @@ public struct KMeansSeedStats: Sendable {
 /// - Complexity: O(ndk) where n=count, d=dimension, k=centroids
 /// - Performance: ~2-3 GB/s on M1 (memory-bound for distance computation)
 ///
+/// - Throws:
+///   - `VectorIndexError(.invalidParameter)`: If k < 1
+///   - `VectorIndexError(.invalidParameter)`: If k > n
+///   - `VectorIndexError(.invalidParameter)`: If n < 1
+///   - `VectorIndexError(.invalidDimension)`: If d < 1
+///
 /// - Parameters:
 ///   - data: Input vectors [n][d], row-major, Float32
-///   - count: Number of vectors
-///   - dimension: Vector dimension
-///   - k: Number of centroids to select
+///   - count: Number of vectors (must be ≥ 1)
+///   - dimension: Vector dimension (must be ≥ 1)
+///   - k: Number of centroids to select (must be in [1, n])
 ///   - config: Seeding configuration
 ///   - centroidsOut: Output centroids [k][d]
 ///   - chosenIndicesOut: Optional indices of chosen seeds [k]
@@ -166,9 +172,43 @@ public func kmeansPlusPlusSeed(
     config: KMeansSeedConfig = .default,
     centroidsOut: UnsafeMutablePointer<Float>,
     chosenIndicesOut: UnsafeMutablePointer<Int>?
-) -> KMeansSeedStats {
-    precondition(k >= 1 && k <= n, "k must be in [1, n]")
-    precondition(d >= 1, "dimension must be positive")
+) throws -> KMeansSeedStats {
+    // Validate dimension
+    guard d >= 1 else {
+        throw ErrorBuilder(.invalidDimension, operation: "kmeans_seed")
+            .message("Dimension must be at least 1")
+            .info("dimension", "\(d)")
+            .build()
+    }
+
+    // Validate count
+    guard n >= 1 else {
+        throw ErrorBuilder.invalidParameter(
+            operation: "kmeans_seed",
+            name: "n",
+            value: "\(n)",
+            constraint: "must be >= 1"
+        )
+    }
+
+    // Validate k lower bound
+    guard k >= 1 else {
+        throw ErrorBuilder.invalidParameter(
+            operation: "kmeans_seed",
+            name: "k",
+            value: "\(k)",
+            constraint: "must be >= 1"
+        )
+    }
+
+    // Validate k upper bound
+    guard k <= n else {
+        throw ErrorBuilder(.invalidParameter, operation: "kmeans_seed")
+            .message("k must not exceed number of data points")
+            .info("k", "\(k)")
+            .info("n", "\(n)")
+            .build()
+    }
 
     let startTime = DispatchTime.now().uptimeNanoseconds
 

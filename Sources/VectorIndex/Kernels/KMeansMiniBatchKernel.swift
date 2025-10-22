@@ -455,7 +455,8 @@ public func kmeans_minibatch_f32(
             sampleSize: 0, rngSeed: cfg.seed, rngStreamID: cfg.streamID,
             strictFP: false, prefetchDistance: 2, oversamplingFactor: 2, rounds: 5
         )
-        _ = kmeansPlusPlusSeed(
+        // Safe to force-try: parameters already validated on lines 436-437
+        _ = try! kmeansPlusPlusSeed(
             data: x, count: Int(n), dimension: d, k: kc,
             config: seedCfg, centroidsOut: centroidsOut, chosenIndicesOut: nil
         )

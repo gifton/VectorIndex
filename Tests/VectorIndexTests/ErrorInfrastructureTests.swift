@@ -498,4 +498,337 @@ final class ErrorInfrastructureTests: XCTestCase {
             XCTAssertTrue(kinds.contains(.fileIOError))
         }
     }
+
+    // MARK: - Phase 2 Migration Tests: IVFAppend
+
+    func testIVFAppend_ThrowsOnInvalidKc() {
+        // Test k_c <= 0
+        XCTAssertThrowsError(try IVFListHandle(k_c: 0, m: 0, d: 128, opts: IVFAppendOpts(format: .flat))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError, got \(type(of: error))")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertTrue(indexError.kind.isRecoverable)
+            XCTAssertEqual(indexError.context.operation, "ivf_create")
+            XCTAssertEqual(indexError.context.additionalInfo["param_k_c"], "0")
+            XCTAssertTrue(indexError.message.contains("must be > 0"))
+        }
+
+        XCTAssertThrowsError(try IVFListHandle(k_c: -5, m: 0, d: 128, opts: IVFAppendOpts(format: .flat))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["param_k_c"], "-5")
+        }
+    }
+
+    func testIVFAppend_ThrowsOnInvalidDimensionForFlat() {
+        // Test d <= 0 for flat format
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 0, d: 0, opts: IVFAppendOpts(format: .flat))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.operation, "ivf_create")
+            XCTAssertEqual(indexError.context.additionalInfo["param_d"], "0")
+            XCTAssertTrue(indexError.message.contains("must be > 0 for flat format"))
+        }
+
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 0, d: -128, opts: IVFAppendOpts(format: .flat))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["param_d"], "-128")
+        }
+    }
+
+    func testIVFAppend_ThrowsOnNonZeroMForFlat() {
+        // Test m != 0 for flat format
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 8, d: 128, opts: IVFAppendOpts(format: .flat))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.operation, "ivf_create")
+            XCTAssertEqual(indexError.context.additionalInfo["param_m"], "8")
+            XCTAssertTrue(indexError.message.contains("must be 0 for flat format"))
+        }
+    }
+
+    func testIVFAppend_ThrowsOnInvalidMForPQ() {
+        // Test m <= 0 for PQ format
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 0, d: 0, opts: IVFAppendOpts(format: .pq8))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.operation, "ivf_create")
+            XCTAssertEqual(indexError.context.additionalInfo["m"], "0")
+            XCTAssertEqual(indexError.context.additionalInfo["d"], "0")
+            XCTAssertTrue(indexError.message.contains("m must be > 0 and d must be 0"))
+        }
+
+        // Test d != 0 for PQ format
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 8, d: 128, opts: IVFAppendOpts(format: .pq8, group: 4))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["m"], "8")
+            XCTAssertEqual(indexError.context.additionalInfo["d"], "128")
+        }
+    }
+
+    func testIVFAppend_ThrowsOnInvalidGroupSize() {
+        // Test group not 4 or 8
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 16, d: 0, opts: IVFAppendOpts(format: .pq8, group: 2))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.operation, "ivf_create")
+            XCTAssertEqual(indexError.context.additionalInfo["param_group"], "2")
+            XCTAssertTrue(indexError.message.contains("must be 4 or 8"))
+        }
+
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 16, d: 0, opts: IVFAppendOpts(format: .pq8, group: 16))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["param_group"], "16")
+        }
+    }
+
+    func testIVFAppend_ThrowsOnMNotDivisibleByGroup() {
+        // Test m % group != 0
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 15, d: 0, opts: IVFAppendOpts(format: .pq8, group: 4))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.operation, "ivf_create")
+            XCTAssertEqual(indexError.context.additionalInfo["m"], "15")
+            XCTAssertEqual(indexError.context.additionalInfo["group"], "4")
+            XCTAssertTrue(indexError.message.contains("m must be divisible by group size"))
+        }
+
+        XCTAssertThrowsError(try IVFListHandle(k_c: 10, m: 17, d: 0, opts: IVFAppendOpts(format: .pq8, group: 8))) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["m"], "17")
+            XCTAssertEqual(indexError.context.additionalInfo["group"], "8")
+        }
+    }
+
+    func testIVFAppend_SucceedsWithValidParameters() {
+        // Test that valid parameters succeed
+        XCTAssertNoThrow(try IVFListHandle(k_c: 10, m: 0, d: 128, opts: IVFAppendOpts(format: .flat)))
+        XCTAssertNoThrow(try IVFListHandle(k_c: 100, m: 8, d: 0, opts: IVFAppendOpts(format: .pq8, group: 4)))
+        XCTAssertNoThrow(try IVFListHandle(k_c: 50, m: 16, d: 0, opts: IVFAppendOpts(format: .pq8, group: 8)))
+        XCTAssertNoThrow(try IVFListHandle(k_c: 1, m: 0, d: 1, opts: IVFAppendOpts(format: .flat)))
+    }
+
+    // MARK: - Phase 2 Migration Tests: KMeansSeeding
+
+    func testKMeansSeeding_ThrowsOnInvalidDimension() {
+        // Test d < 1
+        var data = [Float](repeating: 0.0, count: 100)
+        var centroids = [Float](repeating: 0.0, count: 10)
+
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 10,
+            dimension: 0,
+            k: 2,
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError, got \(type(of: error))")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidDimension)
+            XCTAssertTrue(indexError.kind.isRecoverable)
+            XCTAssertEqual(indexError.context.operation, "kmeans_seed")
+            XCTAssertEqual(indexError.context.additionalInfo["dimension"], "0")
+            XCTAssertTrue(indexError.message.contains("must be at least 1"))
+        }
+
+        // Test negative dimension
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 10,
+            dimension: -5,
+            k: 2,
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+            XCTAssertEqual(indexError.kind, .invalidDimension)
+            XCTAssertEqual(indexError.context.additionalInfo["dimension"], "-5")
+        }
+    }
+
+    func testKMeansSeeding_ThrowsOnInvalidCount() {
+        // Test n < 1
+        var data = [Float](repeating: 0.0, count: 10)
+        var centroids = [Float](repeating: 0.0, count: 10)
+
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 0,
+            dimension: 10,
+            k: 2,
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertTrue(indexError.kind.isRecoverable)
+            XCTAssertEqual(indexError.context.operation, "kmeans_seed")
+            XCTAssertEqual(indexError.context.additionalInfo["param_n"], "0")
+            XCTAssertTrue(indexError.message.contains("must be >= 1"))
+        }
+
+        // Test negative count
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: -10,
+            dimension: 10,
+            k: 2,
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["param_n"], "-10")
+        }
+    }
+
+    func testKMeansSeeding_ThrowsOnKLessThanOne() {
+        // Test k < 1
+        var data = [Float](repeating: 0.0, count: 100)
+        var centroids = [Float](repeating: 0.0, count: 10)
+
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 10,
+            dimension: 10,
+            k: 0,
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.operation, "kmeans_seed")
+            XCTAssertEqual(indexError.context.additionalInfo["param_k"], "0")
+            XCTAssertTrue(indexError.message.contains("must be >= 1"))
+        }
+
+        // Test negative k
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 10,
+            dimension: 10,
+            k: -5,
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["param_k"], "-5")
+        }
+    }
+
+    func testKMeansSeeding_ThrowsOnKGreaterThanN() {
+        // Test k > n
+        var data = [Float](repeating: 0.0, count: 50) // 5 vectors of dim 10
+        var centroids = [Float](repeating: 0.0, count: 100) // space for 10 centroids
+
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 5,
+            dimension: 10,
+            k: 10, // k > n (10 > 5)
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertTrue(indexError.kind.isRecoverable)
+            XCTAssertEqual(indexError.context.operation, "kmeans_seed")
+            XCTAssertEqual(indexError.context.additionalInfo["k"], "10")
+            XCTAssertEqual(indexError.context.additionalInfo["n"], "5")
+            XCTAssertTrue(indexError.message.contains("must not exceed number of data points"))
+        }
+
+        // Test k = n + 1
+        XCTAssertThrowsError(try kmeansPlusPlusSeed(
+            data: &data,
+            count: 5,
+            dimension: 10,
+            k: 6, // k = n + 1
+            centroidsOut: &centroids,
+            chosenIndicesOut: nil
+        )) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError")
+                return
+            }
+            XCTAssertEqual(indexError.kind, .invalidParameter)
+            XCTAssertEqual(indexError.context.additionalInfo["k"], "6")
+            XCTAssertEqual(indexError.context.additionalInfo["n"], "5")
+        }
+    }
+
+    // Note: Success case tests for kmeansPlusPlusSeed are covered in KMeansPPSeedingTests.swift
+    // The tests there use properly aligned data and cover all valid parameter combinations.
+    // This test file focuses on error path validation to ensure proper error handling.
 }
