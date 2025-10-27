@@ -43,26 +43,8 @@ import Accelerate
 
 // MARK: - Error Handling
 
-/// Errors that can occur during residual computation
-public enum ResidualError: Int32, Error {
-    case ok = 0
-    case invalidDimension = -1
-    case invalidCoarseID = -2
-    case invalidAlignment = -3
-    case nullPointer = -4
-    case dimensionMismatch = -5
-
-    public var localizedDescription: String {
-        switch self {
-        case .ok: return "Success"
-        case .invalidDimension: return "Invalid dimension (d must be > 0 and divisible by m)"
-        case .invalidCoarseID: return "Coarse assignment ID out of valid range [0, kc)"
-        case .invalidAlignment: return "Pointer not properly aligned for SIMD operations"
-        case .nullPointer: return "Required pointer is null"
-        case .dimensionMismatch: return "Dimension mismatch between vectors and centroids"
-        }
-    }
-}
+// ResidualError removed - migrated to VectorIndexError
+// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
 
 // MARK: - Options & Telemetry
 
@@ -160,7 +142,7 @@ internal func _prefetchRead(_ ptr: UnsafeRawPointer?) {
 ///   - d:               dimension (must be > 0)
 ///   - rOut:            [n × d] preallocated output buffer
 ///   - opts:            residual options (grouping, prefetch, bounds)
-/// - Throws: `ResidualError` if validation fails
+/// - Throws: `VectorIndexError` if validation fails
 ///
 @inlinable
 public func residuals_f32(
@@ -173,12 +155,18 @@ public func residuals_f32(
     opts: ResidualOpts = .default
 ) throws {
     guard d > 0 else {
-        throw ResidualError.invalidDimension
+        throw ErrorBuilder(.invalidDimension, operation: "residuals_f32")
+            .message("Invalid dimension: d must be positive")
+            .info("d", "\(d)")
+            .build()
     }
 
     if opts.checkBounds {
         guard opts.kc > 0 else {
-            throw ResidualError.invalidCoarseID
+            throw ErrorBuilder(.invalidParameter, operation: "residuals_f32")
+                .message("Invalid kc for bounds checking: must be positive")
+                .info("kc", "\(opts.kc)")
+                .build()
         }
     }
 
@@ -213,7 +201,12 @@ public func residuals_f32(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {
-                throw ResidualError.invalidCoarseID
+                throw ErrorBuilder(.invalidRange, operation: "residuals_compute")
+                    .message("Coarse assignment ID out of valid range")
+                    .info("coarse_id", "\(a)")
+                    .info("valid_range", "0..<\(opts.kc)")
+                    .info("vector_index", "\(i)")
+                    .build()
             }
         }
 
@@ -250,7 +243,7 @@ public func residuals_f32(
 /// Overwrites input vectors with their residuals, saving memory allocation.
 ///
 /// - Parameters: Mirror `residuals_f32` except `x_io` is both input & output.
-/// - Throws: `ResidualError` if validation fails
+/// - Throws: `VectorIndexError` if validation fails
 ///
 @inlinable
 public func residuals_f32_inplace(
@@ -262,12 +255,18 @@ public func residuals_f32_inplace(
     opts: ResidualOpts = .default
 ) throws {
     guard d > 0 else {
-        throw ResidualError.invalidDimension
+        throw ErrorBuilder(.invalidDimension, operation: "residuals_f32_inplace")
+            .message("Invalid dimension: d must be positive")
+            .info("d", "\(d)")
+            .build()
     }
 
     if opts.checkBounds {
         guard opts.kc > 0 else {
-            throw ResidualError.invalidCoarseID
+            throw ErrorBuilder(.invalidParameter, operation: "residuals_f32_inplace")
+                .message("Invalid kc for bounds checking: must be positive")
+                .info("kc", "\(opts.kc)")
+                .build()
         }
     }
 
@@ -299,7 +298,12 @@ public func residuals_f32_inplace(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {
-                throw ResidualError.invalidCoarseID
+                throw ErrorBuilder(.invalidRange, operation: "residuals_compute")
+                    .message("Coarse assignment ID out of valid range")
+                    .info("coarse_id", "\(a)")
+                    .info("valid_range", "0..<\(opts.kc)")
+                    .info("vector_index", "\(i)")
+                    .build()
             }
         }
 
@@ -344,7 +348,10 @@ internal func _residuals_grouped(
     let nInt = Int(n)
     let kc = opts.kc
     guard kc > 0 else {
-        throw ResidualError.invalidCoarseID
+        throw ErrorBuilder(.invalidParameter, operation: "residuals_grouped")
+            .message("Invalid kc for grouped residuals: must be positive")
+            .info("kc", "\(kc)")
+            .build()
     }
 
     // 1) counts per centroid
@@ -353,7 +360,12 @@ internal func _residuals_grouped(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < kc else {
-                throw ResidualError.invalidCoarseID
+                throw ErrorBuilder(.invalidRange, operation: "residuals_grouped")
+                    .message("Coarse assignment ID out of valid range")
+                    .info("coarse_id", "\(a)")
+                    .info("valid_range", "0..<\(kc)")
+                    .info("vector_index", "\(i)")
+                    .build()
             }
         }
         counts[a] += 1  // ✅ Fixed: regular += instead of &+=
@@ -422,7 +434,10 @@ internal func _residuals_grouped_inplace(
     let nInt = Int(n)
     let kc = opts.kc
     guard kc > 0 else {
-        throw ResidualError.invalidCoarseID
+        throw ErrorBuilder(.invalidParameter, operation: "residuals_grouped_inplace")
+            .message("Invalid kc for grouped residuals: must be positive")
+            .info("kc", "\(kc)")
+            .build()
     }
 
     var counts = Array<Int>(repeating: 0, count: kc)
@@ -430,7 +445,12 @@ internal func _residuals_grouped_inplace(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < kc else {
-                throw ResidualError.invalidCoarseID
+                throw ErrorBuilder(.invalidRange, operation: "residuals_grouped_inplace")
+                    .message("Coarse assignment ID out of valid range")
+                    .info("coarse_id", "\(a)")
+                    .info("valid_range", "0..<\(kc)")
+                    .info("vector_index", "\(i)")
+                    .build()
             }
         }
         counts[a] += 1  // ✅ Fixed: regular += instead of &+=

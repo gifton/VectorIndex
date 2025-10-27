@@ -51,18 +51,58 @@ public struct IVFAllocator {
     public init(alloc: @escaping (Int, Int) -> UnsafeMutableRawPointer?, free: @escaping (UnsafeMutableRawPointer?) -> Void) { self.alloc = alloc; self.free = free }
 }
 
-public enum IVFError: Error { case invalidInput, invalidDimensions, invalidListID, invalidFormat, invalidGroup, idWidthUnsupported, capacityOverflow, allocationFailed, mmapRequiredForDurable, outOfRange }
+// IVFError removed - migrated to VectorIndexError
+// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
 
 private enum IDStorage { case u32(ptr: UnsafeMutablePointer<UInt32>?), u64(ptr: UnsafeMutablePointer<UInt64>?) }
 @inline(__always) private func idStrideBytes(_ opts: IVFAppendOpts) -> Int { (opts.id_bits == 32) ? MemoryLayout<UInt32>.stride : MemoryLayout<UInt64>.stride }
 
+/// Stores an external ID into the appropriate storage type
+///
+/// This function validates that the storage variant matches the configured ID bit width.
+/// A mismatch indicates internal corruption or a programming error (opts.id_bits modified
+/// after storage allocation, memory corruption, or bug in storage initialization).
+///
+/// - Throws:
+///   - `IVFError.idWidthUnsupported`: If value exceeds UInt32.max when using 32-bit IDs
+///   - `VectorIndexError(.internalInconsistency)`: If storage type doesn't match opts.id_bits
 @inline(__always)
 private func storeExternalID(_ storage: inout IDStorage, _ index: Int, _ val64: UInt64, opts: IVFAppendOpts) throws {
     if opts.id_bits == 32 {
-        guard val64 <= UInt64(UInt32.max) else { throw IVFError.idWidthUnsupported }
-        if case .u32(let p) = storage { p![index] = UInt32(truncatingIfNeeded: val64) } else { fatalError("ID storage kind mismatch") }
+        // Validate value fits in 32 bits
+        guard val64 <= UInt64(UInt32.max) else {
+            throw ErrorBuilder(.invalidParameter, operation: "store_external_id")
+                .message("ID value exceeds 32-bit maximum")
+                .info("id_value", "\(val64)")
+                .info("max_value", "\(UInt32.max)")
+                .build()
+        }
+
+        // Verify storage is actually u32 variant
+        if case .u32(let p) = storage {
+            p![index] = UInt32(truncatingIfNeeded: val64)
+        } else {
+            // Internal inconsistency: storage is u64 but opts specify 32-bit IDs
+            throw ErrorBuilder(.internalInconsistency, operation: "store_external_id")
+                .message("ID storage type mismatch: expected u32 storage but found u64")
+                .info("expected_bits", "32")
+                .info("storage_variant", "u64")
+                .info("index", "\(index)")
+                .build()
+        }
     } else {
-        if case .u64(let p) = storage { p![index] = val64 } else { fatalError("ID storage kind mismatch") }
+        // opts.id_bits == 64
+        if case .u64(let p) = storage {
+            p![index] = val64
+        } else {
+            // Internal inconsistency: storage is u32 but opts specify 64-bit IDs
+            throw ErrorBuilder(.internalInconsistency, operation: "store_external_id")
+                .message("ID storage type mismatch: expected u64 storage but found u32")
+                .info("expected_bits", "64")
+                .info("storage_variant", "u32")
+                .info("index", "\(index)")
+                .build()
+        }
     }
 }
 
@@ -136,23 +176,43 @@ private final class IVFList {
     init(capacity: Int, codeBytesPerVector: Int, dFlat: Int, opts: IVFAppendOpts, index: IVFListHandle) throws {
         self.lock = makeLock(); self.index = index; self.capacity = max(capacity, 0)
         let idBytes = capacity * idStrideBytes(opts)
-        guard let idsBuf = (opts.allocator?.alloc(idBytes, 64) ?? alignedAlloc(idBytes, alignment: 64)) else { throw IVFError.allocationFailed }
+        guard let idsBuf = (opts.allocator?.alloc(idBytes, 64) ?? alignedAlloc(idBytes, alignment: 64)) else {
+            throw ErrorBuilder(.memoryExhausted, operation: "ivf_list_init")
+                .message("Failed to allocate ID storage")
+                .info("requested_bytes", "\(idBytes)")
+                .build()
+        }
         self.idsRaw = idsBuf
         if opts.id_bits == 32 { self.ids = .u32(ptr: idsBuf.bindMemory(to: UInt32.self, capacity: capacity)) }
         else { self.ids = .u64(ptr: idsBuf.bindMemory(to: UInt64.self, capacity: capacity)) }
         switch index.format {
         case .pq8, .pq4:
             let bytes = capacity * codeBytesPerVector
-            guard let cbuf = (opts.allocator?.alloc(bytes, 1) ?? malloc(bytes)) else { throw IVFError.allocationFailed }
+            guard let cbuf = (opts.allocator?.alloc(bytes, 1) ?? malloc(bytes)) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_list_init")
+                    .message("Failed to allocate code storage")
+                    .info("requested_bytes", "\(bytes)")
+                    .build()
+            }
             self.codesRaw = cbuf; self.codes = cbuf.bindMemory(to: UInt8.self, capacity: bytes)
         case .flat:
             let elems = capacity * dFlat; let byteCount = elems * MemoryLayout<Float>.stride
-            guard let xbuf = (opts.allocator?.alloc(byteCount, 64) ?? alignedAlloc(byteCount, alignment: 64)) else { throw IVFError.allocationFailed }
+            guard let xbuf = (opts.allocator?.alloc(byteCount, 64) ?? alignedAlloc(byteCount, alignment: 64)) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_list_init")
+                    .message("Failed to allocate vector storage")
+                    .info("requested_bytes", "\(byteCount)")
+                    .build()
+            }
             self.xbRaw = xbuf; self.xb = xbuf.bindMemory(to: Float.self, capacity: elems)
         }
         if opts.timestamps {
             let bytes = capacity * MemoryLayout<UInt64>.stride
-            guard let tbuf = (opts.allocator?.alloc(bytes, 64) ?? alignedAlloc(bytes, alignment: 64)) else { throw IVFError.allocationFailed }
+            guard let tbuf = (opts.allocator?.alloc(bytes, 64) ?? alignedAlloc(bytes, alignment: 64)) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_list_init")
+                    .message("Failed to allocate timestamp storage")
+                    .info("requested_bytes", "\(bytes)")
+                    .build()
+            }
             self.tsRaw = tbuf; self.ts = tbuf.bindMemory(to: UInt64.self, capacity: capacity)
         }
     }
@@ -256,60 +316,133 @@ public final class IVFListHandle {
         for _ in 0..<k_c { let list = try IVFList(capacity: initCap, codeBytesPerVector: self.codeBytesPerVector, dFlat: d, opts: opts, index: self); lists.append(list) }
     }
     @inline(__always) fileprivate func allocateInternalID(_ count: Int) -> Int64 { switch opts.concurrency { case .singleWriter: let b = nextInternalID; nextInternalID &+= Int64(count); return b; default: globalLock.lock(); let b = nextInternalID; nextInternalID &+= Int64(count); globalLock.unlock(); return b } }
-    public func getListStats(listID: Int32) throws -> IVFListStats { guard listID >= 0 && listID < Int32(k_c) else { throw IVFError.invalidListID }; let L = lists[Int(listID)]; var out = IVFListStats(); out.length = L.length; out.capacity = L.capacity; out.bytesIDs = L.capacity * idStrideBytes(opts); switch format { case .pq8, .pq4: out.bytesCodesOrVecs = L.capacity * codeBytesPerVector; case .flat: out.bytesCodesOrVecs = L.capacity * d * MemoryLayout<Float>.stride }; return out }
+    public func getListStats(listID: Int32) throws -> IVFListStats {
+        guard listID >= 0 && listID < Int32(k_c) else {
+            throw ErrorBuilder(.invalidRange, operation: "get_list_stats")
+                .message("List ID out of valid range")
+                .info("list_id", "\(listID)")
+                .info("valid_range", "0..<\(k_c)")
+                .build()
+        }
+        let L = lists[Int(listID)]
+        var out = IVFListStats()
+        out.length = L.length
+        out.capacity = L.capacity
+        out.bytesIDs = L.capacity * idStrideBytes(opts)
+        switch format {
+        case .pq8, .pq4: out.bytesCodesOrVecs = L.capacity * codeBytesPerVector
+        case .flat: out.bytesCodesOrVecs = L.capacity * d * MemoryLayout<Float>.stride
+        }
+        return out
+    }
     public func getListStats(listID: Int32, durable: Bool) throws -> IVFListStats {
         if durable, storage == .mmap, let mmap = mmapHandle {
-            guard listID >= 0 && listID < Int32(k_c) else { throw IVFError.invalidListID }
-            guard let (descs, _) = mmap.mmapLists() else { throw IVFError.invalidInput }
-            let i = Int(listID); let dsc = descs[i]
+            guard listID >= 0 && listID < Int32(k_c) else {
+                throw ErrorBuilder(.invalidRange, operation: "get_list_stats_durable")
+                    .message("List ID out of valid range")
+                    .info("list_id", "\(listID)")
+                    .info("valid_range", "0..<\(k_c)")
+                    .build()
+            }
+            guard let (descs, _) = mmap.mmapLists() else {
+                throw ErrorBuilder(.contractViolation, operation: "get_list_stats_durable")
+                    .message("mmap list descriptors unavailable (internal error)")
+                    .build()
+            }
+            let i = Int(listID)
+            let dsc = descs[i]
             let len = mmap.snapshotListLength(listID: i)
             var out = IVFListStats()
             out.length = len
             out.capacity = dsc.capacityHost(mmap.fileEndianness)
             out.bytesIDs = out.capacity * idStrideBytes(opts)
-            switch format { case .pq8, .pq4: out.bytesCodesOrVecs = out.capacity * codeBytesPerVector; case .flat: out.bytesCodesOrVecs = out.capacity * d * MemoryLayout<Float>.stride }
+            switch format {
+            case .pq8, .pq4: out.bytesCodesOrVecs = out.capacity * codeBytesPerVector
+            case .flat: out.bytesCodesOrVecs = out.capacity * d * MemoryLayout<Float>.stride
+            }
             return out
         }
         return try getListStats(listID: listID)
     }
 
     public func readList(listID: Int32) throws -> (length: Int, idsU64: UnsafePointer<UInt64>?, idsU32: UnsafePointer<UInt32>?, codes: UnsafePointer<UInt8>?, xb: UnsafePointer<Float>?) {
-        guard listID >= 0 && listID < Int32(k_c) else { throw IVFError.invalidListID }
+        guard listID >= 0 && listID < Int32(k_c) else {
+            throw ErrorBuilder(.invalidRange, operation: "read_list")
+                .message("List ID out of valid range")
+                .info("list_id", "\(listID)")
+                .info("valid_range", "0..<\(k_c)")
+                .build()
+        }
+
         if storage == .mmap, let mmap = mmapHandle {
             let i = Int(listID)
             let n = mmap.snapshotListLength(listID: i)
-            guard let (descs, _) = mmap.mmapLists() else { throw IVFError.invalidInput }
+            guard let (descs, _) = mmap.mmapLists() else {
+                throw ErrorBuilder(.contractViolation, operation: "read_list")
+                    .message("mmap list descriptors unavailable (internal error)")
+                    .build()
+            }
             let dsc = descs[i]
             let idsOff = dsc.idsOffsetHost(mmap.fileEndianness)
             let codesOff = dsc.codesOffsetHost(mmap.fileEndianness)
             let vecsOff = dsc.vecsOffsetHost(mmap.fileEndianness)
+
             if opts.id_bits == 64 {
-                guard let base = mmap.idsBase() else { throw IVFError.invalidInput }
+                guard let base = mmap.idsBase() else {
+                    throw ErrorBuilder(.contractViolation, operation: "read_list")
+                        .message("mmap IDs base pointer unavailable (internal error)")
+                        .build()
+                }
                 let ptr = base.advanced(by: Int(idsOff)).assumingMemoryBound(to: UInt64.self)
                 if format == .flat {
-                    guard let vbase = mmap.vecsBase() else { throw IVFError.invalidInput }
+                    guard let vbase = mmap.vecsBase() else {
+                        throw ErrorBuilder(.contractViolation, operation: "read_list")
+                            .message("mmap vectors base pointer unavailable (internal error)")
+                            .build()
+                    }
                     let vptr = vbase.advanced(by: Int(vecsOff)).assumingMemoryBound(to: Float.self)
                     return (n, UnsafePointer(ptr), nil, nil, UnsafePointer(vptr))
                 } else {
-                    guard let cbase = mmap.codesBase() else { throw IVFError.invalidInput }
+                    guard let cbase = mmap.codesBase() else {
+                        throw ErrorBuilder(.contractViolation, operation: "read_list")
+                            .message("mmap codes base pointer unavailable (internal error)")
+                            .build()
+                    }
                     let cptr = cbase.advanced(by: Int(codesOff)).assumingMemoryBound(to: UInt8.self)
                     return (n, UnsafePointer(ptr), nil, UnsafePointer(cptr), nil)
                 }
             } else if opts.id_bits == 32 {
-                guard let base = mmap.idsBase() else { throw IVFError.invalidInput }
+                guard let base = mmap.idsBase() else {
+                    throw ErrorBuilder(.contractViolation, operation: "read_list")
+                        .message("mmap IDs base pointer unavailable (internal error)")
+                        .build()
+                }
                 let ptr = base.advanced(by: Int(idsOff)).assumingMemoryBound(to: UInt32.self)
                 if format == .flat {
-                    guard let vbase = mmap.vecsBase() else { throw IVFError.invalidInput }
+                    guard let vbase = mmap.vecsBase() else {
+                        throw ErrorBuilder(.contractViolation, operation: "read_list")
+                            .message("mmap vectors base pointer unavailable (internal error)")
+                            .build()
+                    }
                     let vptr = vbase.advanced(by: Int(vecsOff)).assumingMemoryBound(to: Float.self)
                     return (n, nil, UnsafePointer(ptr), nil, UnsafePointer(vptr))
                 } else {
-                    guard let cbase = mmap.codesBase() else { throw IVFError.invalidInput }
+                    guard let cbase = mmap.codesBase() else {
+                        throw ErrorBuilder(.contractViolation, operation: "read_list")
+                            .message("mmap codes base pointer unavailable (internal error)")
+                            .build()
+                    }
                     let cptr = cbase.advanced(by: Int(codesOff)).assumingMemoryBound(to: UInt8.self)
                     return (n, nil, UnsafePointer(ptr), UnsafePointer(cptr), nil)
                 }
             }
-            throw IVFError.idWidthUnsupported
+            throw ErrorBuilder(.invalidParameter, operation: "read_list")
+                .message("Unsupported ID bit width")
+                .info("id_bits", "\(opts.id_bits)")
+                .info("supported_values", "32, 64")
+                .build()
         }
+
         let L = lists[Int(listID)]
         let n = L.length
         switch opts.id_bits {
@@ -319,7 +452,11 @@ public final class IVFListHandle {
             if case .u32(let p) = L.ids { return (n, nil, UnsafePointer(p), UnsafePointer(L.codes), UnsafePointer(L.xb)) }
         default: break
         }
-        throw IVFError.idWidthUnsupported
+        throw ErrorBuilder(.invalidParameter, operation: "read_list")
+            .message("Unsupported ID bit width")
+            .info("id_bits", "\(opts.id_bits)")
+            .info("supported_values", "32, 64")
+            .build()
     }
 }
 
@@ -344,38 +481,120 @@ private func safeNewCapacity(oldCap: Int, need: Int, opts: IVFAppendOpts) throws
     if oldCap == 0 { return max(opts.reserve_min, need) }
     let factor = max(1.1, Double(opts.reserve_factor)); let mult = Double(oldCap) * factor
     let candidate1 = Int(mult.rounded(.up)); let candidate2 = oldCap + max(opts.reserve_min, need - oldCap)
-    let newCap = max(candidate1, candidate2); if newCap <= oldCap { throw IVFError.capacityOverflow }; return newCap
+    let newCap = max(candidate1, candidate2)
+    if newCap <= oldCap {
+        throw ErrorBuilder(.capacityExceeded, operation: "calculate_capacity")
+            .message("Capacity growth overflow")
+            .info("old_capacity", "\(oldCap)")
+            .info("needed", "\(need)")
+            .build()
+    }
+    return newCap
 }
 
 private func growList(_ list: IVFList, codeBytesPerVec: Int, dFlat: Int, opts: IVFAppendOpts, index: IVFListHandle, minNewLen: Int) throws {
     let newCap = try safeNewCapacity(oldCap: list.capacity, need: minNewLen, opts: opts)
     let idBytes = newCap * idStrideBytes(opts)
-    guard let newIDsRaw = (opts.allocator?.alloc(idBytes, 64) ?? alignedAlloc(idBytes, alignment: 64)) else { throw IVFError.allocationFailed }
+    guard let newIDsRaw = (opts.allocator?.alloc(idBytes, 64) ?? alignedAlloc(idBytes, alignment: 64)) else {
+        throw ErrorBuilder(.memoryExhausted, operation: "grow_list")
+            .message("Failed to allocate ID storage during list growth")
+            .info("requested_bytes", "\(idBytes)")
+            .info("new_capacity", "\(newCap)")
+            .build()
+    }
     var newIDs: IDStorage = (opts.id_bits == 32) ? .u32(ptr: newIDsRaw.bindMemory(to: UInt32.self, capacity: newCap)) : .u64(ptr: newIDsRaw.bindMemory(to: UInt64.self, capacity: newCap))
     var newCodesRaw: UnsafeMutableRawPointer? = nil; var newCodes: UnsafeMutablePointer<UInt8>? = nil; var newXBRaw: UnsafeMutableRawPointer? = nil; var newXB: UnsafeMutablePointer<Float>? = nil
     switch index.format {
     case .pq8, .pq4:
-        let bytes = newCap * codeBytesPerVec; guard let c = (opts.allocator?.alloc(bytes, 1) ?? malloc(bytes)) else { (opts.allocator?.free(newIDsRaw) ?? alignedFree(newIDsRaw)); throw IVFError.allocationFailed }
+        let bytes = newCap * codeBytesPerVec
+        guard let c = (opts.allocator?.alloc(bytes, 1) ?? malloc(bytes)) else {
+            (opts.allocator?.free(newIDsRaw) ?? alignedFree(newIDsRaw))
+            throw ErrorBuilder(.memoryExhausted, operation: "grow_list")
+                .message("Failed to allocate code storage during list growth")
+                .info("requested_bytes", "\(bytes)")
+                .info("new_capacity", "\(newCap)")
+                .build()
+        }
         newCodesRaw = c; newCodes = c.bindMemory(to: UInt8.self, capacity: bytes)
     case .flat:
         let elems = newCap * dFlat; let byteCount = elems * MemoryLayout<Float>.stride
-        guard let xraw = (opts.allocator?.alloc(byteCount, 64) ?? alignedAlloc(byteCount, alignment: 64)) else { (opts.allocator?.free(newIDsRaw) ?? alignedFree(newIDsRaw)); throw IVFError.allocationFailed }
+        guard let xraw = (opts.allocator?.alloc(byteCount, 64) ?? alignedAlloc(byteCount, alignment: 64)) else {
+            (opts.allocator?.free(newIDsRaw) ?? alignedFree(newIDsRaw))
+            throw ErrorBuilder(.memoryExhausted, operation: "grow_list")
+                .message("Failed to allocate vector storage during list growth")
+                .info("requested_bytes", "\(byteCount)")
+                .info("new_capacity", "\(newCap)")
+                .build()
+        }
         newXBRaw = xraw; newXB = xraw.bindMemory(to: Float.self, capacity: elems)
     }
     var newTSRaw: UnsafeMutableRawPointer? = nil; var newTS: UnsafeMutablePointer<UInt64>? = nil
-    if opts.timestamps { let bytes = newCap * MemoryLayout<UInt64>.stride; guard let t = (opts.allocator?.alloc(bytes, 64) ?? alignedAlloc(bytes, alignment: 64)) else { (opts.allocator?.free(newIDsRaw) ?? alignedFree(newIDsRaw)); if let r = newCodesRaw { (opts.allocator?.free(r) ?? free(r)) }; if let r = newXBRaw { (opts.allocator?.free(r) ?? alignedFree(r)) }; throw IVFError.allocationFailed }; newTSRaw = t; newTS = t.bindMemory(to: UInt64.self, capacity: newCap) }
+    if opts.timestamps {
+        let bytes = newCap * MemoryLayout<UInt64>.stride
+        guard let t = (opts.allocator?.alloc(bytes, 64) ?? alignedAlloc(bytes, alignment: 64)) else {
+            (opts.allocator?.free(newIDsRaw) ?? alignedFree(newIDsRaw))
+            if let r = newCodesRaw { (opts.allocator?.free(r) ?? free(r)) }
+            if let r = newXBRaw { (opts.allocator?.free(r) ?? alignedFree(r)) }
+            throw ErrorBuilder(.memoryExhausted, operation: "grow_list")
+                .message("Failed to allocate timestamp storage during list growth")
+                .info("requested_bytes", "\(bytes)")
+                .info("new_capacity", "\(newCap)")
+                .build()
+        }
+        newTSRaw = t; newTS = t.bindMemory(to: UInt64.self, capacity: newCap)
+    }
     let n = list.length
     if n > 0 {
+        // Copy existing IDs to new storage
+        // This validates that old and new storage types match opts.id_bits
         switch (list.ids, newIDs) {
-        case (.u64(let old), .u64(let neu)): memcpy(neu, old, n * MemoryLayout<UInt64>.stride)
-        case (.u32(let old), .u32(let neu)): memcpy(neu, old, n * MemoryLayout<UInt32>.stride)
-        default: fatalError("ID storage kind mismatch on grow")
+        case (.u64(let old), .u64(let neu)):
+            memcpy(neu, old, n * MemoryLayout<UInt64>.stride)
+        case (.u32(let old), .u32(let neu)):
+            memcpy(neu, old, n * MemoryLayout<UInt32>.stride)
+        default:
+            // Internal inconsistency: storage types don't match
+            // This indicates opts.id_bits was modified after list creation,
+            // memory corruption, or a bug in storage initialization
+            var oldBits: Int
+            var newBits: Int
+            if case .u32 = list.ids {
+                oldBits = 32
+            } else {
+                oldBits = 64
+            }
+            if case .u32 = newIDs {
+                newBits = 32
+            } else {
+                newBits = 64
+            }
+            throw ErrorBuilder(.internalInconsistency, operation: "grow_list")
+                .message("ID storage type mismatch during list growth")
+                .info("old_id_bits", "\(oldBits)")
+                .info("new_id_bits", "\(newBits)")
+                .info("expected_bits", "\(opts.id_bits)")
+                .info("list_length", "\(n)")
+                .info("old_capacity", "\(list.capacity)")
+                .info("new_capacity", "\(newCap)")
+                .build()
         }
+
+        // Copy existing codes or vectors
         switch index.format {
-        case .pq8, .pq4: if let old = list.codes, let neu = newCodes { memcpy(neu, old, n * codeBytesPerVec) }
-        case .flat: if let old = list.xb, let neu = newXB { memcpy(neu, old, n * dFlat * MemoryLayout<Float>.stride) }
+        case .pq8, .pq4:
+            if let old = list.codes, let neu = newCodes {
+                memcpy(neu, old, n * codeBytesPerVec)
+            }
+        case .flat:
+            if let old = list.xb, let neu = newXB {
+                memcpy(neu, old, n * dFlat * MemoryLayout<Float>.stride)
+            }
         }
-        if opts.timestamps, let old = list.ts, let neu = newTS { memcpy(neu, old, n * MemoryLayout<UInt64>.stride) }
+
+        // Copy existing timestamps if enabled
+        if opts.timestamps, let old = list.ts, let neu = newTS {
+            memcpy(neu, old, n * MemoryLayout<UInt64>.stride)
+        }
     }
     if let r = list.idsRaw { (index.opts.allocator?.free(r) ?? alignedFree(r)) }
     if let r = list.codesRaw { (index.opts.allocator?.free(r) ?? free(r)) }
@@ -394,11 +613,32 @@ private func groupByListIDs(listIDs: UnsafePointer<Int32>, n: Int, k_c: Int) -> 
 }
 
 public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePointer<UInt64>, codes: UnsafePointer<UInt8>, n: Int, m: Int, index: IVFListHandle, opts inOpts: IVFAppendOpts?, internalIDsOut: UnsafeMutablePointer<Int64>?) throws {
-    guard n >= 0, m == index.m, (index.format == .pq8 || index.format == .pq4) else { throw IVFError.invalidFormat }
+    guard n >= 0, m == index.m, (index.format == .pq8 || index.format == .pq4) else {
+        throw ErrorBuilder(.unsupportedLayout, operation: "ivf_append")
+            .message("ivf_append requires PQ format with matching m parameter")
+            .info("format", "\(index.format)")
+            .info("expected_m", "\(index.m)")
+            .info("provided_m", "\(m)")
+            .info("n", "\(n)")
+            .build()
+    }
     let opts = inOpts ?? index.opts
-    guard (opts.group == 4 || opts.group == 8), m % opts.group == 0 else { throw IVFError.invalidGroup }
+    guard (opts.group == 4 || opts.group == 8), m % opts.group == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "ivf_append")
+            .message("Invalid group size or m not divisible by group")
+            .info("group", "\(opts.group)")
+            .info("m", "\(m)")
+            .info("valid_groups", "4, 8")
+            .build()
+    }
     if opts.durable {
-        guard index.storage == .mmap, let mmap = index.mmapHandle else { throw IVFError.mmapRequiredForDurable }
+        guard index.storage == .mmap, let mmap = index.mmapHandle else {
+            throw ErrorBuilder(.missingDependency, operation: "ivf_append")
+                .message("Durable mode requires mmap backend")
+                .info("storage", "\(index.storage)")
+                .info("has_mmap_handle", "\(index.mmapHandle != nil)")
+                .build()
+        }
         let baseInternal = index.allocateInternalID(n)
         // Group by list and perform mmap durable appends per list
         for listID in 0..<index.k_c {
@@ -413,16 +653,35 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
             let codesStride = (index.format == .pq8) ? m : (m >> 1)
             let idsBytes = count * idStride
             let codesBytes = count * codesStride
-            guard let idsBuf = malloc(idsBytes) else { throw IVFError.allocationFailed }
+            guard let idsBuf = malloc(idsBytes) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_append_durable")
+                    .message("Failed to allocate temporary ID buffer for durable append")
+                    .info("requested_bytes", "\(idsBytes)")
+                    .info("list_id", "\(listID)")
+                    .build()
+            }
             defer { free(idsBuf) }
-            guard let codesBuf = malloc(codesBytes) else { throw IVFError.allocationFailed }
+            guard let codesBuf = malloc(codesBytes) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_append_durable")
+                    .message("Failed to allocate temporary code buffer for durable append")
+                    .info("requested_bytes", "\(codesBytes)")
+                    .info("list_id", "\(listID)")
+                    .build()
+            }
             defer { free(codesBuf) }
             // Fill buffers
             if index.opts.id_bits == 32 {
                 let p = idsBuf.bindMemory(to: UInt32.self, capacity: count)
                 for (j, srcIdx) in localIndices.enumerated() {
                     let v = external_ids[srcIdx]
-                    if v > UInt64(UInt32.max) { throw IVFError.idWidthUnsupported }
+                    if v > UInt64(UInt32.max) {
+                        throw ErrorBuilder(.invalidParameter, operation: "ivf_append_durable")
+                            .message("ID value exceeds 32-bit maximum")
+                            .info("id_value", "\(v)")
+                            .info("max_value", "\(UInt32.max)")
+                            .info("index", "\(srcIdx)")
+                            .build()
+                    }
                     p[j] = UInt32(truncatingIfNeeded: v)
                 }
             } else {
@@ -442,7 +701,15 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
             // Reserve and commit
             let res = try mmap.mmap_append_begin(listID: listID, addLen: count)
             // Sanity: ensure stride matches container
-            if res.idsStride != idStride || res.codesStride != codesStride { throw IVFError.invalidFormat }
+            if res.idsStride != idStride || res.codesStride != codesStride {
+                throw ErrorBuilder(.unsupportedLayout, operation: "ivf_append_durable")
+                    .message("Stride mismatch between index and mmap container")
+                    .info("expected_ids_stride", "\(idStride)")
+                    .info("actual_ids_stride", "\(res.idsStride)")
+                    .info("expected_codes_stride", "\(codesStride)")
+                    .info("actual_codes_stride", "\(res.codesStride)")
+                    .build()
+            }
             try mmap.mmap_append_commit(res, idsSrc: idsBuf, codesSrc: codesBuf, vecsSrc: nil)
             // Internal IDs out (monotonic over entire batch)
             if let out = internalIDsOut { for srcIdx in localIndices { out[srcIdx] = baseInternal + Int64(srcIdx) } }
@@ -453,7 +720,17 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
         }
         return
     }
-    for i in 0..<n { let lid = Int(list_ids[i]); if lid < 0 || lid >= index.k_c { throw IVFError.invalidListID } }
+    for i in 0..<n {
+        let lid = Int(list_ids[i])
+        if lid < 0 || lid >= index.k_c {
+            throw ErrorBuilder(.invalidRange, operation: "ivf_append")
+                .message("List ID out of valid range")
+                .info("list_id", "\(lid)")
+                .info("valid_range", "0..<\(index.k_c)")
+                .info("vector_index", "\(i)")
+                .build()
+        }
+    }
     let batches = groupByListIDs(listIDs: list_ids, n: n, k_c: index.k_c)
     let baseInternal = index.allocateInternalID(n)
     let srcCodeStride: Int = (index.format == .pq8) ? m : (opts.pack4_unpacked ? m : (m >> 1))
@@ -477,10 +754,28 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
 }
 
 public func ivf_append_one_list(list_id: Int32, external_ids: UnsafePointer<UInt64>, codes: UnsafePointer<UInt8>, n: Int, m: Int, index: IVFListHandle, opts inOpts: IVFAppendOpts?, internalIDsOut: UnsafeMutablePointer<Int64>?) throws {
-    guard n >= 0, m == index.m, (index.format == .pq8 || index.format == .pq4) else { throw IVFError.invalidFormat }
-    guard list_id >= 0 && list_id < Int32(index.k_c) else { throw IVFError.invalidListID }
+    guard n >= 0, m == index.m, (index.format == .pq8 || index.format == .pq4) else {
+        throw ErrorBuilder(.unsupportedLayout, operation: "ivf_append_one_list")
+            .message("ivf_append_one_list requires PQ format with matching m parameter")
+            .info("format", "\(index.format)")
+            .info("expected_m", "\(index.m)")
+            .info("provided_m", "\(m)")
+            .info("n", "\(n)")
+            .build()
+    }
+    guard list_id >= 0 && list_id < Int32(index.k_c) else {
+        throw ErrorBuilder(.invalidRange, operation: "ivf_append_one_list")
+            .message("List ID out of valid range")
+            .info("list_id", "\(list_id)")
+            .info("valid_range", "0..<\(index.k_c)")
+            .build()
+    }
     let opts = inOpts ?? index.opts
-    if opts.durable { throw IVFError.mmapRequiredForDurable }
+    if opts.durable {
+        throw ErrorBuilder(.missingDependency, operation: "ivf_append_one_list")
+            .message("Durable mode not supported in single-list append (use ivf_append)")
+            .build()
+    }
     let L = index.lists[Int(list_id)]
     switch index.opts.concurrency { case .perListMultiWriter: L.lock.lock(); case .globalMultiWriter: index.globalLock.lock(); case .singleWriter: break }
     let newLen = L.length + n
@@ -503,10 +798,23 @@ public func ivf_append_one_list(list_id: Int32, external_ids: UnsafePointer<UInt
 }
 
 public func ivf_append_flat(list_ids: UnsafePointer<Int32>, external_ids: UnsafePointer<UInt64>, xb: UnsafePointer<Float>, n: Int, d: Int, index: IVFListHandle, opts inOpts: IVFAppendOpts?, internalIDsOut: UnsafeMutablePointer<Int64>?) throws {
-    guard index.format == .flat, d == index.d else { throw IVFError.invalidDimensions }
+    guard index.format == .flat, d == index.d else {
+        throw ErrorBuilder(.dimensionMismatch, operation: "ivf_append_flat")
+            .message("ivf_append_flat requires flat format with matching dimension")
+            .info("format", "\(index.format)")
+            .info("expected_d", "\(index.d)")
+            .info("provided_d", "\(d)")
+            .build()
+    }
     let opts = inOpts ?? index.opts
     if opts.durable {
-        guard index.storage == .mmap, let mmap = index.mmapHandle else { throw IVFError.mmapRequiredForDurable }
+        guard index.storage == .mmap, let mmap = index.mmapHandle else {
+            throw ErrorBuilder(.missingDependency, operation: "ivf_append_flat")
+                .message("Durable mode requires mmap backend")
+                .info("storage", "\(index.storage)")
+                .info("has_mmap_handle", "\(index.mmapHandle != nil)")
+                .build()
+        }
         let baseInternal = index.allocateInternalID(n)
         for listID in 0..<index.k_c {
             var localIndices: [Int] = []
@@ -517,13 +825,36 @@ public func ivf_append_flat(list_ids: UnsafePointer<Int32>, external_ids: Unsafe
             let idsBytes = count * idStride
             let vecStride = d * MemoryLayout<Float>.stride
             let vecBytes = count * vecStride
-            guard let idsBuf = malloc(idsBytes) else { throw IVFError.allocationFailed }
+            guard let idsBuf = malloc(idsBytes) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_append_flat_durable")
+                    .message("Failed to allocate temporary ID buffer for durable append")
+                    .info("requested_bytes", "\(idsBytes)")
+                    .info("list_id", "\(listID)")
+                    .build()
+            }
             defer { free(idsBuf) }
-            guard let vecBuf = malloc(vecBytes) else { throw IVFError.allocationFailed }
+            guard let vecBuf = malloc(vecBytes) else {
+                throw ErrorBuilder(.memoryExhausted, operation: "ivf_append_flat_durable")
+                    .message("Failed to allocate temporary vector buffer for durable append")
+                    .info("requested_bytes", "\(vecBytes)")
+                    .info("list_id", "\(listID)")
+                    .build()
+            }
             defer { free(vecBuf) }
             if index.opts.id_bits == 32 {
                 let p = idsBuf.bindMemory(to: UInt32.self, capacity: count)
-                for (j, srcIdx) in localIndices.enumerated() { let v = external_ids[srcIdx]; if v > UInt64(UInt32.max) { throw IVFError.idWidthUnsupported }; p[j] = UInt32(truncatingIfNeeded: v) }
+                for (j, srcIdx) in localIndices.enumerated() {
+                    let v = external_ids[srcIdx]
+                    if v > UInt64(UInt32.max) {
+                        throw ErrorBuilder(.invalidParameter, operation: "ivf_append_flat_durable")
+                            .message("ID value exceeds 32-bit maximum")
+                            .info("id_value", "\(v)")
+                            .info("max_value", "\(UInt32.max)")
+                            .info("index", "\(srcIdx)")
+                            .build()
+                    }
+                    p[j] = UInt32(truncatingIfNeeded: v)
+                }
             } else {
                 let p = idsBuf.bindMemory(to: UInt64.self, capacity: count)
                 for (j, srcIdx) in localIndices.enumerated() { p[j] = external_ids[srcIdx] }
@@ -533,14 +864,32 @@ public func ivf_append_flat(list_ids: UnsafePointer<Int32>, external_ids: Unsafe
                 memcpy(vdst.advanced(by: j * vecStride), xb.advanced(by: srcIdx * d), vecStride)
             }
             let res = try mmap.mmap_append_begin(listID: listID, addLen: count)
-            if res.idsStride != idStride || res.vecsStride != vecStride { throw IVFError.invalidFormat }
+            if res.idsStride != idStride || res.vecsStride != vecStride {
+                throw ErrorBuilder(.unsupportedLayout, operation: "ivf_append_flat_durable")
+                    .message("Stride mismatch between index and mmap container")
+                    .info("expected_ids_stride", "\(idStride)")
+                    .info("actual_ids_stride", "\(res.idsStride)")
+                    .info("expected_vecs_stride", "\(vecStride)")
+                    .info("actual_vecs_stride", "\(res.vecsStride)")
+                    .build()
+            }
             try mmap.mmap_append_commit(res, idsSrc: idsBuf, codesSrc: nil, vecsSrc: vecBuf)
             if let out = internalIDsOut { for srcIdx in localIndices { out[srcIdx] = baseInternal + Int64(srcIdx) } }
             let L = index.lists[listID]; L.length += count; if L.capacity < L.length { L.capacity = L.length }
         }
         return
     }
-    for i in 0..<n { let lid = Int(list_ids[i]); if lid < 0 || lid >= index.k_c { throw IVFError.invalidListID } }
+    for i in 0..<n {
+        let lid = Int(list_ids[i])
+        if lid < 0 || lid >= index.k_c {
+            throw ErrorBuilder(.invalidRange, operation: "ivf_append_flat")
+                .message("List ID out of valid range")
+                .info("list_id", "\(lid)")
+                .info("valid_range", "0..<\(index.k_c)")
+                .info("vector_index", "\(i)")
+                .build()
+        }
+    }
     let batches = groupByListIDs(listIDs: list_ids, n: n, k_c: index.k_c)
     let baseInternal = index.allocateInternalID(n)
     for listID in 0..<index.k_c {
@@ -562,14 +911,67 @@ public func ivf_append_flat(list_ids: UnsafePointer<Int32>, external_ids: Unsafe
     }
 }
 
+/// Inserts vectors at a specified position in a PQ-format IVF list
+///
+/// This function is specifically for PQ8 and PQ4 format indices. For flat format
+/// indices, use `ivf_insert_at_flat()` instead.
+///
+/// - Important: This function requires PQ8 or PQ4 format. Attempting to use it
+///              with a flat format index will result in an error.
+///
+/// - Parameters:
+///   - list_id: Target list index (0..<k_c)
+///   - pos: Position to insert at (0...list.length)
+///   - external_ids: External IDs for inserted vectors
+///   - codes: Quantized codes (PQ8: n×m bytes, PQ4: n×(m/2) bytes)
+///   - n: Number of vectors to insert
+///   - index: IVF list handle
+///
+/// - Throws:
+///   - `VectorIndexError(.unsupportedLayout)`: If index format is flat (use ivf_insert_at_flat)
+///   - `VectorIndexError(.internalInconsistency)`: If internal storage corruption detected
+///   - `VectorIndexError(.invalidRange)`: If list_id out of range or position invalid
+///   - `VectorIndexError(.contractViolation)`: If n < 0
+///   - `VectorIndexError(.missingDependency)`: If durable mode not properly configured
+///   - `VectorIndexError(.memoryExhausted)`: If capacity increase fails
 public func ivf_insert_at(list_id: Int32, pos: Int, external_ids: UnsafePointer<UInt64>, codes: UnsafePointer<UInt8>, n: Int, index: IVFListHandle) throws {
-    guard list_id >= 0 && list_id < Int32(index.k_c) else { throw IVFError.invalidListID }
-    guard n >= 0 else { throw IVFError.invalidInput }
-    if index.opts.durable { throw IVFError.mmapRequiredForDurable }
+    // Validate format compatibility
+    guard index.format == .pq8 || index.format == .pq4 else {
+        throw ErrorBuilder(.unsupportedLayout, operation: "ivf_insert_at")
+            .message("ivf_insert_at requires PQ format; use ivf_insert_at_flat for flat format")
+            .info("actual_format", "\(index.format)")
+            .build()
+    }
+
+    guard list_id >= 0 && list_id < Int32(index.k_c) else {
+        throw ErrorBuilder(.invalidRange, operation: "ivf_insert_at")
+            .message("List ID out of valid range")
+            .info("list_id", "\(list_id)")
+            .info("valid_range", "0..<\(index.k_c)")
+            .build()
+    }
+    guard n >= 0 else {
+        throw ErrorBuilder(.contractViolation, operation: "ivf_insert_at")
+            .message("Invalid vector count (must be non-negative)")
+            .info("n", "\(n)")
+            .build()
+    }
+    if index.opts.durable {
+        throw ErrorBuilder(.missingDependency, operation: "ivf_insert_at")
+            .message("Durable mode not supported for insert operations")
+            .build()
+    }
     let L = index.lists[Int(list_id)]
     switch index.opts.concurrency { case .perListMultiWriter: L.lock.lock(); case .globalMultiWriter: index.globalLock.lock(); case .singleWriter: break }
     defer { switch index.opts.concurrency { case .perListMultiWriter: L.lock.unlock(); case .globalMultiWriter: index.globalLock.unlock(); case .singleWriter: break } }
-    guard pos >= 0 && pos <= L.length else { throw IVFError.outOfRange }
+    guard pos >= 0 && pos <= L.length else {
+        throw ErrorBuilder(.invalidRange, operation: "ivf_insert_at")
+            .message("Insert position out of valid range")
+            .info("position", "\(pos)")
+            .info("valid_range", "0...\(L.length)")
+            .info("list_length", "\(L.length)")
+            .build()
+    }
     let newLen = L.length + n
     if newLen > L.capacity { try growList(L, codeBytesPerVec: index.codeBytesPerVector, dFlat: index.d, opts: index.opts, index: index, minNewLen: newLen) }
     let tailCount = L.length - pos; let idB = idStrideBytes(index.opts)
@@ -590,7 +992,9 @@ public func ivf_insert_at(list_id: Int32, pos: Int, external_ids: UnsafePointer<
             let dst = L.codes!.advanced(by: (pos + i) * index.codeBytesPerVector); let src = codes.advanced(by: i * index.m); memcpy(dst, src, index.m)
         case .pq4:
             let dst = L.codes!.advanced(by: (pos + i) * index.codeBytesPerVector); memcpy(dst, codes.advanced(by: i * (index.m >> 1)), index.m >> 1)
-        case .flat: fatalError("Use ivf_insert_at_flat for IVF-Flat")
+        case .flat:
+            // Unreachable: format validation at function entry ensures only PQ formats reach here
+            break
         }
         if index.opts.timestamps, let tsPtr = L.ts { tsPtr[pos + i] = UInt64(Date().timeIntervalSince1970 * 1_000_000_000.0) }
     }
@@ -598,14 +1002,41 @@ public func ivf_insert_at(list_id: Int32, pos: Int, external_ids: UnsafePointer<
 }
 
 public func ivf_insert_at_flat(list_id: Int32, pos: Int, external_ids: UnsafePointer<UInt64>, xb: UnsafePointer<Float>, n: Int, index: IVFListHandle) throws {
-    guard index.format == .flat else { throw IVFError.invalidFormat }
-    guard list_id >= 0 && list_id < Int32(index.k_c) else { throw IVFError.invalidListID }
-    guard n >= 0 else { throw IVFError.invalidInput }
-    if index.opts.durable { throw IVFError.mmapRequiredForDurable }
+    guard index.format == .flat else {
+        throw ErrorBuilder(.unsupportedLayout, operation: "ivf_insert_at_flat")
+            .message("ivf_insert_at_flat requires flat format; use ivf_insert_at for PQ format")
+            .info("actual_format", "\(index.format)")
+            .build()
+    }
+    guard list_id >= 0 && list_id < Int32(index.k_c) else {
+        throw ErrorBuilder(.invalidRange, operation: "ivf_insert_at_flat")
+            .message("List ID out of valid range")
+            .info("list_id", "\(list_id)")
+            .info("valid_range", "0..<\(index.k_c)")
+            .build()
+    }
+    guard n >= 0 else {
+        throw ErrorBuilder(.contractViolation, operation: "ivf_insert_at_flat")
+            .message("Invalid vector count (must be non-negative)")
+            .info("n", "\(n)")
+            .build()
+    }
+    if index.opts.durable {
+        throw ErrorBuilder(.missingDependency, operation: "ivf_insert_at_flat")
+            .message("Durable mode not supported for insert operations")
+            .build()
+    }
     let L = index.lists[Int(list_id)]
     switch index.opts.concurrency { case .perListMultiWriter: L.lock.lock(); case .globalMultiWriter: index.globalLock.lock(); case .singleWriter: break }
     defer { switch index.opts.concurrency { case .perListMultiWriter: L.lock.unlock(); case .globalMultiWriter: index.globalLock.unlock(); case .singleWriter: break } }
-    guard pos >= 0 && pos <= L.length else { throw IVFError.outOfRange }
+    guard pos >= 0 && pos <= L.length else {
+        throw ErrorBuilder(.invalidRange, operation: "ivf_insert_at_flat")
+            .message("Insert position out of valid range")
+            .info("position", "\(pos)")
+            .info("valid_range", "0...\(L.length)")
+            .info("list_length", "\(L.length)")
+            .build()
+    }
     let newLen = L.length + n
     if newLen > L.capacity { try growList(L, codeBytesPerVec: index.codeBytesPerVector, dFlat: index.d, opts: index.opts, index: index, minNewLen: newLen) }
     let tail = L.length - pos; let idB = idStrideBytes(index.opts)

@@ -180,7 +180,7 @@ extension IndexErrorKind {
         switch self {
         // User can fix these
         case .dimensionMismatch, .invalidDimension, .invalidParameter,
-             .invalidRange, .emptyInput, .incompatibleConfig:
+             .invalidRange, .emptyInput, .incompatibleConfig, .unsupportedLayout:
             return true
 
         // Retry might work

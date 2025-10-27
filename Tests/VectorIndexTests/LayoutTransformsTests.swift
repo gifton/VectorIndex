@@ -74,13 +74,13 @@ final class LayoutTransformsTests: XCTestCase {
                 var inter = [UInt8](repeating: 0, count: n * m)
                 aos.withUnsafeBufferPointer { src in
                     inter.withUnsafeMutableBufferPointer { dst in
-                        pqCodesInterleave_u8(aos: src.baseAddress!, n: n, m: m, g: g, out: dst.baseAddress!)
+                        try! pqCodesInterleave_u8(aos: src.baseAddress!, n: n, m: m, g: g, out: dst.baseAddress!)
                     }
                 }
                 var back = [UInt8](repeating: 0, count: n * m)
                 inter.withUnsafeBufferPointer { src in
                     back.withUnsafeMutableBufferPointer { dst in
-                        pqCodesDeinterleave_u8(interleaved: src.baseAddress!, n: n, m: m, g: g, aos: dst.baseAddress!)
+                        try! pqCodesDeinterleave_u8(interleaved: src.baseAddress!, n: n, m: m, g: g, aos: dst.baseAddress!)
                     }
                 }
                 XCTAssertEqual(back, aos)
@@ -108,13 +108,13 @@ final class LayoutTransformsTests: XCTestCase {
                 var interPacked = [UInt8](repeating: 0, count: n * bytesPerVec)
                 aosPacked.withUnsafeBufferPointer { src in
                     interPacked.withUnsafeMutableBufferPointer { dst in
-                        pqCodesInterleave_u4(aos_packed: src.baseAddress!, n: n, m: m, g: g, out_packed: dst.baseAddress!)
+                        try! pqCodesInterleave_u4(aos_packed: src.baseAddress!, n: n, m: m, g: g, out_packed: dst.baseAddress!)
                     }
                 }
                 var backPacked = [UInt8](repeating: 0, count: n * bytesPerVec)
                 interPacked.withUnsafeBufferPointer { src in
                     backPacked.withUnsafeMutableBufferPointer { dst in
-                        pqCodesDeinterleave_u4(interleaved_packed: src.baseAddress!, n: n, m: m, g: g, aos_packed: dst.baseAddress!)
+                        try! pqCodesDeinterleave_u4(interleaved_packed: src.baseAddress!, n: n, m: m, g: g, aos_packed: dst.baseAddress!)
                     }
                 }
                 XCTAssertEqual(backPacked, aosPacked)

@@ -397,10 +397,12 @@ final class PQTrainTests: XCTestCase {
                 centroidNormsOut: &nilNorms
             )
         ) { error in
-            XCTAssert(error is PQError)
-            if let pqError = error as? PQError {
-                XCTAssertEqual(pqError, .insufficientData)
+            guard let vecError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError, got \(type(of: error))")
+                return
             }
+            XCTAssertEqual(vecError.kind, .emptyInput)
+            XCTAssertTrue(vecError.message.contains("Insufficient training data"))
         }
 
         print("✅ Insufficient data error correctly thrown")
@@ -420,10 +422,12 @@ final class PQTrainTests: XCTestCase {
                 centroidNormsOut: &nilNorms
             )
         ) { error in
-            XCTAssert(error is PQError)
-            if let pqError = error as? PQError {
-                XCTAssertEqual(pqError, .invalidDim)
+            guard let vecError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError, got \(type(of: error))")
+                return
             }
+            XCTAssertEqual(vecError.kind, .invalidDimension)
+            XCTAssertTrue(vecError.message.contains("divisible"))
         }
 
         print("✅ Invalid dimension error correctly thrown")

@@ -831,4 +831,741 @@ final class ErrorInfrastructureTests: XCTestCase {
     // Note: Success case tests for kmeansPlusPlusSeed are covered in KMeansPPSeedingTests.swift
     // The tests there use properly aligned data and cover all valid parameter combinations.
     // This test file focuses on error path validation to ensure proper error handling.
+
+    // MARK: - Phase 2 Migration Tests: storeExternalID (IVFAppend - Phase 1)
+
+    func testIVFAppend_32BitIDStorage_NoInternalInconsistency() throws {
+        // Regression test: Verify that normal append operations with 32-bit IDs
+        // don't trigger the new internal inconsistency error after storeExternalID migration
+        let opts = IVFAppendOpts(format: .pq8, id_bits: 32)
+        let handle = try IVFListHandle(k_c: 10, m: 8, d: 0, opts: opts)
+
+        // Prepare test data: 100 vectors
+        let n = 100
+        var listIDs = [Int32](repeating: 0, count: n)
+        var externalIDs = [UInt64](repeating: 0, count: n)
+        var codes = [UInt8](repeating: 0, count: n * 8)
+
+        // Distribute across lists
+        for i in 0..<n {
+            listIDs[i] = Int32(i % 10)
+            externalIDs[i] = UInt64(i + 1000) // All IDs fit in UInt32
+        }
+
+        // Append vectors - should succeed without storage mismatch errors
+        XCTAssertNoThrow(
+            try ivf_append(
+                list_ids: listIDs,
+                external_ids: externalIDs,
+                codes: codes,
+                n: n,
+                m: 8,
+                index: handle,
+                opts: nil,
+                internalIDsOut: nil
+            )
+        )
+
+        // Verify data was stored correctly
+        for listID in 0..<10 {
+            let stats = try handle.getListStats(listID: Int32(listID))
+            XCTAssertTrue(stats.length > 0, "List \(listID) should contain vectors")
+        }
+    }
+
+    func testIVFAppend_64BitIDStorage_NoInternalInconsistency() throws {
+        // Regression test: Verify that normal append operations with 64-bit IDs
+        // don't trigger the new internal inconsistency error after storeExternalID migration
+        let opts = IVFAppendOpts(format: .pq8, id_bits: 64)
+        let handle = try IVFListHandle(k_c: 5, m: 8, d: 0, opts: opts)
+
+        // Prepare test data with large IDs (> UInt32.max)
+        let n = 50
+        var listIDs = [Int32](repeating: 0, count: n)
+        var externalIDs = [UInt64](repeating: 0, count: n)
+        var codes = [UInt8](repeating: 0, count: n * 8)
+
+        for i in 0..<n {
+            listIDs[i] = Int32(i % 5)
+            // Use IDs larger than UInt32.max to ensure we're truly testing 64-bit storage
+            externalIDs[i] = UInt64(UInt32.max) + UInt64(i + 1)
+        }
+
+        // Append vectors - should succeed without storage mismatch errors
+        XCTAssertNoThrow(
+            try ivf_append(
+                list_ids: listIDs,
+                external_ids: externalIDs,
+                codes: codes,
+                n: n,
+                m: 8,
+                index: handle,
+                opts: nil,
+                internalIDsOut: nil
+            )
+        )
+
+        // Verify data was stored correctly
+        for listID in 0..<5 {
+            let stats = try handle.getListStats(listID: Int32(listID))
+            XCTAssertTrue(stats.length > 0, "List \(listID) should contain vectors")
+        }
+    }
+
+    func testIVFAppend_32BitIDs_ThrowsOnOversizedID() throws {
+        // Verify that the existing idWidthUnsupported error still works after migration
+        let opts = IVFAppendOpts(format: .pq8, id_bits: 32)
+        let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
+
+        // Attempt to store an ID larger than UInt32.max
+        var listIDs: [Int32] = [0]
+        var externalIDs: [UInt64] = [UInt64(UInt32.max) + 1] // Too large for 32-bit storage
+        var codes = [UInt8](repeating: 0, count: 8)
+
+        XCTAssertThrowsError(
+            try ivf_append(
+                list_ids: listIDs,
+                external_ids: externalIDs,
+                codes: codes,
+                n: 1,
+                m: 8,
+                index: handle,
+                opts: nil,
+                internalIDsOut: nil
+            )
+        ) { error in
+            // Should throw VectorIndexError with .invalidParameter, not internal inconsistency
+            guard let vecError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError, got \(type(of: error))")
+                return
+            }
+            XCTAssertEqual(vecError.kind, .invalidParameter)
+            XCTAssertTrue(vecError.message.contains("32-bit maximum") || vecError.message.contains("ID value exceeds"))
+        }
+    }
+
+    func testIVFAppendFlat_32And64BitIDs_NoInternalInconsistency() throws {
+        // Test flat format with both ID sizes to ensure storeExternalID works in all code paths
+
+        // Test 32-bit IDs
+        do {
+            let opts32 = IVFAppendOpts(format: .flat, id_bits: 32)
+            let handle32 = try IVFListHandle(k_c: 3, m: 0, d: 128, opts: opts32)
+
+            let n = 30
+            var listIDs = [Int32](repeating: 0, count: n)
+            var externalIDs = [UInt64](repeating: 0, count: n)
+            var vectors = [Float](repeating: 1.0, count: n * 128)
+
+            for i in 0..<n {
+                listIDs[i] = Int32(i % 3)
+                externalIDs[i] = UInt64(i + 5000)
+            }
+
+            XCTAssertNoThrow(
+                try ivf_append_flat(
+                    list_ids: listIDs,
+                    external_ids: externalIDs,
+                    xb: vectors,
+                    n: n,
+                    d: 128,
+                    index: handle32,
+                    opts: nil,
+                    internalIDsOut: nil
+                )
+            )
+        }
+
+        // Test 64-bit IDs
+        do {
+            let opts64 = IVFAppendOpts(format: .flat, id_bits: 64)
+            let handle64 = try IVFListHandle(k_c: 3, m: 0, d: 128, opts: opts64)
+
+            let n = 30
+            var listIDs = [Int32](repeating: 0, count: n)
+            var externalIDs = [UInt64](repeating: 0, count: n)
+            var vectors = [Float](repeating: 1.0, count: n * 128)
+
+            for i in 0..<n {
+                listIDs[i] = Int32(i % 3)
+                externalIDs[i] = UInt64(UInt32.max) + UInt64(i + 1000)
+            }
+
+            XCTAssertNoThrow(
+                try ivf_append_flat(
+                    list_ids: listIDs,
+                    external_ids: externalIDs,
+                    xb: vectors,
+                    n: n,
+                    d: 128,
+                    index: handle64,
+                    opts: nil,
+                    internalIDsOut: nil
+                )
+            )
+        }
+    }
+
+    func testIVFInsertAt_32And64BitIDs_NoInternalInconsistency() throws {
+        // Test ivf_insert_at with both ID sizes to ensure storeExternalID works in insert operations
+
+        // Test 32-bit IDs
+        do {
+            let opts32 = IVFAppendOpts(format: .pq8, id_bits: 32)
+            let handle32 = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts32)
+
+            // First append some vectors
+            var listIDs: [Int32] = [0, 0, 0]
+            var externalIDs: [UInt64] = [100, 200, 300]
+            var codes = [UInt8](repeating: 1, count: 3 * 8)
+            try ivf_append(list_ids: listIDs, external_ids: externalIDs, codes: codes, n: 3, m: 8, index: handle32, opts: nil, internalIDsOut: nil)
+
+            // Insert in the middle
+            var insertIDs: [UInt64] = [150]
+            var insertCodes = [UInt8](repeating: 2, count: 8)
+            XCTAssertNoThrow(
+                try ivf_insert_at(
+                    list_id: 0,
+                    pos: 1,
+                    external_ids: insertIDs,
+                    codes: insertCodes,
+                    n: 1,
+                    index: handle32
+                )
+            )
+
+            let stats = try handle32.getListStats(listID: 0)
+            XCTAssertEqual(stats.length, 4)
+        }
+
+        // Test 64-bit IDs
+        do {
+            let opts64 = IVFAppendOpts(format: .pq8, id_bits: 64)
+            let handle64 = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts64)
+
+            // First append some vectors with large IDs
+            var listIDs: [Int32] = [0, 0]
+            var externalIDs: [UInt64] = [UInt64(UInt32.max) + 100, UInt64(UInt32.max) + 300]
+            var codes = [UInt8](repeating: 1, count: 2 * 8)
+            try ivf_append(list_ids: listIDs, external_ids: externalIDs, codes: codes, n: 2, m: 8, index: handle64, opts: nil, internalIDsOut: nil)
+
+            // Insert with large ID
+            var insertIDs: [UInt64] = [UInt64(UInt32.max) + 200]
+            var insertCodes = [UInt8](repeating: 2, count: 8)
+            XCTAssertNoThrow(
+                try ivf_insert_at(
+                    list_id: 0,
+                    pos: 1,
+                    external_ids: insertIDs,
+                    codes: insertCodes,
+                    n: 1,
+                    index: handle64
+                )
+            )
+
+            let stats = try handle64.getListStats(listID: 0)
+            XCTAssertEqual(stats.length, 3)
+        }
+    }
+
+    // Note: Direct testing of the storage mismatch error (VectorIndexError(.internalInconsistency))
+    // is not feasible without exposing internal implementation details or using unsafe pointer manipulation.
+    // The error represents defensive programming for conditions that should never occur in normal usage:
+    // - opts.id_bits modified after storage allocation
+    // - Memory corruption of IDStorage enum discriminant
+    // - Bug in storage initialization logic
+    //
+    // The tests above verify that:
+    // 1. Normal operations with 32-bit IDs work correctly (no false positives)
+    // 2. Normal operations with 64-bit IDs work correctly (no false positives)
+    // 3. The existing idWidthUnsupported error still works
+    // 4. All code paths that call storeExternalID execute without triggering the error
+
+    // MARK: - Phase 2 Migration Tests: growList (IVFAppend - Phase 2)
+
+    func testIVFAppend_ListGrowth_32BitIDs_NoInternalInconsistency() throws {
+        // Test that list growth (capacity increase) works correctly with 32-bit IDs
+        // This exercises the growList function's storage type matching logic
+
+        let opts = IVFAppendOpts(
+            format: .pq8,
+            reserve_factor: 1.5, // Moderate growth factor
+            reserve_min: 10,     // Small initial capacity
+            id_bits: 32
+        )
+        let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
+
+        // Append enough vectors to trigger multiple growth operations
+        let batchSize = 15
+        let numBatches = 7  // Will append 7 * 15 = 105 vectors
+        let totalVectors = numBatches * batchSize
+
+        for batch in 0..<numBatches {
+            var listIDs = [Int32](repeating: 0, count: batchSize)
+            var externalIDs = [UInt64](repeating: 0, count: batchSize)
+            var codes = [UInt8](repeating: UInt8(batch % 256), count: batchSize * 8)
+
+            for i in 0..<batchSize {
+                externalIDs[i] = UInt64(batch * batchSize + i + 1000)
+            }
+
+            // Each append may trigger list growth
+            XCTAssertNoThrow(
+                try ivf_append(
+                    list_ids: listIDs,
+                    external_ids: externalIDs,
+                    codes: codes,
+                    n: batchSize,
+                    m: 8,
+                    index: handle,
+                    opts: nil,
+                    internalIDsOut: nil
+                ),
+                "List growth should succeed for 32-bit IDs (batch \(batch))"
+            )
+        }
+
+        // Verify all vectors were stored
+        let stats = try handle.getListStats(listID: 0)
+        XCTAssertEqual(stats.length, totalVectors, "All vectors should be stored after growth")
+        XCTAssertGreaterThan(stats.capacity, 10, "Capacity should have grown beyond initial reserve_min")
+    }
+
+    func testIVFAppend_ListGrowth_64BitIDs_NoInternalInconsistency() throws {
+        // Test that list growth works correctly with 64-bit IDs
+        // Uses large IDs (> UInt32.max) to ensure we're truly testing 64-bit storage
+
+        let opts = IVFAppendOpts(
+            format: .pq8,
+            reserve_factor: 2.0, // Aggressive growth
+            reserve_min: 8,      // Small initial capacity to force growth
+            id_bits: 64
+        )
+        let handle = try IVFListHandle(k_c: 2, m: 8, d: 0, opts: opts)
+
+        // Append vectors with large IDs across multiple lists
+        let totalVectors = 80
+        let batchSize = 12
+
+        for batch in 0..<(totalVectors / batchSize) {
+            var listIDs = [Int32](repeating: 0, count: batchSize)
+            var externalIDs = [UInt64](repeating: 0, count: batchSize)
+            var codes = [UInt8](repeating: UInt8(batch % 256), count: batchSize * 8)
+
+            for i in 0..<batchSize {
+                listIDs[i] = Int32(i % 2)  // Distribute across 2 lists
+                // Use IDs larger than UInt32.max
+                externalIDs[i] = UInt64(UInt32.max) + UInt64(batch * batchSize + i + 5000)
+            }
+
+            XCTAssertNoThrow(
+                try ivf_append(
+                    list_ids: listIDs,
+                    external_ids: externalIDs,
+                    codes: codes,
+                    n: batchSize,
+                    m: 8,
+                    index: handle,
+                    opts: nil,
+                    internalIDsOut: nil
+                ),
+                "List growth should succeed for 64-bit IDs (batch \(batch))"
+            )
+        }
+
+        // Verify both lists received vectors and grew
+        for listID in 0..<2 {
+            let stats = try handle.getListStats(listID: Int32(listID))
+            XCTAssertGreaterThan(stats.length, 0, "List \(listID) should contain vectors")
+            XCTAssertGreaterThan(stats.capacity, 8, "List \(listID) capacity should have grown")
+        }
+    }
+
+    func testIVFAppendFlat_ListGrowth_32And64BitIDs_NoInternalInconsistency() throws {
+        // Test that growList works correctly for flat format (vector storage instead of codes)
+
+        // Test 32-bit IDs with flat format
+        do {
+            let opts32 = IVFAppendOpts(
+                format: .flat,
+                reserve_min: 5,  // Very small to force multiple growths
+                id_bits: 32
+            )
+            let handle32 = try IVFListHandle(k_c: 1, m: 0, d: 64, opts: opts32)
+
+            // Append in batches to trigger growth
+            for batch in 0..<10 {
+                var listIDs: [Int32] = [0, 0, 0, 0, 0]
+                var externalIDs: [UInt64] = [
+                    UInt64(batch * 5 + 0),
+                    UInt64(batch * 5 + 1),
+                    UInt64(batch * 5 + 2),
+                    UInt64(batch * 5 + 3),
+                    UInt64(batch * 5 + 4)
+                ]
+                var vectors = [Float](repeating: Float(batch), count: 5 * 64)
+
+                XCTAssertNoThrow(
+                    try ivf_append_flat(
+                        list_ids: listIDs,
+                        external_ids: externalIDs,
+                        xb: vectors,
+                        n: 5,
+                        d: 64,
+                        index: handle32,
+                        opts: nil,
+                        internalIDsOut: nil
+                    ),
+                    "Flat format growth should succeed for 32-bit IDs (batch \(batch))"
+                )
+            }
+
+            let stats32 = try handle32.getListStats(listID: 0)
+            XCTAssertEqual(stats32.length, 50)
+            XCTAssertGreaterThan(stats32.capacity, 5)
+        }
+
+        // Test 64-bit IDs with flat format
+        do {
+            let opts64 = IVFAppendOpts(
+                format: .flat,
+                reserve_min: 6,
+                id_bits: 64
+            )
+            let handle64 = try IVFListHandle(k_c: 1, m: 0, d: 32, opts: opts64)
+
+            for batch in 0..<8 {
+                var listIDs: [Int32] = [0, 0, 0]
+                var externalIDs: [UInt64] = [
+                    UInt64(UInt32.max) + UInt64(batch * 3 + 0),
+                    UInt64(UInt32.max) + UInt64(batch * 3 + 1),
+                    UInt64(UInt32.max) + UInt64(batch * 3 + 2)
+                ]
+                var vectors = [Float](repeating: Float(batch + 1), count: 3 * 32)
+
+                XCTAssertNoThrow(
+                    try ivf_append_flat(
+                        list_ids: listIDs,
+                        external_ids: externalIDs,
+                        xb: vectors,
+                        n: 3,
+                        d: 32,
+                        index: handle64,
+                        opts: nil,
+                        internalIDsOut: nil
+                    ),
+                    "Flat format growth should succeed for 64-bit IDs (batch \(batch))"
+                )
+            }
+
+            let stats64 = try handle64.getListStats(listID: 0)
+            XCTAssertEqual(stats64.length, 24)
+            XCTAssertGreaterThan(stats64.capacity, 6)
+        }
+    }
+
+    func testIVFInsertAt_TriggeringGrowth_NoInternalInconsistency() throws {
+        // Test that ivf_insert_at can trigger list growth without storage mismatch errors
+
+        let opts = IVFAppendOpts(
+            format: .pq8,
+            reserve_min: 3,  // Very small capacity to force growth
+            id_bits: 64
+        )
+        let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
+
+        // Initial append (fits in initial capacity)
+        var initialIDs: [Int32] = [0, 0]
+        var initialExtIDs: [UInt64] = [100, 200]
+        var initialCodes = [UInt8](repeating: 1, count: 2 * 8)
+        try ivf_append(
+            list_ids: initialIDs,
+            external_ids: initialExtIDs,
+            codes: initialCodes,
+            n: 2,
+            m: 8,
+            index: handle,
+            opts: nil,
+            internalIDsOut: nil
+        )
+
+        // Insert operations that will trigger growth
+        for i in 0..<5 {
+            var insertID: [UInt64] = [UInt64(UInt32.max) + UInt64(i * 100)]
+            var insertCodes = [UInt8](repeating: UInt8(i + 2), count: 8)
+
+            XCTAssertNoThrow(
+                try ivf_insert_at(
+                    list_id: 0,
+                    pos: i + 1,  // Insert in middle
+                    external_ids: insertID,
+                    codes: insertCodes,
+                    n: 1,
+                    index: handle
+                ),
+                "Insert triggering growth should succeed (iteration \(i))"
+            )
+        }
+
+        let stats = try handle.getListStats(listID: 0)
+        XCTAssertEqual(stats.length, 7, "Should have 2 initial + 5 inserted vectors")
+        XCTAssertGreaterThan(stats.capacity, 3, "Capacity should have grown beyond initial reserve_min")
+    }
+
+    // Note: Direct testing of the growList storage mismatch error is not feasible for the same
+    // reasons as storeExternalID - it requires internal state corruption that shouldn't occur
+    // during normal operations. The tests above verify that:
+    // 1. List growth works correctly with 32-bit IDs (no false positives)
+    // 2. List growth works correctly with 64-bit IDs (no false positives)
+    // 3. Growth works for both PQ and flat formats
+    // 4. Growth triggered by both append and insert operations succeeds
+    // 5. Multiple consecutive growth operations work correctly
+
+    // MARK: - Phase 3 Migration Tests: ivf_insert_at format validation (IVFAppend - Phase 3)
+
+    func testIVFInsertAt_ThrowsOnFlatFormat() throws {
+        // Test that ivf_insert_at properly rejects flat format indices
+        // User should use ivf_insert_at_flat instead
+
+        let opts = IVFAppendOpts(format: .flat)
+        let handle = try IVFListHandle(k_c: 1, m: 0, d: 128, opts: opts)
+
+        // First append some vectors using the correct function for flat format
+        var listIDs: [Int32] = [0, 0, 0]
+        var externalIDs: [UInt64] = [100, 200, 300]
+        var vectors = [Float](repeating: 1.0, count: 3 * 128)
+        try ivf_append_flat(
+            list_ids: listIDs,
+            external_ids: externalIDs,
+            xb: vectors,
+            n: 3,
+            d: 128,
+            index: handle,
+            opts: nil,
+            internalIDsOut: nil
+        )
+
+        // Now attempt to use ivf_insert_at (wrong function for flat format)
+        var insertIDs: [UInt64] = [150]
+        var dummyCodes = [UInt8](repeating: 0, count: 8)  // Codes parameter is ignored but required
+
+        XCTAssertThrowsError(
+            try ivf_insert_at(
+                list_id: 0,
+                pos: 1,
+                external_ids: insertIDs,
+                codes: dummyCodes,
+                n: 1,
+                index: handle
+            )
+        ) { error in
+            guard let indexError = error as? VectorIndexError else {
+                XCTFail("Expected VectorIndexError, got \(type(of: error))")
+                return
+            }
+
+            // Verify error details
+            XCTAssertEqual(indexError.kind, .unsupportedLayout)
+            XCTAssertTrue(indexError.kind.isRecoverable, "Format error should be recoverable")
+            XCTAssertEqual(indexError.context.operation, "ivf_insert_at")
+            XCTAssertTrue(
+                indexError.message.contains("PQ format"),
+                "Error message should mention PQ format requirement"
+            )
+            XCTAssertTrue(
+                indexError.message.contains("ivf_insert_at_flat"),
+                "Error message should suggest correct function"
+            )
+            XCTAssertEqual(indexError.context.additionalInfo["actual_format"], "flat")
+
+            // Verify recovery message is helpful
+            let recovery = indexError.recoveryMessage
+            XCTAssertFalse(recovery.isEmpty, "Should provide recovery guidance")
+        }
+    }
+
+    func testIVFInsertAt_SucceedsWithPQ8Format() throws {
+        // Regression test: Verify ivf_insert_at still works correctly with PQ8 format
+
+        let opts = IVFAppendOpts(format: .pq8)
+        let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
+
+        // Append initial vectors
+        var listIDs: [Int32] = [0, 0, 0]
+        var externalIDs: [UInt64] = [100, 200, 300]
+        var codes = [UInt8](repeating: 1, count: 3 * 8)
+        try ivf_append(
+            list_ids: listIDs,
+            external_ids: externalIDs,
+            codes: codes,
+            n: 3,
+            m: 8,
+            index: handle,
+            opts: nil,
+            internalIDsOut: nil
+        )
+
+        // Insert should succeed for PQ8 format
+        var insertIDs: [UInt64] = [150]
+        var insertCodes = [UInt8](repeating: 2, count: 8)
+
+        XCTAssertNoThrow(
+            try ivf_insert_at(
+                list_id: 0,
+                pos: 1,
+                external_ids: insertIDs,
+                codes: insertCodes,
+                n: 1,
+                index: handle
+            ),
+            "ivf_insert_at should succeed with PQ8 format"
+        )
+
+        // Verify insertion worked
+        let stats = try handle.getListStats(listID: 0)
+        XCTAssertEqual(stats.length, 4, "Should have 3 initial + 1 inserted vector")
+    }
+
+    func testIVFInsertAt_SucceedsWithPQ4Format() throws {
+        // Regression test: Verify ivf_insert_at works correctly with PQ4 format
+
+        let opts = IVFAppendOpts(format: .pq4, group: 4)
+        let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
+
+        // Append initial vectors
+        var listIDs: [Int32] = [0, 0]
+        var externalIDs: [UInt64] = [100, 200]
+        var codes = [UInt8](repeating: 1, count: 2 * 4)  // PQ4: m/2 = 8/2 = 4 bytes per vector
+        try ivf_append(
+            list_ids: listIDs,
+            external_ids: externalIDs,
+            codes: codes,
+            n: 2,
+            m: 8,
+            index: handle,
+            opts: nil,
+            internalIDsOut: nil
+        )
+
+        // Insert should succeed for PQ4 format
+        var insertIDs: [UInt64] = [150]
+        var insertCodes = [UInt8](repeating: 2, count: 4)
+
+        XCTAssertNoThrow(
+            try ivf_insert_at(
+                list_id: 0,
+                pos: 1,
+                external_ids: insertIDs,
+                codes: insertCodes,
+                n: 1,
+                index: handle
+            ),
+            "ivf_insert_at should succeed with PQ4 format"
+        )
+
+        // Verify insertion worked
+        let stats = try handle.getListStats(listID: 0)
+        XCTAssertEqual(stats.length, 3, "Should have 2 initial + 1 inserted vector")
+    }
+
+    func testIVFInsertAtFlat_SucceedsWithFlatFormat() throws {
+        // Complementary test: Verify ivf_insert_at_flat works correctly with flat format
+        // This demonstrates the correct API usage pattern
+
+        let opts = IVFAppendOpts(format: .flat)
+        let handle = try IVFListHandle(k_c: 1, m: 0, d: 64, opts: opts)
+
+        // Append initial vectors using ivf_append_flat
+        var listIDs: [Int32] = [0, 0]
+        var externalIDs: [UInt64] = [100, 300]
+        var vectors = [Float](repeating: 1.0, count: 2 * 64)
+        try ivf_append_flat(
+            list_ids: listIDs,
+            external_ids: externalIDs,
+            xb: vectors,
+            n: 2,
+            d: 64,
+            index: handle,
+            opts: nil,
+            internalIDsOut: nil
+        )
+
+        // Insert using the correct function for flat format
+        var insertIDs: [UInt64] = [200]
+        var insertVectors = [Float](repeating: 2.0, count: 64)
+
+        XCTAssertNoThrow(
+            try ivf_insert_at_flat(
+                list_id: 0,
+                pos: 1,
+                external_ids: insertIDs,
+                xb: insertVectors,
+                n: 1,
+                index: handle
+            ),
+            "ivf_insert_at_flat should succeed with flat format"
+        )
+
+        // Verify insertion worked
+        let stats = try handle.getListStats(listID: 0)
+        XCTAssertEqual(stats.length, 3, "Should have 2 initial + 1 inserted vector")
+    }
+
+    func testIVFInsertAt_ErrorMessageQuality() throws {
+        // Verify that the error message provides clear, actionable guidance
+
+        let opts = IVFAppendOpts(format: .flat)
+        let handle = try IVFListHandle(k_c: 1, m: 0, d: 128, opts: opts)
+
+        // Append one vector to ensure list is non-empty
+        var listIDs: [Int32] = [0]
+        var externalIDs: [UInt64] = [100]
+        var vectors = [Float](repeating: 1.0, count: 128)
+        try ivf_append_flat(
+            list_ids: listIDs,
+            external_ids: externalIDs,
+            xb: vectors,
+            n: 1,
+            d: 128,
+            index: handle,
+            opts: nil,
+            internalIDsOut: nil
+        )
+
+        // Attempt incorrect function
+        var insertIDs: [UInt64] = [200]
+        var dummyCodes = [UInt8](repeating: 0, count: 8)
+
+        do {
+            try ivf_insert_at(
+                list_id: 0,
+                pos: 0,
+                external_ids: insertIDs,
+                codes: dummyCodes,
+                n: 1,
+                index: handle
+            )
+            XCTFail("Should have thrown unsupportedLayout error")
+        } catch let error as VectorIndexError {
+            // Check error message quality
+            let fullDescription = error.description
+            XCTAssertTrue(
+                fullDescription.contains("PQ format"),
+                "Full description should explain format requirement"
+            )
+
+            let shortDescription = error.shortDescription
+            XCTAssertFalse(
+                shortDescription.isEmpty,
+                "Should have concise user-facing description"
+            )
+
+            // Verify metadata is complete
+            XCTAssertEqual(error.context.operation, "ivf_insert_at")
+            XCTAssertNotNil(error.context.additionalInfo["actual_format"])
+            XCTAssertEqual(error.kind.category, .configuration)
+        } catch {
+            XCTFail("Expected VectorIndexError, got \(type(of: error))")
+        }
+    }
 }

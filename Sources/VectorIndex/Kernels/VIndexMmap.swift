@@ -166,20 +166,8 @@ internal struct AppendReservation {
     let vecsStride: Int
 }
 
-internal enum VIndexError: Error {
-    case openFailed(errno: Int32)
-    case statFailed(errno: Int32)
-    case mmapFailed(errno: Int32)
-    case badHeader
-    case badCRC
-    case unknownSection
-    case unsupportedEndianness
-    case misalignedSection(expected: UInt64, got: UInt64)
-    case cannotGrowSection(SectionType)
-    case badListID
-    case insufficientCapacity
-    case walIOFailed(errno: Int32)
-}
+// VIndexError removed - migrated to VectorIndexError
+// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
 
 internal final class IndexMmap {
     public let path: String
@@ -227,27 +215,77 @@ internal final class IndexMmap {
     public static func open(path: String, opts: MmapOpts = .init()) throws -> IndexMmap {
         let flags = opts.readOnly ? O_RDONLY : O_RDWR
         let fd = Darwin.open(path, flags | O_CLOEXEC)
-        guard fd >= 0 else { throw VIndexError.openFailed(errno: errno) }
+        guard fd >= 0 else {
+            throw ErrorBuilder(.fileIOError, operation: "vindex_open")
+                .message("Failed to open index file")
+                .info("path", path)
+                .info("errno", "\(errno)")
+                .build()
+        }
         var st = stat()
-        guard fstat(fd, &st) == 0 else { let err = errno; Darwin.close(fd); throw VIndexError.statFailed(errno: err) }
+        guard fstat(fd, &st) == 0 else {
+            let err = errno
+            Darwin.close(fd)
+            throw ErrorBuilder(.fileIOError, operation: "vindex_fstat")
+                .message("Failed to stat index file")
+                .info("path", path)
+                .info("errno", "\(err)")
+                .build()
+        }
         let fileSize = UInt64(st.st_size)
-        guard fileSize >= 4096 else { let err = errno; Darwin.close(fd); throw VIndexError.badHeader }
+        guard fileSize >= 4096 else {
+            let err = errno
+            Darwin.close(fd)
+            throw ErrorBuilder(.corruptedData, operation: "vindex_open")
+                .message("Index file too small or invalid header")
+                .info("file_size", "\(fileSize)")
+                .info("min_size", "4096")
+                .build()
+        }
         let prot: Int32 = opts.readOnly ? PROT_READ : (PROT_READ | PROT_WRITE)
         let mapFlags: Int32 = MAP_FILE | MAP_SHARED
         let base = mmap(nil, Int(fileSize), prot, mapFlags, fd, 0)
-        guard base != MAP_FAILED else { let err = errno; Darwin.close(fd); throw VIndexError.mmapFailed(errno: err) }
+        guard base != MAP_FAILED else {
+            let err = errno
+            Darwin.close(fd)
+            throw ErrorBuilder(.mmapError, operation: "vindex_mmap")
+                .message("Failed to mmap index file")
+                .info("path", path)
+                .info("size", "\(fileSize)")
+                .info("errno", "\(err)")
+                .build()
+        }
 
         let hdrPtr = base!.bindMemory(to: VIndexHeader.self, capacity: 1)
         let hdr = hdrPtr.pointee
         let fileEndian = hdr.fileEndian()
         guard fileEndian == .little || fileEndian == .big else {
-            munmap(base, Int(fileSize)); Darwin.close(fd); throw VIndexError.unsupportedEndianness
+            munmap(base, Int(fileSize))
+            Darwin.close(fd)
+            throw ErrorBuilder(.endiannessMismatch, operation: "vindex_open")
+                .message("Unsupported or invalid endianness in index file")
+                .info("endian_byte", "\(hdr.version_endian)")
+                .build()
         }
-        guard hdr.magicOK(fileEndian) else { munmap(base, Int(fileSize)); Darwin.close(fd); throw VIndexError.badHeader }
+        guard hdr.magicOK(fileEndian) else {
+            munmap(base, Int(fileSize))
+            Darwin.close(fd)
+            throw ErrorBuilder(.corruptedData, operation: "vindex_open")
+                .message("Invalid magic number in index header")
+                .build()
+        }
         if opts.verifyCRCs {
             let calc = computeHeaderCRC(UnsafeRawPointer(hdrPtr))
             let stored = toHost(hdr.header_crc32, fileEndian: fileEndian)
-            guard calc == stored else { munmap(base, Int(fileSize)); Darwin.close(fd); throw VIndexError.badCRC }
+            guard calc == stored else {
+                munmap(base, Int(fileSize))
+                Darwin.close(fd)
+                throw ErrorBuilder(.corruptedData, operation: "vindex_open")
+                    .message("Header CRC mismatch")
+                    .info("expected", "\(stored)")
+                    .info("actual", "\(calc)")
+                    .build()
+            }
         }
         let tocOffset = toHost(hdr.toc_offset, fileEndian: fileEndian)
         let tocEntries = Int(toHost(hdr.toc_entries, fileEndian: fileEndian))
@@ -302,16 +340,36 @@ internal final class IndexMmap {
     private func indexInit() throws {
         for i in 0..<tocCount {
             let te = toc.advanced(by: i).pointee
-            guard let ty = te.typeHost(fileEndian) else { throw VIndexError.unknownSection }
+            guard let ty = te.typeHost(fileEndian) else {
+                throw ErrorBuilder(.invalidFormat, operation: "vindex_init")
+                    .message("Unknown section type in TOC")
+                    .info("toc_index", "\(i)")
+                    .build()
+            }
             tocByType[ty] = te
             let off = te.offsetHost(fileEndian)
             let al  = UInt64(te.alignHost(fileEndian))
-            if al != 0 && (off % UInt64(al)) != 0 { throw VIndexError.misalignedSection(expected: UInt64(al), got: off % UInt64(al)) }
+            if al != 0 && (off % UInt64(al)) != 0 {
+                throw ErrorBuilder(.corruptedData, operation: "vindex_init")
+                    .message("Section misaligned in index file")
+                    .info("section_type", "\(ty.rawValue)")
+                    .info("offset", "\(off)")
+                    .info("required_alignment", "\(al)")
+                    .info("actual_alignment", "\(off % UInt64(al))")
+                    .build()
+            }
             if opts.verifyCRCs && te.sizeHost(fileEndian) > 0 {
                 let p = slice(te)
                 let crc = CRC32.hash(p, Int(te.sizeHost(fileEndian)))
                 let stored = te.crcHost(fileEndian)
-                guard crc == stored else { throw VIndexError.badCRC }
+                guard crc == stored else {
+                    throw ErrorBuilder(.corruptedData, operation: "vindex_init")
+                        .message("Section CRC mismatch")
+                        .info("section_type", "\(ty.rawValue)")
+                        .info("expected", "\(stored)")
+                        .info("actual", "\(crc)")
+                        .build()
+                }
             }
         }
         if let e = mapSection(.centroids) { secCentroids = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
@@ -349,7 +407,13 @@ internal final class IndexMmap {
 
         if !opts.readOnly {
             walFD = Darwin.open(walPath, O_RDWR | O_CREAT | O_CLOEXEC, S_IRUSR | S_IWUSR)
-            if walFD < 0 { throw VIndexError.walIOFailed(errno: errno) }
+            if walFD < 0 {
+                throw ErrorBuilder(.fileIOError, operation: "vindex_wal_open")
+                    .message("Failed to open WAL file")
+                    .info("wal_path", walPath)
+                    .info("errno", "\(errno)")
+                    .build()
+            }
         }
     }
 
@@ -401,11 +465,29 @@ internal final class IndexMmap {
 
     // Write IDMap blob into existing section (size must fit). Updates CRC in TOC.
     public func writeIDMapBlob(_ blob: Data) throws {
-        guard !opts.readOnly else { throw VIndexError.walIOFailed(errno: EROFS) }
-        guard let e = tocByType[.idMap] else { throw VIndexError.unknownSection }
+        guard !opts.readOnly else {
+            throw ErrorBuilder(.fileIOError, operation: "vindex_idmap_write")
+                .message("Cannot write to read-only index")
+                .build()
+        }
+        guard let e = tocByType[.idMap] else {
+            throw ErrorBuilder(.invalidFormat, operation: "vindex_idmap_write")
+                .message("IDMap section not found in index")
+                .build()
+        }
         let maxSize = Int(e.sizeHost(fileEndian))
-        guard blob.count <= maxSize else { throw VIndexError.cannotGrowSection(.idMap) }
-        guard let basePtr = secIDMap else { throw VIndexError.unknownSection }
+        guard blob.count <= maxSize else {
+            throw ErrorBuilder(.capacityExceeded, operation: "vindex_idmap_write")
+                .message("IDMap blob too large for allocated section")
+                .info("blob_size", "\(blob.count)")
+                .info("max_size", "\(maxSize)")
+                .build()
+        }
+        guard let basePtr = secIDMap else {
+            throw ErrorBuilder(.invalidFormat, operation: "vindex_idmap_write")
+                .message("IDMap section pointer unavailable")
+                .build()
+        }
         blob.withUnsafeBytes { src in
             memcpy(UnsafeMutableRawPointer(mutating: basePtr), src.baseAddress!, blob.count)
             if maxSize > blob.count {
@@ -426,7 +508,12 @@ internal final class IndexMmap {
                 idxFound = i; break
             }
         }
-        guard let i = idxFound else { throw VIndexError.unknownSection }
+        guard let i = idxFound else {
+            throw ErrorBuilder(.invalidFormat, operation: "vindex_update_crc")
+                .message("Section not found in TOC")
+                .info("section_type", "\(ty.rawValue)")
+                .build()
+        }
         var te = toc.advanced(by: i).pointee
         let p = slice(te)
         let sz = Int(te.sizeHost(fileEndian))
@@ -457,7 +544,14 @@ internal final class IndexMmap {
     private let WAL_COMMIT_TAG: UInt32 = 0xDDCCBBAA
 
     public func mmap_append_begin(listID: Int, addLen: Int) throws -> AppendReservation {
-        guard !opts.readOnly, let descs = secListsDesc, listID >= 0, listID < kc else { throw VIndexError.badListID }
+        guard !opts.readOnly, let descs = secListsDesc, listID >= 0, listID < kc else {
+            throw ErrorBuilder(.invalidRange, operation: "mmap_append_begin")
+                .message("Invalid list ID or index is read-only")
+                .info("list_id", "\(listID)")
+                .info("valid_range", "0..<\(kc)")
+                .info("read_only", "\(opts.readOnly)")
+                .build()
+        }
         var dsc = descs[listID]
         let oldLen = dsc.lengthHost(fileEndian)
         let cap    = dsc.capacityHost(fileEndian)
@@ -468,10 +562,28 @@ internal final class IndexMmap {
         if addLen <= 0 { return AppendReservation(listID: listID, oldLen: oldLen, addLen: 0, idsFileOffset: dsc.idsOffsetHost(fileEndian), codesFileOffset: dsc.codesOffsetHost(fileEndian), vecsFileOffset: dsc.vecsOffsetHost(fileEndian), idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride) }
 
         if need > cap {
-            guard mapSection(.ids) != nil else { throw VIndexError.cannotGrowSection(.ids) }
-            guard mapSection(.codes) != nil else { throw VIndexError.cannotGrowSection(.codes) }
+            guard mapSection(.ids) != nil else {
+                throw ErrorBuilder(.capacityExceeded, operation: "mmap_append_begin")
+                    .message("Cannot grow IDs section")
+                    .info("list_id", "\(listID)")
+                    .build()
+            }
+            guard mapSection(.codes) != nil else {
+                throw ErrorBuilder(.capacityExceeded, operation: "mmap_append_begin")
+                    .message("Cannot grow codes section")
+                    .info("list_id", "\(listID)")
+                    .build()
+            }
             var _: TOCEntry? = nil; var vecsBasePtr: UnsafeMutableRawPointer? = nil
-            if vecsStride > 0 { guard mapSection(.vecs) != nil else { throw VIndexError.cannotGrowSection(.vecs) }; vecsBasePtr = secVecs }
+            if vecsStride > 0 {
+                guard mapSection(.vecs) != nil else {
+                    throw ErrorBuilder(.capacityExceeded, operation: "mmap_append_begin")
+                        .message("Cannot grow vecs section")
+                        .info("list_id", "\(listID)")
+                        .build()
+                }
+                vecsBasePtr = secVecs
+            }
             let newCap = max(need, max(cap * 2, 256))
             let newIDsOff = alignUp(tailIDs, 64)
             let newCodesOff = alignUp(tailCodes, 64)
@@ -483,7 +595,11 @@ internal final class IndexMmap {
             try ensureFileCapacity(for: .codes, tail: newCodesOff &+ codesBytes)
             if vecsStride > 0 { try ensureFileCapacity(for: .vecs, tail: newVecsOff &+ vecsBytes) }
             // After possible remap, refresh bases
-            guard let idsBase2 = secIDs, let codesBase2 = secCodes else { throw VIndexError.mmapFailed(errno: EFAULT) }
+            guard let idsBase2 = secIDs, let codesBase2 = secCodes else {
+                throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                    .message("Section base pointers unavailable after remap")
+                    .build()
+            }
             let oldIDs = idsBase2.advanced(by: Int(dsc.idsOffsetHost(fileEndian)))
             let newIDs = idsBase2.advanced(by: Int(newIDsOff))
             if oldLen > 0 { memcpy(newIDs, oldIDs, oldLen * idsStride) }
@@ -492,7 +608,11 @@ internal final class IndexMmap {
             if oldLen > 0 { memcpy(newCodes, oldCodes, oldLen * codesStride) }
             var newVecsOffUsed: UInt64 = 0
             if vecsStride > 0 {
-                guard let vecsBase = secVecs else { throw VIndexError.mmapFailed(errno: EFAULT) }
+                guard let vecsBase = secVecs else {
+                    throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                        .message("Vecs section base pointer unavailable after remap")
+                        .build()
+                }
                 let oldVecs = vecsBase.advanced(by: Int(dsc.vecsOffsetHost(fileEndian)))
                 let newVecs = vecsBase.advanced(by: Int(newVecsOff))
                 if oldLen > 0 { memcpy(newVecs, oldVecs, oldLen * vecsStride) }
@@ -584,7 +704,12 @@ internal final class IndexMmap {
     }
 
     private func ensureFileCapacity(for ty: SectionType, tail: UInt64) throws {
-        guard let e = mapSection(ty) else { throw VIndexError.cannotGrowSection(ty) }
+        guard let e = mapSection(ty) else {
+            throw ErrorBuilder(.capacityExceeded, operation: "ensure_file_capacity")
+                .message("Cannot grow section: not found in TOC")
+                .info("section_type", "\(ty.rawValue)")
+                .build()
+        }
         let off = e.offsetHost(fileEndian)
         let needEnd = off + tail
         if needEnd > fileSize {
@@ -592,16 +717,36 @@ internal final class IndexMmap {
             for (t, other) in tocByType {
                 if t == ty { continue }
                 let oOff = other.offsetHost(fileEndian)
-                if oOff > off { throw VIndexError.cannotGrowSection(ty) }
+                if oOff > off {
+                    throw ErrorBuilder(.capacityExceeded, operation: "ensure_file_capacity")
+                        .message("Cannot grow section: not the last section by offset")
+                        .info("section_type", "\(ty.rawValue)")
+                        .info("section_offset", "\(off)")
+                        .info("later_section_offset", "\(oOff)")
+                        .build()
+                }
             }
             // Extend file size
             let newSize = alignUp(needEnd, UInt64(getpagesize()))
-            if ftruncate(fd, off_t(newSize)) != 0 { throw VIndexError.statFailed(errno: errno) }
+            if ftruncate(fd, off_t(newSize)) != 0 {
+                throw ErrorBuilder(.fileIOError, operation: "ensure_file_capacity")
+                    .message("Failed to extend index file")
+                    .info("current_size", "\(fileSize)")
+                    .info("new_size", "\(newSize)")
+                    .info("errno", "\(errno)")
+                    .build()
+            }
             // Remap
             _ = msync(base, Int(fileSize), MS_SYNC)
             _ = munmap(base, Int(fileSize))
             let newMap = mmap(nil, Int(newSize), prot, mapFlags, fd, 0)
-            if newMap == MAP_FAILED { throw VIndexError.mmapFailed(errno: errno) }
+            if newMap == MAP_FAILED {
+                throw ErrorBuilder(.mmapError, operation: "ensure_file_capacity")
+                    .message("Failed to remap extended index file")
+                    .info("new_size", "\(newSize)")
+                    .info("errno", "\(errno)")
+                    .build()
+            }
             base = newMap!
             fileSize = newSize
             // Rebuild pointers and section maps
@@ -613,7 +758,12 @@ internal final class IndexMmap {
             // Note: skip CRC revalidation on remap; data not modified here.
             for i in 0..<tocCount {
                 let te = toc.advanced(by: i).pointee
-                guard let ty2 = te.typeHost(fileEndian) else { throw VIndexError.unknownSection }
+                guard let ty2 = te.typeHost(fileEndian) else {
+                    throw ErrorBuilder(.invalidFormat, operation: "ensure_file_capacity")
+                        .message("Unknown section type after remap")
+                        .info("toc_index", "\(i)")
+                        .build()
+                }
                 tocByType[ty2] = te
             }
             if let e = mapSection(.centroids) { secCentroids = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
@@ -661,8 +811,20 @@ internal final class IndexMmap {
         rec.crc32 = crc.littleEndian
         var r = rec
         let wrote = withUnsafeBytes(of: &r) { write(walFD, $0.baseAddress!, $0.count) }
-        if wrote != MemoryLayout<WalAppend>.size { throw VIndexError.walIOFailed(errno: errno) }
-        if fsync(walFD) != 0 { throw VIndexError.walIOFailed(errno: errno) }
+        if wrote != MemoryLayout<WalAppend>.size {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_append")
+                .message("Failed to write WAL append record")
+                .info("expected_bytes", "\(MemoryLayout<WalAppend>.size)")
+                .info("written_bytes", "\(wrote)")
+                .info("errno", "\(errno)")
+                .build()
+        }
+        if fsync(walFD) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_append")
+                .message("Failed to fsync WAL file")
+                .info("errno", "\(errno)")
+                .build()
+        }
     }
 
     private func writeWalCommit(listID: Int, newLen: Int) throws {
@@ -674,7 +836,19 @@ internal final class IndexMmap {
         rec.crc32 = crc.littleEndian
         var r = rec
         let wrote = withUnsafeBytes(of: &r) { write(walFD, $0.baseAddress!, $0.count) }
-        if wrote != MemoryLayout<WalCommit>.size { throw VIndexError.walIOFailed(errno: errno) }
-        if fsync(walFD) != 0 { throw VIndexError.walIOFailed(errno: errno) }
+        if wrote != MemoryLayout<WalCommit>.size {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_commit")
+                .message("Failed to write WAL commit record")
+                .info("expected_bytes", "\(MemoryLayout<WalCommit>.size)")
+                .info("written_bytes", "\(wrote)")
+                .info("errno", "\(errno)")
+                .build()
+        }
+        if fsync(walFD) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_commit")
+                .message("Failed to fsync WAL file")
+                .info("errno", "\(errno)")
+                .build()
+        }
     }
 }

@@ -11,15 +11,8 @@ import Accelerate
 
 // MARK: - Public API
 
-public enum PQError: Int32, Error {
-    case ok = 0
-    case invalidDim = -1
-    case invalidK = -2
-    case insufficientData = -3
-    case nullPtr = -4
-    case alignment = -5
-    case allocFailed = -6
-}
+// PQError removed - migrated to VectorIndexError
+// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
 
 public enum PQAlgorithm: Sendable { case lloyd, minibatch }
 public enum EmptyClusterPolicy: Sendable { case split, reseed, ignore }
@@ -87,13 +80,45 @@ public func pq_train_f32(
     codebooksOut: inout [Float],
     centroidNormsOut: inout [Float]?
 ) throws -> PQTrainStats {
-    guard d > 0, m > 0, n >= 0 else { throw PQError.invalidDim }
-    guard d % m == 0 else { throw PQError.invalidDim }
-    guard ks >= 1 && ks <= 65536 else { throw PQError.invalidK }
-    if (coarseCentroids == nil) != (assignments == nil) { throw PQError.nullPtr }
+    guard d > 0, m > 0, n >= 0 else {
+        throw ErrorBuilder(.invalidDimension, operation: "pq_train")
+            .message("Invalid dimensions: d, m must be positive, n must be non-negative")
+            .info("d", "\(d)")
+            .info("m", "\(m)")
+            .info("n", "\(n)")
+            .build()
+    }
+    guard d % m == 0 else {
+        throw ErrorBuilder(.invalidDimension, operation: "pq_train")
+            .message("Dimension d must be divisible by number of subquantizers m")
+            .info("d", "\(d)")
+            .info("m", "\(m)")
+            .info("dsub", "\(d / m)")
+            .build()
+    }
+    guard ks >= 1 && ks <= 65536 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_train")
+            .message("Invalid number of clusters ks")
+            .info("ks", "\(ks)")
+            .info("valid_range", "1...65536")
+            .build()
+    }
+    if (coarseCentroids == nil) != (assignments == nil) {
+        throw ErrorBuilder(.contractViolation, operation: "pq_train")
+            .message("coarseCentroids and assignments must both be nil or both be non-nil")
+            .info("coarseCentroids_nil", "\(coarseCentroids == nil)")
+            .info("assignments_nil", "\(assignments == nil)")
+            .build()
+    }
     let dsub = d / m
     let needN = (inCfg.sampleN > 0 ? inCfg.sampleN : n)
-    if needN < ks { throw PQError.insufficientData }
+    if needN < ks {
+        throw ErrorBuilder(.emptyInput, operation: "pq_train")
+            .message("Insufficient training data: need at least ks vectors")
+            .info("available_n", "\(needN)")
+            .info("required_ks", "\(ks)")
+            .build()
+    }
 
     if codebooksOut.count != m * ks * dsub { codebooksOut = .init(repeating: 0, count: m * ks * dsub) }
     if let _ = centroidNormsOut {
@@ -266,10 +291,35 @@ public func pq_train_streaming_f32(
     codebooksOut: inout [Float],
     centroidNormsOut: inout [Float]?
 ) throws -> PQTrainStats {
-    guard d > 0, m > 0 else { throw PQError.invalidDim }
-    guard d % m == 0 else { throw PQError.invalidDim }
-    guard ks >= 1 && ks <= 65536 else { throw PQError.invalidK }
-    if (coarseCentroids == nil) != (assignChunks == nil) { throw PQError.nullPtr }
+    guard d > 0, m > 0 else {
+        throw ErrorBuilder(.invalidDimension, operation: "pq_train_streaming")
+            .message("Invalid dimensions: d and m must be positive")
+            .info("d", "\(d)")
+            .info("m", "\(m)")
+            .build()
+    }
+    guard d % m == 0 else {
+        throw ErrorBuilder(.invalidDimension, operation: "pq_train_streaming")
+            .message("Dimension d must be divisible by number of subquantizers m")
+            .info("d", "\(d)")
+            .info("m", "\(m)")
+            .info("dsub", "\(d / m)")
+            .build()
+    }
+    guard ks >= 1 && ks <= 65536 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_train_streaming")
+            .message("Invalid number of clusters ks")
+            .info("ks", "\(ks)")
+            .info("valid_range", "1...65536")
+            .build()
+    }
+    if (coarseCentroids == nil) != (assignChunks == nil) {
+        throw ErrorBuilder(.contractViolation, operation: "pq_train_streaming")
+            .message("coarseCentroids and assignChunks must both be nil or both be non-nil")
+            .info("coarseCentroids_nil", "\(coarseCentroids == nil)")
+            .info("assignChunks_nil", "\(assignChunks == nil)")
+            .build()
+    }
     var cfg = inCfg
     cfg.algo = .minibatch
     if cfg.maxIters <= 0 { cfg.maxIters = 15 }

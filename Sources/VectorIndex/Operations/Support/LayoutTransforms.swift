@@ -38,23 +38,8 @@ public enum PQGroupSize: Int, Sendable {
     }
 }
 
-public enum LayoutError: Error, CustomStringConvertible {
-    case invalidRowBlockSize(Int)
-    case invalidDimensions(n: Int, d: Int)
-    case bufferTooLarge(Int)
-    case invalidPQGroup(m: Int, g: Int)
-    case invalidPQ4Bit(m: Int, g: Int)
-
-    public var description: String {
-        switch self {
-        case .invalidRowBlockSize(let R): return "Invalid row block size R=\(R). Expected 4 or 8."
-        case .invalidDimensions(let n, let d): return "Invalid dimensions n=\(n), d=\(d). Both must be > 0."
-        case .bufferTooLarge(let sz): return "Buffer too large: \(sz) elements would overflow."
-        case .invalidPQGroup(let m, let g): return "m (\(m)) must be divisible by g (\(g))."
-        case .invalidPQ4Bit(let m, let g): return "For 4-bit, m and g must be even; got m=\(m), g=\(g)."
-        }
-    }
-}
+// LayoutError removed - migrated to VectorIndexError
+// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
 
 // MARK: - Configuration
 
@@ -119,13 +104,31 @@ public func aosoaBufferSize(n: Int, d: Int) -> Int {
 
 @inline(__always)
 public func validateInterleaveParams(n: Int, d: Int, R: Int) throws {
-    guard R == 4 || R == 8 else { throw LayoutError.invalidRowBlockSize(R) }
-    guard n > 0 && d > 0 else { throw LayoutError.invalidDimensions(n: n, d: d) }
+    guard R == 4 || R == 8 else {
+        throw ErrorBuilder(.invalidParameter, operation: "validate_interleave_params")
+            .message("Invalid row block size")
+            .info("R", "\(R)")
+            .info("valid_values", "4, 8")
+            .build()
+    }
+    guard n > 0 && d > 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "validate_interleave_params")
+            .message("Invalid dimensions: both n and d must be positive")
+            .info("n", "\(n)")
+            .info("d", "\(d)")
+            .build()
+    }
 
     let dP = paddedDimension(d)
     let required = n &* dP
     // 4 bytes per float; just ensure element count itself doesn't overflow common Int arithmetic.
-    guard required < (Int.max >> 2) else { throw LayoutError.bufferTooLarge(required) }
+    guard required < (Int.max >> 2) else {
+        throw ErrorBuilder(.capacityExceeded, operation: "validate_interleave_params")
+            .message("Buffer size would overflow")
+            .info("required_elements", "\(required)")
+            .info("max_elements", "\(Int.max >> 2)")
+            .build()
+    }
 }
 
 @inline(__always)
@@ -392,7 +395,9 @@ public func vecsInterleaveInPlace_f32(
 // MARK: - PQ Code Interleaving (UInt8)
 
 /// Transform PQ codes from AoS [n][m] to group-interleaved layout.
-/// Precondition: m % g == 0
+///
+/// - Throws:
+///   - `VectorIndexError(.invalidParameter)`: If m is not divisible by g
 @inlinable
 public func pqCodesInterleave_u8(
     aos: UnsafePointer<UInt8>,
@@ -400,8 +405,14 @@ public func pqCodesInterleave_u8(
     m: Int,
     g: Int,
     out: UnsafeMutablePointer<UInt8>
-) {
-    precondition(m % g == 0, "m must be divisible by g")
+) throws {
+    guard m % g == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_codes_interleave_u8")
+            .message("m must be divisible by g")
+            .info("m", "\(m)")
+            .info("g", "\(g)")
+            .build()
+    }
 
     let numGroups = m / g
 
@@ -443,6 +454,9 @@ public func pqCodesInterleave_u8(
 }
 
 /// Inverse of `pqCodesInterleave_u8`
+///
+/// - Throws:
+///   - `VectorIndexError(.invalidParameter)`: If m is not divisible by g
 @inlinable
 public func pqCodesDeinterleave_u8(
     interleaved: UnsafePointer<UInt8>,
@@ -450,8 +464,14 @@ public func pqCodesDeinterleave_u8(
     m: Int,
     g: Int,
     aos: UnsafeMutablePointer<UInt8>
-) {
-    precondition(m % g == 0, "m must be divisible by g")
+) throws {
+    guard m % g == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_codes_deinterleave_u8")
+            .message("m must be divisible by g")
+            .info("m", "\(m)")
+            .info("g", "\(g)")
+            .build()
+    }
 
     let numGroups = m / g
 
@@ -494,7 +514,9 @@ public func pqCodesDeinterleave_u8(
 
 /// Transform packed 4-bit PQ codes to group-interleaved layout.
 /// Each byte contains two 4-bit codes (low nibble, high nibble).
-/// Precondition: m % g == 0, and both m and g are even.
+///
+/// - Throws:
+///   - `VectorIndexError(.invalidParameter)`: If m is not divisible by g, or if m or g is not even
 @inlinable
 public func pqCodesInterleave_u4(
     aos_packed: UnsafePointer<UInt8>,
@@ -502,9 +524,23 @@ public func pqCodesInterleave_u4(
     m: Int,   // number of subquantizers
     g: Int,   // group size (even)
     out_packed: UnsafeMutablePointer<UInt8>
-) {
-    precondition(m % g == 0, "m must be divisible by g")
-    precondition(m % 2 == 0 && g % 2 == 0, "m and g must be even for 4-bit")
+) throws {
+    guard m % g == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_codes_interleave_u4")
+            .message("m must be divisible by g")
+            .info("m", "\(m)")
+            .info("g", "\(g)")
+            .build()
+    }
+    guard m % 2 == 0 && g % 2 == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_codes_interleave_u4")
+            .message("For 4-bit PQ, both m and g must be even")
+            .info("m", "\(m)")
+            .info("g", "\(g)")
+            .info("m_even", "\(m % 2 == 0)")
+            .info("g_even", "\(g % 2 == 0)")
+            .build()
+    }
 
     let numGroups = m / g
     let bytesPerVec = m / 2
@@ -547,6 +583,9 @@ public func pqCodesInterleave_u4(
 }
 
 /// Inverse of `pqCodesInterleave_u4`
+///
+/// - Throws:
+///   - `VectorIndexError(.invalidParameter)`: If m is not divisible by g, or if m or g is not even
 @inlinable
 public func pqCodesDeinterleave_u4(
     interleaved_packed: UnsafePointer<UInt8>,
@@ -554,9 +593,23 @@ public func pqCodesDeinterleave_u4(
     m: Int,
     g: Int,
     aos_packed: UnsafeMutablePointer<UInt8>
-) {
-    precondition(m % g == 0, "m must be divisible by g")
-    precondition(m % 2 == 0 && g % 2 == 0, "m and g must be even for 4-bit")
+) throws {
+    guard m % g == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_codes_deinterleave_u4")
+            .message("m must be divisible by g")
+            .info("m", "\(m)")
+            .info("g", "\(g)")
+            .build()
+    }
+    guard m % 2 == 0 && g % 2 == 0 else {
+        throw ErrorBuilder(.invalidParameter, operation: "pq_codes_deinterleave_u4")
+            .message("For 4-bit PQ, both m and g must be even")
+            .info("m", "\(m)")
+            .info("g", "\(g)")
+            .info("m_even", "\(m % 2 == 0)")
+            .info("g_even", "\(g % 2 == 0)")
+            .build()
+    }
 
     let numGroups = m / g
     let bytesPerVec = m / 2
