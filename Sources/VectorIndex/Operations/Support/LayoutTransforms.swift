@@ -204,54 +204,39 @@ public func vecsInterleave_f32(
             let dimEnd = min(dimStart + V, d)
             let chunkDims = max(0, dimEnd - dimStart)
 
-            // Output offset (contiguous R×V tile)
-            let outOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            // Output offset for this block and dim-chunk, compact (no row padding beyond n)
+            // Layout per block contributes `blockRows * V` elements per chunk.
+            let outOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
-            // Transpose R rows × V dims into output
-            // First, write actual dims for available rows
+            // Transpose blockRows × V dims into output
             for row in 0..<blockRows {
                 let gRow = rowStart + row
                 let inRowOffset = gRow &* d
 
-                // Write real dimensions
-                var outBase = outOffset &+ row  // stride R across dims
+                // Stride across dims by blockRows (compact last block)
+                var outBase = outOffset &+ row
                 var inBase = inRowOffset &+ dimStart
                 var dim = 0
 
-                // Fast path: full chunk
                 if chunkDims == V {
-                    // Unrolled for unit-stride across dims (store as interleaved)
-                    // Each iteration stores dim i at outBase + i*R
-                    outBase = outOffset &+ row
                     for _ in 0..<V {
                         aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        outBase &+= blockRows
                         inBase &+= 1
                     }
                 } else {
-                    // Partial tail
+                    // Partial tail: copy real dims
                     while dim < chunkDims {
                         aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        outBase &+= blockRows
                         inBase &+= 1
                         dim &+= 1
                     }
-                    // Pad remaining dims with zeros
+                    // Pad remaining dims with zeros for this row
                     while dim < V {
                         aosoa[outBase] = 0.0
-                        outBase &+= R
+                        outBase &+= blockRows
                         dim &+= 1
-                    }
-                }
-            }
-
-            // Pad remaining rows in this block to zeros for all V dims
-            if blockRows < R {
-                for row in blockRows..<R {
-                    var outBase = outOffset &+ row
-                    for _ in 0..<V {
-                        aosoa[outBase] = 0.0
-                        outBase &+= R
                     }
                 }
             }
@@ -324,7 +309,8 @@ public func vecsDeinterleave_f32(
             let dimEnd   = min(dimStart + V, d)
             let realDims = max(0, dimEnd - dimStart)
 
-            let inOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            // Mirror compact layout used in interleave
+            let inOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
             for row in 0..<blockRows {
                 let gRow = rowStart + row
@@ -336,7 +322,7 @@ public func vecsDeinterleave_f32(
                 // Copy only real dimensions (skip padded tail)
                 for _ in 0..<realDims {
                     aos[outBase] = aosoa[inBase]
-                    inBase &+= R
+                    inBase &+= blockRows
                     outBase &+= 1
                 }
             }
@@ -919,7 +905,7 @@ public func vecsInterleave_f32_parallel(
             let dimStart = dimChunk * V
             let dimEnd = min(dimStart + V, d)
             let chunkDims = max(0, dimEnd - dimStart)
-            let outOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            let outOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
             for row in 0..<blockRows {
                 let gRow = rowStart + row
@@ -932,30 +918,20 @@ public func vecsInterleave_f32_parallel(
                 if chunkDims == V {
                     for _ in 0..<V {
                         aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        outBase &+= blockRows
                         inBase &+= 1
                     }
                 } else {
                     while dim < chunkDims {
                         aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        outBase &+= blockRows
                         inBase &+= 1
                         dim &+= 1
                     }
                     while dim < V {
                         aosoa[outBase] = 0.0
-                        outBase &+= R
+                        outBase &+= blockRows
                         dim &+= 1
-                    }
-                }
-            }
-
-            if blockRows < R {
-                for row in blockRows..<R {
-                    var outBase = outOffset &+ row
-                    for _ in 0..<V {
-                        aosoa[outBase] = 0.0
-                        outBase &+= R
                     }
                 }
             }
@@ -1001,7 +977,7 @@ public func vecsDeinterleave_f32_parallel(
             let dimEnd   = min(dimStart + V, d)
             let realDims = max(0, dimEnd - dimStart)
 
-            let inOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            let inOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
             for row in 0..<blockRows {
                 let gRow = rowStart + row
@@ -1013,7 +989,7 @@ public func vecsDeinterleave_f32_parallel(
                 // Copy only real dimensions (skip padded tail)
                 for _ in 0..<realDims {
                     aos[outBase] = aosoa[inBase]
-                    inBase &+= R
+                    inBase &+= blockRows
                     outBase &+= 1
                 }
             }

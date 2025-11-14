@@ -484,7 +484,11 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             dimension: dimension,
             metric: metric,
             details: [
-                "nlist": String(centroids.count),
+                // Report configured nlist for consistency, even if training
+                // used fewer centroids due to small dataset size.
+                "nlist": String(config.nlist),
+                // Also report how many centroids are currently trained/built.
+                "trained_nlist": String(centroids.count),
                 "nprobe": String(config.nprobe),
                 "assigned": String(idToListIndex.count)
             ]

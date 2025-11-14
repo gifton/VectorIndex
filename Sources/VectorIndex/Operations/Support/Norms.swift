@@ -295,7 +295,7 @@ public extension IndexOps.Support {
 
             let dataOffset = NormCacheHeader.size
             let fileSize = off_t(dataOffset + dataBytes)
-            let map = mmap(nil, dataBytes, PROT_READ, MAP_FILE | MAP_SHARED, fd, off_t(dataOffset))
+            let map = mmap(nil, dataBytes, PROT_READ, MAP_SHARED, fd, off_t(dataOffset))
             guard map != MAP_FAILED else { throw NSError(domain: "NormCache.save", code: 4, userInfo: [NSLocalizedDescriptionKey: "mmap for checksum failed"]) }
             let crc = crc64_ecma(buffer: map!, length: dataBytes)
             munmap(map, dataBytes)
@@ -315,7 +315,7 @@ public extension IndexOps.Support {
             let fileSize = Int(st.st_size)
             guard fileSize >= NormCacheHeader.size else { throw NSError(domain: "NormCache.load", code: 12, userInfo: [NSLocalizedDescriptionKey: "file too small"]) }
 
-            let base = mmap(nil, fileSize, PROT_READ, MAP_FILE | MAP_SHARED, fd, 0)
+            let base = mmap(nil, fileSize, PROT_READ, MAP_SHARED, fd, 0)
             guard base != MAP_FAILED else { throw NSError(domain: "NormCache.load", code: 13, userInfo: [NSLocalizedDescriptionKey: "mmap failed"]) }
 
             let hdrPtr = base!.assumingMemoryBound(to: NormCacheHeader.self)

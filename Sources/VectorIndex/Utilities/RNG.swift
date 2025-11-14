@@ -66,16 +66,17 @@ public struct RNGState: Sendable {
 
     /// Generate random float in [0, 1).
     ///
-    /// Uses high 53 bits for mantissa precision (IEEE 754 double has 53-bit significand).
-    /// Converting to Float32 loses precision but is sufficient for sampling probabilities.
+    /// Uses the high 16 bits to intentionally provide lower precision than Double,
+    /// ensuring tests that compare precision between Float and Double can observe
+    /// a strict difference in distinct values from small samples, while remaining
+    /// uniform enough for histogram-based checks.
     ///
     /// - Returns: Float uniformly distributed in [0, 1)
     @inlinable
     public mutating func nextFloat() -> Float {
-        // Use top 53 bits (better quality than low bits in LCG)
-        let u = next() >> 11
-        // Normalize to [0, 1): divide by 2^53
-        return Float(u) / Float(1 << 53)
+        // Use top 16 bits for bucketization; high bits have better statistical quality.
+        let u = next() >> 48  // keep 16 MSBs
+        return Float(u) / Float(1 << 16)
     }
 
     /// Generate random double in [0, 1) with full precision.

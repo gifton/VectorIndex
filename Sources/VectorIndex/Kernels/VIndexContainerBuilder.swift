@@ -105,9 +105,10 @@ internal enum VIndexContainerBuilder {
         let tocOffset = off
         off = alignUpU64(tocOffset &+ tocSize, 64)
 
-        // ListsDesc section
+        // ListsDesc section (packed 64-byte records)
+        let DISK_LISTDESC_SIZE: UInt64 = 64
         let listsDescOffset = off
-        let listsDescSize = UInt64(k_c * MemoryLayout<ListDesc>.stride)
+        let listsDescSize = UInt64(k_c) &* DISK_LISTDESC_SIZE
         off = alignUpU64(listsDescOffset &+ listsDescSize, 64)
 
         // IDs section (pre-sized for idCap)
@@ -147,13 +148,31 @@ internal enum VIndexContainerBuilder {
 
         // Create and size the file
         let fd = Darwin.open(path, O_RDWR | O_CREAT | O_TRUNC | O_CLOEXEC, S_IRUSR | S_IWUSR)
-        guard fd >= 0 else { throw VIndexError.openFailed(errno: errno) }
+        guard fd >= 0 else {
+            throw ErrorBuilder(.fileIOError, operation: "container_create")
+                .message("Failed to open container file")
+                .path(path)
+                .errno(errno)
+                .build()
+        }
         defer { _ = Darwin.close(fd) }
-        if ftruncate(fd, off_t(fileSize)) != 0 { throw VIndexError.statFailed(errno: errno) }
+        if ftruncate(fd, off_t(fileSize)) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "container_resize")
+                .message("Failed to resize container file")
+                .path(path)
+                .info("size", "\(fileSize)")
+                .errno(errno)
+                .build()
+        }
 
         // Map and write
-        guard let base = mmap(nil, Int(fileSize), PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0), base != MAP_FAILED else {
-            throw VIndexError.mmapFailed(errno: errno)
+        guard let base = mmap(nil, Int(fileSize), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0), base != MAP_FAILED else {
+            throw ErrorBuilder(.mmapError, operation: "container_mmap")
+                .message("Failed to mmap container file")
+                .path(path)
+                .info("size", "\(fileSize)")
+                .errno(errno)
+                .build()
         }
         defer { _ = msync(base, Int(fileSize), MS_SYNC); _ = munmap(base, Int(fileSize)) }
 
@@ -166,44 +185,85 @@ internal enum VIndexContainerBuilder {
             zero(idMapOffset, idMapSize)
         }
 
-        // Write ListsDesc array
-        let descsPtr = UnsafeMutableRawPointer(base).advanced(by: Int(listsDescOffset)).assumingMemoryBound(to: ListDesc.self)
-        for i in 0..<k_c {
-            var dsc = ListDesc(format: 0, group_g: UInt8(group), id_bits: UInt8(idBits), reserved0: 0, length: 0, capacity: UInt32(idCap), ids_offset: 0, codes_offset: 0, vecs_offset: 0, ids_stride: UInt32(idStride), codes_stride: UInt32(codesStride), vecs_stride: UInt32(vecsStride), reserved1: 0)
-            switch format {
-            case .pq8: dsc.format = 2
-            case .pq4: dsc.format = 3
-            case .flat: dsc.format = 1
+        // Helpers to store little-endian values
+        @inline(__always) func storeLE32(_ ptr: UnsafeMutableRawPointer, _ v: UInt32) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { bytes in
+                memcpy(ptr, bytes.baseAddress!, 4)
             }
-            dsc.length = 0
-            dsc.capacity = UInt32(idCap)
-            dsc.ids_offset = perListIDsOff[i]
-            if format == .flat { dsc.vecs_offset = perListPayloadOff[i] } else { dsc.codes_offset = perListPayloadOff[i] }
-            descsPtr.advanced(by: i).pointee = dsc
+        }
+        @inline(__always) func storeLE64(_ ptr: UnsafeMutableRawPointer, _ v: UInt64) {
+            var le = v.littleEndian
+            withUnsafeBytes(of: &le) { bytes in
+                memcpy(ptr, bytes.baseAddress!, 8)
+            }
         }
 
-        // Build TOC entries
-        // All TOC fields are stored in little-endian (file) format
-        let tocPtr = UnsafeMutableRawPointer(base).advanced(by: Int(tocOffset)).assumingMemoryBound(to: _TOCEntry.self)
+        // Write ListsDesc records (packed 64 bytes)
+        for i in 0..<k_c {
+            let recBase = UnsafeMutableRawPointer(base).advanced(by: Int(listsDescOffset &+ UInt64(i) &* DISK_LISTDESC_SIZE))
+            // Zero record
+            memset(recBase, 0, Int(DISK_LISTDESC_SIZE))
+            // Byte fields
+            recBase.storeBytes(of: UInt8((format == .pq8) ? 2 : (format == .pq4 ? 3 : 1)), as: UInt8.self) // format at +0
+            recBase.advanced(by: 1).storeBytes(of: UInt8(group), as: UInt8.self)                           // group at +1
+            recBase.advanced(by: 2).storeBytes(of: UInt8(idBits), as: UInt8.self)                          // id_bits at +2
+            recBase.advanced(by: 3).storeBytes(of: UInt8(0), as: UInt8.self)                               // reserved at +3
+            // u32 fields
+            storeLE32(recBase.advanced(by: 4), 0)                                                          // length
+            storeLE32(recBase.advanced(by: 8), UInt32(idCap))                                              // capacity
+            // u64 offsets (section-relative)
+            storeLE64(recBase.advanced(by: 16), perListIDsOff[i])                                          // ids_offset
+            if format == .flat {
+                storeLE64(recBase.advanced(by: 32), perListPayloadOff[i])                                  // vecs_offset at +32
+            } else {
+                storeLE64(recBase.advanced(by: 24), perListPayloadOff[i])                                  // codes_offset at +24
+            }
+            // strides
+            storeLE32(recBase.advanced(by: 40), UInt32(idStride))
+            storeLE32(recBase.advanced(by: 44), UInt32(codesStride))
+            storeLE32(recBase.advanced(by: 48), UInt32(vecsStride))
+            storeLE32(recBase.advanced(by: 52), 0)                                                         // reserved1
+        }
+
+        // Build TOC entries (packed 36 bytes per entry)
+        let DISK_TOC_ENTRY_SIZE: UInt64 = 36
+        @inline(__always) func writeTOCEntry(_ idx: Int, type: UInt32, offset: UInt64, size: UInt64, align: UInt32, flags: UInt32, crc32: UInt32, reserved: UInt32) {
+            let basePtr = UnsafeMutableRawPointer(base).advanced(by: Int(tocOffset &+ UInt64(idx) &* DISK_TOC_ENTRY_SIZE))
+            // Packed layout (36 bytes): type@0 (u32), offset@4 (u64), size@12 (u64), align@20 (u32), flags@24 (u32), crc@28 (u32), reserved@32 (u32)
+            storeLE32(basePtr.advanced(by: 0), type)
+            storeLE64(basePtr.advanced(by: 4), offset)
+            storeLE64(basePtr.advanced(by: 12), size)
+            storeLE32(basePtr.advanced(by: 20), align)
+            storeLE32(basePtr.advanced(by: 24), flags)
+            storeLE32(basePtr.advanced(by: 28), crc32)
+            storeLE32(basePtr.advanced(by: 32), reserved)
+        }
         // ListsDesc entry
-        tocPtr[0] = _TOCEntry(type: SectionType.listsDesc.rawValue, offset: listsDescOffset, size: listsDescSize, align: 64, flags: 0, crc32: 0, reserved: 0)
-        tocPtr[1] = _TOCEntry(type: SectionType.ids.rawValue, offset: idsOffset, size: idsSize, align: 64, flags: 0, crc32: 0, reserved: 0)
+        writeTOCEntry(0, type: SectionType.listsDesc.rawValue, offset: listsDescOffset, size: listsDescSize, align: 64, flags: 0, crc32: 0, reserved: 0)
+        // IDs entry
+        writeTOCEntry(1, type: SectionType.ids.rawValue, offset: idsOffset, size: idsSize, align: 64, flags: 0, crc32: 0, reserved: 0)
+        // Payload entry
         let payloadType: SectionType = (format == .flat) ? .vecs : .codes
-        tocPtr[2] = _TOCEntry(type: payloadType.rawValue, offset: payloadOffset, size: payloadSize, align: UInt32(getpagesize()), flags: 0, crc32: 0, reserved: 0)
+        writeTOCEntry(2, type: payloadType.rawValue, offset: payloadOffset, size: payloadSize, align: UInt32(getpagesize()), flags: 0, crc32: 0, reserved: 0)
         if includeIDMap {
-            tocPtr[3] = _TOCEntry(type: SectionType.idMap.rawValue, offset: idMapOffset, size: idMapSize, align: 64, flags: 0, crc32: 0, reserved: 0)
+            writeTOCEntry(3, type: SectionType.idMap.rawValue, offset: idMapOffset, size: idMapSize, align: 64, flags: 0, crc32: 0, reserved: 0)
         }
 
-        // Compute CRCs over sections and store directly (no endian conversion needed on LE)
-        for i in 0..<tocCount {
-            var te = tocPtr[i]
-            let p = UnsafeRawPointer(base).advanced(by: Int(te.offset))
-            te.crc32 = _CRC32.hash(p, Int(te.size))
-            tocPtr[i] = te
+        // Compute CRCs over sections and write back into TOC entries
+        func writeCRC(at index: Int, offset: UInt64, size: UInt64) {
+            let p = UnsafeRawPointer(base).advanced(by: Int(offset))
+            let c = _CRC32.hash(p, Int(size))
+            let crcPtr = UnsafeMutableRawPointer(base).advanced(by: Int(tocOffset &+ UInt64(index) &* DISK_TOC_ENTRY_SIZE + 28))
+            storeLE32(crcPtr, c)
         }
+        writeCRC(at: 0, offset: listsDescOffset, size: listsDescSize)
+        writeCRC(at: 1, offset: idsOffset, size: idsSize)
+        writeCRC(at: 2, offset: payloadOffset, size: payloadSize)
+        if includeIDMap { writeCRC(at: 3, offset: idMapOffset, size: idMapSize) }
 
         // Write header with CRC
-        var hdr = _Header(
+        let hdr = _Header(
             magic: UInt64(0x00585845444E4956),
             version_major: 1,
             version_minor: 0,

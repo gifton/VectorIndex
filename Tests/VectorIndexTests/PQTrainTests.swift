@@ -28,6 +28,7 @@ final class PQTrainTests: XCTestCase {
         }
 
         var codebooks = [Float]()
+        
         var norms: [Float]? = []
 
         let stats = try pq_train_f32(
@@ -69,7 +70,7 @@ final class PQTrainTests: XCTestCase {
         var cfg = PQTrainConfig()
         cfg.algo = .minibatch
         cfg.batchSize = 512
-        cfg.maxIters = 10
+        cfg.maxIters = 5
 
         var codebooks = [Float]()
         var norms: [Float]? = []

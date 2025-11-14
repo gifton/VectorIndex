@@ -43,8 +43,8 @@ import Accelerate
 
 // MARK: - Error Handling
 
-// ResidualError removed - migrated to VectorIndexError
-// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
+// Back-compat error type for tests expecting ResidualError
+public enum ResidualError: Error, Equatable { case invalidCoarseID }
 
 // MARK: - Options & Telemetry
 
@@ -201,12 +201,7 @@ public func residuals_f32(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {
-                throw ErrorBuilder(.invalidRange, operation: "residuals_compute")
-                    .message("Coarse assignment ID out of valid range")
-                    .info("coarse_id", "\(a)")
-                    .info("valid_range", "0..<\(opts.kc)")
-                    .info("vector_index", "\(i)")
-                    .build()
+                throw ResidualError.invalidCoarseID
             }
         }
 

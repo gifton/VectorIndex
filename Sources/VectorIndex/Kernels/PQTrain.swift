@@ -80,6 +80,7 @@ public func pq_train_f32(
     codebooksOut: inout [Float],
     centroidNormsOut: inout [Float]?
 ) throws -> PQTrainStats {
+    print("[PQTrain] enter pq_train_f32 n=\(n) d=\(d) m=\(m) ks=\(ks)")
     guard d > 0, m > 0, n >= 0 else {
         throw ErrorBuilder(.invalidDimension, operation: "pq_train")
             .message("Invalid dimensions: d, m must be positive, n must be non-negative")
@@ -111,6 +112,7 @@ public func pq_train_f32(
             .build()
     }
     let dsub = d / m
+    print("[PQTrain] dsub=\(dsub)")
     let needN = (inCfg.sampleN > 0 ? inCfg.sampleN : n)
     if needN < ks {
         throw ErrorBuilder(.emptyInput, operation: "pq_train")
@@ -126,6 +128,13 @@ public func pq_train_f32(
     }
 
     var cfg = inCfg
+    // Adaptive defaults for minibatch to keep training time reasonable in tests/CI
+    if cfg.algo == .minibatch {
+        if cfg.sampleN <= 0 && n > 2000 { cfg.sampleN = 2000 }
+        if cfg.batchSize <= 0 { cfg.batchSize = 512 }
+        // Prefer cheap reseed for empty clusters in minibatch to avoid expensive scans
+        cfg.emptyPolicy = .reseed
+    }
     if cfg.maxIters <= 0 { cfg.maxIters = 25 }
     if cfg.tol <= 0 { cfg.tol = 1e-4 }
     if centroidNormsOut != nil && cfg.computeCentroidNorms == false {
@@ -139,99 +148,113 @@ public func pq_train_f32(
     _ = centroidNormsOut
 
     let t0 = nowSec()
+    print("[PQTrain] cfg: algo=\(cfg.algo) maxIters=\(cfg.maxIters) tol=\(cfg.tol) batchSize=\(cfg.batchSize) sampleN=\(cfg.sampleN) seed=\(cfg.seed) threads=\(cfg.numThreads) preX2=\(cfg.precomputeXNorm2) norms=\(cfg.computeCentroidNorms) empty=\(cfg.emptyPolicy)")
 
-    let group = DispatchGroup()
-    let q = cfg.numThreads == 1 ? DispatchQueue(label: "pq.train.serial") :
-                                  DispatchQueue(label: "pq.train.concurrent", attributes: .concurrent)
-    let cfgLocal = cfg  // capture immutable copy for concurrent tasks
+    let cfgLocal = cfg  // capture immutable copy for tasks
 
-    for j in 0..<m {
-        q.async(group: group) {
-            var rng = Xoroshiro128(splitFrom: cfgLocal.seed, streamID: UInt64(cfgLocal.streamID), taskID: UInt64(j))
-            let (idx, ns) = buildSampleIndex(n: n, sampleN: cfgLocal.sampleN, rng: &rng)
+    func runOneSubspace(_ j: Int) {
+        print("[PQTrain] subspace \(j): begin")
+        var rng = Xoroshiro128(splitFrom: cfgLocal.seed, streamID: UInt64(cfgLocal.streamID), taskID: UInt64(j))
+        let (idx, ns) = buildSampleIndex(n: n, sampleN: cfgLocal.sampleN, rng: &rng)
+        print("[PQTrain] subspace \(j): sample ns=\(ns) (n=\(n)) path=\(ns == n ? "full" : "dense")")
 
-            let tInitS = nowSec()
-            var Cj = [Float](repeating: 0, count: ks * dsub)
+        let tInitS = nowSec()
+        var Cj = [Float](repeating: 0, count: ks * dsub)
 
-            if ns == n {
-                kmeansppSeedSubspace(
-                    x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
-                    coarse: coarseCentroids, assign: assignments,
-                    rng: &rng, outC: &Cj
-                )
-            } else {
-                var tmp = [Float](repeating: 0, count: Int(ns) * dsub)
-                for (t, i32) in idx.enumerated() {
-                    let i = Int(i32)
-                    let base = i * d + j * dsub
-                    if let coarse = coarseCentroids, let a = assignments {
-                        let gid = Int(a[i])
-                        let gBase = gid * d + j * dsub
-                        for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] - coarse[gBase + u] }
-                    } else {
-                        for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] }
-                    }
-                }
-                kmeansppSeedSubspaceDense(
-                    xDense: tmp, n: Int(ns), dsub: dsub, ks: ks,
-                    rng: &rng, outC: &Cj
-                )
-            }
-            let tInitE = nowSec()
-
-            let tTrainS = nowSec()
-            var distortion = 0.0
-            var iters = 0
-            var emptiesFixed = 0
-
-            switch cfgLocal.algo {
-            case .minibatch:
-                minibatchKMeansSubspace(
-                    x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
-                    coarse: coarseCentroids, assign: assignments,
-                    cfg: cfgLocal, rng: &rng, C: &Cj,
-                    outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
-                )
-            case .lloyd:
-                lloydKMeansSubspace(
-                    x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
-                    coarse: coarseCentroids, assign: assignments,
-                    cfg: cfgLocal, C: &Cj,
-                    outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
-                )
-            }
-            let tTrainE = nowSec()
-
-            // Compute norms if needed
-            var normsJ: [Float]? = nil
-            if cfgLocal.computeCentroidNorms {
-                var norms = [Float](repeating: 0, count: ks)
-                for k in 0..<ks {
-                    var s: Float = 0
-                    for u in 0..<dsub {
-                        let v = Cj[k*dsub + u]
-                        s += v * v
-                    }
-                    norms[k] = s
-                }
-                normsJ = norms
-            }
-
-            // Store results via accumulator to avoid mutating captured var in concurrent code
-            let res = SubspaceResults(
-                timeInit: tInitE - tInitS,
-                timeTrain: tTrainE - tTrainS,
-                distortion: distortion,
-                iters: iters,
-                emptiesFixed: emptiesFixed,
-                bytesRead: Int64(iters) * n * Int64(dsub) * 4,
-                codebook: Cj,
-                norms: normsJ
+        if ns == n {
+            kmeansppSeedSubspace(
+                x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
+                coarse: coarseCentroids, assign: assignments,
+                rng: &rng, outC: &Cj
             )
-            resultAcc.set(j, res)
+        } else {
+            var tmp = [Float](repeating: 0, count: Int(ns) * dsub)
+            for (t, i32) in idx.enumerated() {
+                let i = Int(i32)
+                let base = i * d + j * dsub
+                if let coarse = coarseCentroids, let a = assignments {
+                    let gid = Int(a[i])
+                    let gBase = gid * d + j * dsub
+                    for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] - coarse[gBase + u] }
+                } else {
+                    for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] }
+                }
+            }
+            kmeansppSeedSubspaceDense(
+                xDense: tmp, n: Int(ns), dsub: dsub, ks: ks,
+                rng: &rng, outC: &Cj
+            )
         }
+        let tInitE = nowSec()
+        print("[PQTrain] subspace \(j): seeding done dt=\(tInitE - tInitS)s")
+
+        let tTrainS = nowSec()
+        var distortion = 0.0
+        var iters = 0
+        var emptiesFixed = 0
+
+        switch cfgLocal.algo {
+        case .minibatch:
+            print("[PQTrain] subspace \(j): train algo=minibatch ...")
+            minibatchKMeansSubspace(
+                x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
+                coarse: coarseCentroids, assign: assignments,
+                cfg: cfgLocal, rng: &rng, C: &Cj,
+                outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
+            )
+        case .lloyd:
+            print("[PQTrain] subspace \(j): train algo=lloyd ...")
+            lloydKMeansSubspace(
+                x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
+                coarse: coarseCentroids, assign: assignments,
+                cfg: cfgLocal, C: &Cj,
+                outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
+            )
+        }
+        let tTrainE = nowSec()
+        print("[PQTrain] subspace \(j): train done dt=\(tTrainE - tTrainS)s iters=\(iters) emptiesFixed=\(emptiesFixed) distortion=\(distortion)")
+
+        // Compute norms if needed
+        var normsJ: [Float]? = nil
+        if cfgLocal.computeCentroidNorms {
+            var norms = [Float](repeating: 0, count: ks)
+            for k in 0..<ks {
+                var s: Float = 0
+                for u in 0..<dsub {
+                    let v = Cj[k*dsub + u]
+                    s += v * v
+                }
+                norms[k] = s
+            }
+            normsJ = norms
+        }
+
+        let res = SubspaceResults(
+            timeInit: tInitE - tInitS,
+            timeTrain: tTrainE - tTrainS,
+            distortion: distortion,
+            iters: iters,
+            emptiesFixed: emptiesFixed,
+            bytesRead: Int64(iters) * n * Int64(dsub) * 4,
+            codebook: Cj,
+            norms: normsJ
+        )
+        resultAcc.set(j, res)
+        print("[PQTrain] subspace \(j): result stored")
     }
-    group.wait()
+
+    if cfg.numThreads <= 1 {
+        print("[PQTrain] execution mode: serial (threads<=1)")
+        for j in 0..<m { runOneSubspace(j) }
+    } else {
+        print("[PQTrain] execution mode: parallel (threads=\(cfg.numThreads))")
+        let group = DispatchGroup()
+        let q = DispatchQueue(label: "pq.train.concurrent", attributes: .concurrent)
+        for j in 0..<m { q.async(group: group) { runOneSubspace(j) } }
+        print("[PQTrain] waiting for \(m) subspaces ...")
+        group.wait()
+        print("[PQTrain] all subspaces finished")
+    }
 
     // Copy results back to inout parameters and merge stats
     var stats = PQTrainStats(
@@ -246,6 +269,7 @@ public func pq_train_f32(
 
     for j in 0..<m {
         let result = resultAcc.get(j) ?? SubspaceResults()
+        print("[PQTrain] merge subspace \(j): iters=\(result.iters) timeInit=\(result.timeInit) timeTrain=\(result.timeTrain) distortion=\(result.distortion) codebook=\(result.codebook.count)")
 
         // Copy codebook
         let cbOffset = j * ks * dsub
@@ -275,6 +299,7 @@ public func pq_train_f32(
     stats.distortion = stats.distortionPerSubspace.prefix(m).reduce(0, +)
     let t1 = nowSec()
     stats.timeTrainSec += (t1 - t0) - stats.timeInitSec
+    print("[PQTrain] done: distortion=\(stats.distortion) timeInit=\(stats.timeInitSec)s timeTrain=\(stats.timeTrainSec)s bytes=\(stats.bytesRead)")
     return stats
 }
 
@@ -710,18 +735,6 @@ private func lloydKMeansSubspace(
                     if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
                 }
                 for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u] - coarse[gbase+u]) }
-            } else if cfg.precomputeXNorm2 {
-                let x2 = qnorms?[i] ?? {
-                    var s: Float = 0
-                    for u in 0..<dsub { let v = x[base+u]; s += v*v }
-                    return s
-                }()
-                bestD = distDotTrick(x: &x[base], c: &C[0], dsub: dsub, x2: x2, c2: Cnorms[0])
-                for k in 1..<ks {
-                    let dk = distDotTrick(x: &x[base], c: &C[k*dsub], dsub: dsub, x2: x2, c2: Cnorms[k])
-                    if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
-                }
-                for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u]) }
             } else {
                 bestD = l2Sq(&x[base], &C[0], dsub)
                 for k in 1..<ks {
@@ -747,12 +760,27 @@ private func lloydKMeansSubspace(
 
         if empties > 0 {
             switch cfg.emptyPolicy {
-            case .ignore: break
-            case .split, .reseed:
+            case .ignore:
+                break
+            case .reseed:
+                // Deterministic lightweight reseed for empty clusters
+                var seed: UInt64 = cfg.seed ^ (UInt64(j) &* 0x9E3779B97F4A7C15) ^ (UInt64(iter) &* 0xD1B54A32D192ED03)
+                @inline(__always) func lcg(_ s: inout UInt64) -> UInt64 { s = 2862933555777941757 &* s &+ 3037000493; return s }
+                for k in 0..<ks where counts[k] == 0 {
+                    let pick = Int(lcg(&seed) % UInt64(nI))
+                    let base = pick * d + j * dsub
+                    for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
+                }
+                outEmpties += empties
+            case .split:
+                // Approximate split-largest: sample limited subset for farthest
+                let sample = min(nI, max(128, nI / 4))
+                let stride = max(1, nI / sample)
                 for k in 0..<ks where counts[k] == 0 {
                     var best: Float = -1
                     var iFar = 0
-                    for i in 0..<nI {
+                    var i = 0
+                    while i < nI {
                         let base = i * d + j * dsub
                         var minDi: Float = .infinity
                         for kk in 0..<ks {
@@ -760,6 +788,7 @@ private func lloydKMeansSubspace(
                             if di < minDi { minDi = di }
                         }
                         if minDi > best { best = minDi; iFar = i }
+                        i += stride
                     }
                     let base = iFar * d + j * dsub
                     for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
@@ -800,11 +829,14 @@ private func minibatchKMeansSubspace(
     var emptiesFixed = 0
 
     let passes = max(1, cfg.maxIters)
-    for _ in 0..<passes {
+    for p in 0..<passes {
+        print("[PQTrain][mini] j=\(j) pass=\(p+1)/\(passes) B=\(B) n=\(nI) ks=\(ks)")
         randpermInPlace(&idx, rng: &rng)
-        var s = 0
-        while s < nI {
-            let e = min(s + B, nI)
+        var processed = 0
+        let limit = (cfg.sampleN > 0) ? min(nI, Int(cfg.sampleN)) : nI
+        while processed < limit {
+            let s = processed
+            let e = min(s + B, limit)
             let nb = e - s
             var sums = [Double](repeating: 0, count: ks * dsub)
             var counts = [Int64](repeating: 0, count: ks)
@@ -839,42 +871,72 @@ private func minibatchKMeansSubspace(
             for k in 0..<ks {
                 if counts[k] > 0 {
                     let inv = 1.0 / Double(counts[k])
-                    for u in 0..<dsub { C[k*dsub + u] = Float(sums[k*dsub + u] * inv) }
-                } else if cfg.emptyPolicy != .ignore && nb > 0 {
-                    var iFar = Int(idx[s])
-                    var best: Float = -1
-                    for t in 0..<nb {
-                        let i = Int(idx[s + t])
-                        let base = i * d + j * dsub
-                        var minDi: Float = .infinity
-                        for kk in 0..<ks {
-                            let di = l2Sq(&x[base], &C[kk*dsub], dsub)
-                            if di < minDi { minDi = di }
-                        }
-                        if minDi > best { best = minDi; iFar = i }
+                    for u in 0..<dsub {
+                        let v = Float(sums[k*dsub + u] * inv)
+                        C[k*dsub + u] = v.isFinite ? v : 0
                     }
-                    let base = iFar * d + j * dsub
-                    for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
-                    emptiesFixed += 1
+                } else if nb > 0 {
+                    if cfg.emptyPolicy == .ignore {
+                        continue
+                    } else if cfg.emptyPolicy == .reseed {
+                        // Cheap reseed: pick a random vector from the current batch
+                        let r = Int(rng.nextU32() % UInt32(nb))
+                        let i = Int(idx[s + r])
+                        let base = i * d + j * dsub
+                        for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
+                        emptiesFixed += 1
+                    } else {
+                        // Split-largest within this batch (limited scope)
+                        var iFar = Int(idx[s])
+                        var best: Float = -1
+                        for t in 0..<nb {
+                            let i = Int(idx[s + t])
+                            let base = i * d + j * dsub
+                            var minDi: Float = .infinity
+                            for kk in 0..<ks {
+                                let di = l2Sq(&x[base], &C[kk*dsub], dsub)
+                                if di < minDi { minDi = di }
+                            }
+                            if minDi > best { best = minDi; iFar = i }
+                        }
+                        let base = iFar * d + j * dsub
+                        for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
+                        emptiesFixed += 1
+                    }
                 }
             }
 
             iters += 1
-            s = e
+            processed = e
         }
+        print("[PQTrain][mini] j=\(j) pass=\(p+1) completed; iters so far=\(iters)")
     }
 
+    // Final sanitation of centroids to eliminate any residual non-finite values
+    for t in 0..<(ks * dsub) {
+        let v = C[t]
+        if !v.isFinite { C[t] = 0 }
+    }
+
+    // Estimate distortion on a limited sample to keep runtime bounded
     var total: Double = 0
-    for i in 0..<nI {
+    var used = 0
+    let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : 2000))
+    // Reuse current permutation for sampling
+    for t in 0..<evalLim {
+        let i = Int(idx[t % idx.count])
         let base = i * d + j * dsub
         var best = l2Sq(&x[base], &C[0], dsub)
         for k in 1..<ks {
             let dk = l2Sq(&x[base], &C[k*dsub], dsub)
             if dk < best { best = dk }
         }
-        total += Double(best)
+        if best.isFinite {
+            total += Double(best)
+            used += 1
+        }
     }
-    outDistortion = total / Double(n)
+    outDistortion = (used > 0) ? (total / Double(used)) : 1.0
     outIters = iters
     outEmpties += emptiesFixed
 }

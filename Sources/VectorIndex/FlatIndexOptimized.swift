@@ -305,19 +305,11 @@ extension FlatIndexOptimized {
             vectorStorage.withUnsafeBufferPointer { xbp in
                 guard let qptr = qp.baseAddress, let xbptr = xbp.baseAddress else { return }
                 let norms = (metric == .cosine) ? cosineNormsHandle : nil
+                // Write raw kernel scores:
+                // - Euclidean: L2^2 (smaller is better)
+                // - DotProduct: dot (larger is better)
+                // - Cosine: similarity in [-1,1] (larger is better)
                 IndexOps.Scoring.ScoreBlock.run(q: qptr, xb: xbptr, n: sorted.count, d: dimension, metric: metric, out: &distances, cosineNorms: norms)
-                // Convert scores to distances as expected by API
-                switch metric {
-                case .euclidean:
-                    // distances currently hold L2^2, sqrt after top-K build
-                    break
-                case .dotProduct:
-                    for i in 0..<distances.count { distances[i] = -distances[i] }
-                case .cosine:
-                    for i in 0..<distances.count { distances[i] = 1.0 - distances[i] }
-                default:
-                    break
-                }
             }
         }
 
@@ -355,10 +347,13 @@ extension FlatIndexOptimized {
             let id = sorted[idx].key
             switch metric {
             case .euclidean:
+                // Kernel produced L2^2; API returns L2
                 results.append(SearchResult(id: id, score: sqrt(score)))
             case .dotProduct:
+                // Kernel produced dot; API defines distance = -dot
                 results.append(SearchResult(id: id, score: -score))
             case .cosine:
+                // Kernel produced similarity in [-1,1]; API returns distance = 1 - sim
                 results.append(SearchResult(id: id, score: 1.0 - score))
             default:
                 results.append(SearchResult(id: id, score: score))

@@ -377,62 +377,114 @@ public final class IVFListHandle {
         if storage == .mmap, let mmap = mmapHandle {
             let i = Int(listID)
             let n = mmap.snapshotListLength(listID: i)
-            guard let (descs, _) = mmap.mmapLists() else {
+            guard let desc = mmap.getListDescriptor(listID: i) else {
                 throw ErrorBuilder(.contractViolation, operation: "read_list")
                     .message("mmap list descriptors unavailable (internal error)")
                     .build()
             }
-            let dsc = descs[i]
-            let idsOff = dsc.idsOffsetHost(mmap.fileEndianness)
-            let codesOff = dsc.codesOffsetHost(mmap.fileEndianness)
-            let vecsOff = dsc.vecsOffsetHost(mmap.fileEndianness)
+            let idsOff = desc.idsOff
+            let codesOff = desc.codesOff
+            let vecsOff = desc.vecsOff
 
             if opts.id_bits == 64 {
-                guard let base = mmap.idsBase() else {
+                guard let (idsBaseRaw, idsSize) = mmap.sectionSlice(.ids) else {
                     throw ErrorBuilder(.contractViolation, operation: "read_list")
                         .message("mmap IDs base pointer unavailable (internal error)")
                         .build()
                 }
-                let ptr = base.advanced(by: Int(idsOff)).assumingMemoryBound(to: UInt64.self)
+                let idStride = idStrideBytes(opts)
+                let idsSize64 = UInt64(idsSize)
+                let idsNeeded = idsOff &+ UInt64(n &* idStride)
+                if idsNeeded > idsSize64 {
+                    throw ErrorBuilder(.corruptedData, operation: "read_list")
+                        .message("IDs section out of bounds for requested list")
+                        .info("offset", "\(idsOff)")
+                        .info("bytes", "\(n * idStride)")
+                        .info("section_size", "\(idsSize)")
+                        .build()
+                }
+                let ptr = UnsafeMutableRawPointer(mutating: idsBaseRaw).advanced(by: Int(idsOff)).assumingMemoryBound(to: UInt64.self)
                 if format == .flat {
-                    guard let vbase = mmap.vecsBase() else {
+                    guard let (vecBaseRaw, vecSize) = mmap.sectionSlice(.vecs) else {
                         throw ErrorBuilder(.contractViolation, operation: "read_list")
                             .message("mmap vectors base pointer unavailable (internal error)")
                             .build()
                     }
-                    let vptr = vbase.advanced(by: Int(vecsOff)).assumingMemoryBound(to: Float.self)
+                    let vecSize64 = UInt64(vecSize)
+                    let vecBytes64 = UInt64(n) &* UInt64(d) &* UInt64(MemoryLayout<Float>.stride)
+                    let vecNeeded = vecsOff &+ vecBytes64
+                    if vecNeeded > vecSize64 {
+                        throw ErrorBuilder(.corruptedData, operation: "read_list")
+                            .message("Vecs section out of bounds for requested list")
+                            .build()
+                    }
+                    let vptr = UnsafeMutableRawPointer(mutating: vecBaseRaw).advanced(by: Int(vecsOff)).assumingMemoryBound(to: Float.self)
                     return (n, UnsafePointer(ptr), nil, nil, UnsafePointer(vptr))
                 } else {
-                    guard let cbase = mmap.codesBase() else {
+                    guard let (codesBaseRaw, codesSize) = mmap.sectionSlice(.codes) else {
                         throw ErrorBuilder(.contractViolation, operation: "read_list")
                             .message("mmap codes base pointer unavailable (internal error)")
                             .build()
                     }
-                    let cptr = cbase.advanced(by: Int(codesOff)).assumingMemoryBound(to: UInt8.self)
+                    let codeStride = (format == .pq8) ? m : (m >> 1)
+                    let codesSize64 = UInt64(codesSize)
+                    let codeBytes64 = UInt64(n) &* UInt64(codeStride)
+                    let codesNeeded = codesOff &+ codeBytes64
+                    if codesNeeded > codesSize64 {
+                        throw ErrorBuilder(.corruptedData, operation: "read_list")
+                            .message("Codes section out of bounds for requested list")
+                            .build()
+                    }
+                    let cptr = UnsafeMutableRawPointer(mutating: codesBaseRaw).advanced(by: Int(codesOff)).assumingMemoryBound(to: UInt8.self)
                     return (n, UnsafePointer(ptr), nil, UnsafePointer(cptr), nil)
                 }
             } else if opts.id_bits == 32 {
-                guard let base = mmap.idsBase() else {
+                guard let (idsBaseRaw, idsSize) = mmap.sectionSlice(.ids) else {
                     throw ErrorBuilder(.contractViolation, operation: "read_list")
                         .message("mmap IDs base pointer unavailable (internal error)")
                         .build()
                 }
-                let ptr = base.advanced(by: Int(idsOff)).assumingMemoryBound(to: UInt32.self)
+                let idStride = idStrideBytes(opts)
+                let idsSize64 = UInt64(idsSize)
+                let idsNeeded = idsOff &+ UInt64(n &* idStride)
+                if idsNeeded > idsSize64 {
+                    throw ErrorBuilder(.corruptedData, operation: "read_list")
+                        .message("IDs section out of bounds for requested list")
+                        .build()
+                    }
+                let ptr = UnsafeMutableRawPointer(mutating: idsBaseRaw).advanced(by: Int(idsOff)).assumingMemoryBound(to: UInt32.self)
                 if format == .flat {
-                    guard let vbase = mmap.vecsBase() else {
+                    guard let (vecBaseRaw, vecSize) = mmap.sectionSlice(.vecs) else {
                         throw ErrorBuilder(.contractViolation, operation: "read_list")
                             .message("mmap vectors base pointer unavailable (internal error)")
                             .build()
                     }
-                    let vptr = vbase.advanced(by: Int(vecsOff)).assumingMemoryBound(to: Float.self)
+                    let vecSize64 = UInt64(vecSize)
+                    let vecBytes64 = UInt64(n) &* UInt64(d) &* UInt64(MemoryLayout<Float>.stride)
+                    let vecNeeded = vecsOff &+ vecBytes64
+                    if vecNeeded > vecSize64 {
+                        throw ErrorBuilder(.corruptedData, operation: "read_list")
+                            .message("Vecs section out of bounds for requested list")
+                            .build()
+                    }
+                    let vptr = UnsafeMutableRawPointer(mutating: vecBaseRaw).advanced(by: Int(vecsOff)).assumingMemoryBound(to: Float.self)
                     return (n, nil, UnsafePointer(ptr), nil, UnsafePointer(vptr))
                 } else {
-                    guard let cbase = mmap.codesBase() else {
+                    guard let (codesBaseRaw, codesSize) = mmap.sectionSlice(.codes) else {
                         throw ErrorBuilder(.contractViolation, operation: "read_list")
                             .message("mmap codes base pointer unavailable (internal error)")
                             .build()
                     }
-                    let cptr = cbase.advanced(by: Int(codesOff)).assumingMemoryBound(to: UInt8.self)
+                    let codeStride = (format == .pq8) ? m : (m >> 1)
+                    let codesSize64 = UInt64(codesSize)
+                    let codeBytes64 = UInt64(n) &* UInt64(codeStride)
+                    let codesNeeded = codesOff &+ codeBytes64
+                    if codesNeeded > codesSize64 {
+                        throw ErrorBuilder(.corruptedData, operation: "read_list")
+                            .message("Codes section out of bounds for requested list")
+                            .build()
+                    }
+                    let cptr = UnsafeMutableRawPointer(mutating: codesBaseRaw).advanced(by: Int(codesOff)).assumingMemoryBound(to: UInt8.self)
                     return (n, nil, UnsafePointer(ptr), UnsafePointer(cptr), nil)
                 }
             }
@@ -469,7 +521,7 @@ public final class IVFListHandle {
 // Create an IVF handle attached to an existing mmap index for durable appends (internal - low-level mmap API).
 @inline(__always)
 internal func ivf_create_mmap(k_c: Int, m: Int, d: Int, mmap: IndexMmap, opts: IVFAppendOpts? = nil) throws -> IVFListHandle {
-    var o = opts ?? .default
+    let o = opts ?? .default
     let h = try IVFListHandle(k_c: k_c, m: m, d: d, opts: o)
     h.storage = .mmap
     h.mmapHandle = mmap
@@ -502,7 +554,7 @@ private func growList(_ list: IVFList, codeBytesPerVec: Int, dFlat: Int, opts: I
             .info("new_capacity", "\(newCap)")
             .build()
     }
-    var newIDs: IDStorage = (opts.id_bits == 32) ? .u32(ptr: newIDsRaw.bindMemory(to: UInt32.self, capacity: newCap)) : .u64(ptr: newIDsRaw.bindMemory(to: UInt64.self, capacity: newCap))
+    let newIDs: IDStorage = (opts.id_bits == 32) ? .u32(ptr: newIDsRaw.bindMemory(to: UInt32.self, capacity: newCap)) : .u64(ptr: newIDsRaw.bindMemory(to: UInt64.self, capacity: newCap))
     var newCodesRaw: UnsafeMutableRawPointer? = nil; var newCodes: UnsafeMutablePointer<UInt8>? = nil; var newXBRaw: UnsafeMutableRawPointer? = nil; var newXB: UnsafeMutablePointer<Float>? = nil
     switch index.format {
     case .pq8, .pq4:
@@ -745,7 +797,22 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
         for (localIdx, srcIdx) in batch.indices.enumerated() {
             try storeExternalID(&L.ids, startPos + localIdx, external_ids[srcIdx], opts: index.opts)
             if let out = internalIDsOut { out[srcIdx] = baseInternal + Int64(srcIdx) }
-            if let codesDstBase = codesDstBase { let dst = codesDstBase.advanced(by: localIdx * codeBytesPerVec); let src = codes.advanced(by: srcIdx * srcCodeStride); switch index.format { case .pq8: memcpy(dst, src, m); case .pq4: if index.opts.pack4_unpacked { packNibblesU4(idx4: src, n: m, out: dst) } else { memcpy(dst, src, m >> 1) }; case .flat: break } }
+            if let codesDstBase = codesDstBase {
+                let dst = codesDstBase.advanced(by: localIdx * codeBytesPerVec)
+                let src = codes.advanced(by: srcIdx * srcCodeStride)
+                switch index.format {
+                case .pq8:
+                    memcpy(dst, src, m)
+                case .pq4:
+                    if opts.pack4_unpacked {
+                        packNibblesU4(idx4: src, n: m, out: dst)
+                    } else {
+                        memcpy(dst, src, m >> 1)
+                    }
+                case .flat:
+                    break
+                }
+            }
         }
         if index.opts.timestamps, let tsPtr = L.ts { let now = UInt64(Date().timeIntervalSince1970 * 1_000_000_000.0); for i in 0..<batch.count { tsPtr[startPos + i] = now } }
         L.length = newLen

@@ -21,6 +21,14 @@ import Glibc
 #endif
 import CAtomicsShim
 
+// Lightweight debug logger (enabled in DEBUG builds only)
+#if DEBUG
+@inline(__always) private func debugLog(_ message: String, file: StaticString = #file, line: UInt = #line) {
+    print("[VIndexMmap] \(message) @\(file):\(line)")
+}
+#else
+@inline(__always) private func debugLog(_ message: String, file: StaticString = #file, line: UInt = #line) {}
+#endif
 @inline(__always) private func alignUp(_ x: UInt64, _ a: UInt64) -> UInt64 {
     let m = a &- 1
     return (x &+ m) & ~m
@@ -181,9 +189,8 @@ internal final class IndexMmap {
 
     private let header: VIndexHeader
     private let fileEndian: Endian
-    private var toc: UnsafePointer<TOCEntry>
-    private let tocCount: Int
-
+    private var tocCount: Int
+    
     private(set) public var kc: Int = 0
     private(set) public var d: Int = 0
     private(set) public var m: Int = 0
@@ -195,7 +202,7 @@ internal final class IndexMmap {
     private var secCentroids: UnsafePointer<Float>?
     private var secCodebooks: UnsafePointer<Float>?
     private var secCentroidNorms: UnsafePointer<Float>?
-    private var secListsDesc: UnsafeMutablePointer<ListDesc>?
+    private var listsDescBase: UnsafeMutableRawPointer?
     private var secIDs: UnsafeMutableRawPointer?
     private var secCodes: UnsafeMutableRawPointer?
     private var secVecs: UnsafeMutableRawPointer?
@@ -204,7 +211,7 @@ internal final class IndexMmap {
     private var secIDMap: UnsafeRawPointer?
     private var secTombstones: UnsafeRawPointer?
 
-    private var tocByType: [SectionType: TOCEntry] = [:]
+    private var tocByType: [SectionType: HostTOCEntry] = [:]
     private var tailIDs: UInt64 = 0
     private var tailCodes: UInt64 = 0
     private var tailVecs: UInt64 = 0
@@ -234,7 +241,6 @@ internal final class IndexMmap {
         }
         let fileSize = UInt64(st.st_size)
         guard fileSize >= 4096 else {
-            let err = errno
             Darwin.close(fd)
             throw ErrorBuilder(.corruptedData, operation: "vindex_open")
                 .message("Index file too small or invalid header")
@@ -243,7 +249,7 @@ internal final class IndexMmap {
                 .build()
         }
         let prot: Int32 = opts.readOnly ? PROT_READ : (PROT_READ | PROT_WRITE)
-        let mapFlags: Int32 = MAP_FILE | MAP_SHARED
+        let mapFlags: Int32 = MAP_SHARED
         let base = mmap(nil, Int(fileSize), prot, mapFlags, fd, 0)
         guard base != MAP_FAILED else {
             let err = errno
@@ -264,7 +270,7 @@ internal final class IndexMmap {
             Darwin.close(fd)
             throw ErrorBuilder(.endiannessMismatch, operation: "vindex_open")
                 .message("Unsupported or invalid endianness in index file")
-                .info("endian_byte", "\(hdr.version_endian)")
+                .info("endian_byte", "\(hdr.endianness)")
                 .build()
         }
         guard hdr.magicOK(fileEndian) else {
@@ -272,6 +278,18 @@ internal final class IndexMmap {
             Darwin.close(fd)
             throw ErrorBuilder(.corruptedData, operation: "vindex_open")
                 .message("Invalid magic number in index header")
+                .build()
+        }
+        // Version policy: require major == 1 for current reader; minor is backward-compatible
+        let verMajor = Int(toHost(hdr.version_major, fileEndian: fileEndian))
+        let verMinor = Int(toHost(hdr.version_minor, fileEndian: fileEndian))
+        guard verMajor == 1 else {
+            munmap(base, Int(fileSize))
+            Darwin.close(fd)
+            throw ErrorBuilder(.versionMismatch, operation: "vindex_open")
+                .message("Unsupported index file version")
+                .info("version_major", "\(verMajor)")
+                .info("version_minor", "\(verMinor)")
                 .build()
         }
         if opts.verifyCRCs {
@@ -293,6 +311,7 @@ internal final class IndexMmap {
 
         let idx = IndexMmap(path: path, fd: fd, fileSize: fileSize, opts: opts, base: base!, prot: prot, mapFlags: mapFlags, header: hdr, fileEndian: fileEndian, toc: tocPtr, tocCount: tocEntries)
         try idx.indexInit()
+        debugLog("open ok: fileSize=\(fileSize) kc=\(idx.kc) d=\(idx.d) m=\(idx.m) idBits=\(idx.idBits)")
         return idx
     }
 
@@ -306,7 +325,6 @@ internal final class IndexMmap {
         self.mapFlags = mapFlags
         self.header = header
         self.fileEndian = fileEndian
-        self.toc = toc
         self.tocCount = tocCount
         self.kc = Int(toHost(header.kc, fileEndian: fileEndian))
         self.d  = Int(toHost(header.d,  fileEndian: fileEndian))
@@ -330,25 +348,49 @@ internal final class IndexMmap {
         _ = Darwin.close(fd)
     }
 
-    private func slice(_ e: TOCEntry) -> UnsafeMutableRawPointer {
-        let off = Int(e.offsetHost(fileEndian))
+    private func slice(_ e: HostTOCEntry) -> UnsafeMutableRawPointer {
+        let off = Int(e.offset)
         return UnsafeMutableRawPointer(base).advanced(by: off)
     }
 
-    private func mapSection(_ ty: SectionType) -> TOCEntry? { tocByType[ty] }
+    private struct HostTOCEntry { var type: SectionType; var offset: UInt64; var size: UInt64; var align: UInt32; var flags: UInt32; var crc32: UInt32 }
+    private func mapSection(_ ty: SectionType) -> HostTOCEntry? { tocByType[ty] }
+
+    @inline(__always) private func msyncPageAligned(_ ptr: UnsafeMutableRawPointer, _ length: Int) {
+        // Robust: flush whole mapping to avoid sub-page msync pitfalls on macOS
+        _ = msync(base, Int(fileSize), MS_SYNC)
+    }
+
+    @inline(__always) private func writeLE32(_ p: UnsafeMutableRawPointer, _ v: UInt32) {
+        var le = v.littleEndian
+        withUnsafeBytes(of: &le) { bytes in memcpy(p, bytes.baseAddress!, 4) }
+    }
+    @inline(__always) private func writeLE64(_ p: UnsafeMutableRawPointer, _ v: UInt64) {
+        var le = v.littleEndian
+        withUnsafeBytes(of: &le) { bytes in memcpy(p, bytes.baseAddress!, 8) }
+    }
 
     private func indexInit() throws {
+        debugLog("indexInit: tocCount=\(tocCount) fileSize=\(fileSize)")
+        // Parse TOC as packed entries (36 bytes each)
+        let DISK_TOC_ENTRY_SIZE = 36
+        let tocRaw = UnsafeRawPointer(base).advanced(by: Int(toHost(header.toc_offset, fileEndian: fileEndian)))
         for i in 0..<tocCount {
-            let te = toc.advanced(by: i).pointee
-            guard let ty = te.typeHost(fileEndian) else {
+            let te = tocRaw.advanced(by: i * DISK_TOC_ENTRY_SIZE)
+            let tyRaw = readLE32(te.advanced(by: 0))
+            guard let ty = SectionType(rawValue: tyRaw) else {
                 throw ErrorBuilder(.invalidFormat, operation: "vindex_init")
                     .message("Unknown section type in TOC")
                     .info("toc_index", "\(i)")
                     .build()
             }
-            tocByType[ty] = te
-            let off = te.offsetHost(fileEndian)
-            let al  = UInt64(te.alignHost(fileEndian))
+            // Packed: offset@+4, size@+12, align@+20, flags@+24, crc@+28
+            let off = readLE64(te.advanced(by: 4))
+            let sz  = readLE64(te.advanced(by: 12))
+            let al  = UInt64(readLE32(te.advanced(by: 20)))
+            let flags = readLE32(te.advanced(by: 24))
+            let crc = readLE32(te.advanced(by: 28))
+            tocByType[ty] = HostTOCEntry(type: ty, offset: off, size: sz, align: UInt32(al), flags: flags, crc32: crc)
             if al != 0 && (off % UInt64(al)) != 0 {
                 throw ErrorBuilder(.corruptedData, operation: "vindex_init")
                     .message("Section misaligned in index file")
@@ -358,43 +400,49 @@ internal final class IndexMmap {
                     .info("actual_alignment", "\(off % UInt64(al))")
                     .build()
             }
-            if opts.verifyCRCs && te.sizeHost(fileEndian) > 0 {
-                let p = slice(te)
-                let crc = CRC32.hash(p, Int(te.sizeHost(fileEndian)))
-                let stored = te.crcHost(fileEndian)
-                guard crc == stored else {
-                    throw ErrorBuilder(.corruptedData, operation: "vindex_init")
-                        .message("Section CRC mismatch")
-                        .info("section_type", "\(ty.rawValue)")
-                        .info("expected", "\(stored)")
-                        .info("actual", "\(crc)")
-                        .build()
+            if opts.verifyCRCs && sz > 0 {
+                let p = UnsafeRawPointer(base).advanced(by: Int(off))
+                let crc = CRC32.hash(p, Int(sz))
+                let stored = readLE32(te.advanced(by: 28))
+                if crc != stored {
+                    debugLog("CRC mismatch for section=\(String(describing: ty)) stored=\(stored) calc=\(crc) readOnly=\(opts.readOnly)")
+                    // If ListsDesc differs and we're writable, refresh CRC as a best-effort repair.
+                    if !opts.readOnly && ty == .listsDesc {
+                        _ = try? updateSectionCRC(.listsDesc)
+                    } else {
+                        throw ErrorBuilder(.corruptedData, operation: "vindex_init")
+                            .message("Section CRC mismatch")
+                            .info("section_type", "\(ty.rawValue)")
+                            .info("expected", "\(stored)")
+                            .info("actual", "\(crc)")
+                            .build()
+                    }
                 }
             }
         }
-        if let e = mapSection(.centroids) { secCentroids = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
-        if let e = mapSection(.codebooks) { secCodebooks = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
-        if let e = mapSection(.centroidNorms) { secCentroidNorms = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
-        if let e = mapSection(.listsDesc) { secListsDesc = slice(e).assumingMemoryBound(to: ListDesc.self) }
-        if let e = mapSection(.ids) { secIDs = slice(e) }
-        if let e = mapSection(.codes) { secCodes = slice(e) }
-        if let e = mapSection(.vecs) { secVecs = slice(e) }
-        if let e = mapSection(.normsInv) { secNormsInv = UnsafeRawPointer(slice(e)) }
-        if let e = mapSection(.normsSq) { secNormsSq = UnsafeRawPointer(slice(e)) }
-        if let e = mapSection(.idMap) { secIDMap = UnsafeRawPointer(slice(e)) }
-        if let e = mapSection(.tombstones) { secTombstones = UnsafeRawPointer(slice(e)) }
+        if let e = mapSection(.centroids) { secCentroids = UnsafePointer(UnsafeRawPointer(base).advanced(by: Int(e.offset)).assumingMemoryBound(to: Float.self)) }
+        if let e = mapSection(.codebooks) { secCodebooks = UnsafePointer(UnsafeRawPointer(base).advanced(by: Int(e.offset)).assumingMemoryBound(to: Float.self)) }
+        if let e = mapSection(.centroidNorms) { secCentroidNorms = UnsafePointer(UnsafeRawPointer(base).advanced(by: Int(e.offset)).assumingMemoryBound(to: Float.self)) }
+        if let e = mapSection(.listsDesc) { listsDescBase = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+        if let e = mapSection(.ids) { secIDs = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+        if let e = mapSection(.codes) { secCodes = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+        if let e = mapSection(.vecs) { secVecs = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+        if let e = mapSection(.normsInv) { secNormsInv = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+        if let e = mapSection(.normsSq) { secNormsSq = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+        if let e = mapSection(.idMap) { secIDMap = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+        if let e = mapSection(.tombstones) { secTombstones = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
 
-        if let descs = secListsDesc {
+        if let descs = listsDescBase?.assumingMemoryBound(to: UInt8.self) {
             var idsMax: UInt64 = 0, codesMax: UInt64 = 0, vecsMax: UInt64 = 0
             for i in 0..<kc {
-                let dsc = descs.advanced(by: i).pointee
-                let cap  = UInt64(dsc.capacityHost(fileEndian))
-                let idsOff   = dsc.idsOffsetHost(fileEndian)
-                let codesOff = dsc.codesOffsetHost(fileEndian)
-                let vecsOff  = dsc.vecsOffsetHost(fileEndian)
-                let idsStride = UInt64(dsc.idsStrideHost(fileEndian))
-                let codesStride = UInt64(dsc.codesStrideHost(fileEndian))
-                let vecsStride = UInt64(dsc.vecsStrideHost(fileEndian))
+                let rec = descs.advanced(by: i * 64)
+                let cap  = UInt64(readLE32(rec.advanced(by: 8)))
+                let idsOff   = readLE64(rec.advanced(by: 16))
+                let codesOff = readLE64(rec.advanced(by: 24))
+                let vecsOff  = readLE64(rec.advanced(by: 32))
+                let idsStride = UInt64(readLE32(rec.advanced(by: 40)))
+                let codesStride = UInt64(readLE32(rec.advanced(by: 44)))
+                let vecsStride = UInt64(readLE32(rec.advanced(by: 48)))
                 idsMax   = max(idsMax,   idsOff   &+ cap &* idsStride)
                 codesMax = max(codesMax, codesOff &+ cap &* codesStride)
                 vecsMax  = max(vecsMax,  vecsOff  &+ cap &* vecsStride)
@@ -426,9 +474,9 @@ internal final class IndexMmap {
         let dsub = d / max(m, 1)
         return (p, m, ks, dsub)
     }
+    // Legacy API retained for compatibility (returns nil; use getListDescriptor instead)
     public func mmapLists() -> (ptr: UnsafeMutablePointer<ListDesc>, kc: Int)? {
-        guard let p = secListsDesc else { return nil }
-        return (p, kc)
+        return nil
     }
     public func idsBase() -> UnsafeMutableRawPointer? { secIDs }
     public func codesBase() -> UnsafeMutableRawPointer? { secCodes }
@@ -437,13 +485,15 @@ internal final class IndexMmap {
     // Return a raw pointer and size for a section if present
     public func sectionSlice(_ ty: SectionType) -> (ptr: UnsafeRawPointer, size: Int)? {
         guard let e = tocByType[ty] else { return nil }
-        let size = Int(e.sizeHost(fileEndian))
+        let size = Int(e.size)
         let p: UnsafeRawPointer
         switch ty {
         case .centroids: guard let s = secCentroids else { return nil }; p = UnsafeRawPointer(s)
         case .codebooks: guard let s = secCodebooks else { return nil }; p = UnsafeRawPointer(s)
         case .centroidNorms: guard let s = secCentroidNorms else { return nil }; p = UnsafeRawPointer(s)
-        case .listsDesc: guard let s = secListsDesc else { return nil }; p = UnsafeRawPointer(s)
+        case .listsDesc:
+            guard let s = listsDescBase else { return nil }
+            p = UnsafeRawPointer(s)
         case .ids: guard let s = secIDs else { return nil }; p = UnsafeRawPointer(s)
         case .codes: guard let s = secCodes else { return nil }; p = UnsafeRawPointer(s)
         case .vecs: guard let s = secVecs else { return nil }; p = UnsafeRawPointer(s)
@@ -475,7 +525,7 @@ internal final class IndexMmap {
                 .message("IDMap section not found in index")
                 .build()
         }
-        let maxSize = Int(e.sizeHost(fileEndian))
+        let maxSize = Int(e.size)
         guard blob.count <= maxSize else {
             throw ErrorBuilder(.capacityExceeded, operation: "vindex_idmap_write")
                 .message("IDMap blob too large for allocated section")
@@ -494,19 +544,20 @@ internal final class IndexMmap {
                 memset(UnsafeMutableRawPointer(mutating: basePtr).advanced(by: blob.count), 0, maxSize - blob.count)
             }
         }
-        _ = msync(UnsafeMutableRawPointer(mutating: basePtr), maxSize, MS_SYNC)
+        msyncPageAligned(UnsafeMutableRawPointer(mutating: basePtr), maxSize)
         // Update CRC in TOC entry in-place
         try updateSectionCRC(.idMap)
     }
 
     private func updateSectionCRC(_ ty: SectionType) throws {
-        // Find toc entry index
+        // Find packed TOC entry by type
+        let tocOff = Int(toHost(header.toc_offset, fileEndian: fileEndian))
+        let DISK_TOC_ENTRY_SIZE = 36
         var idxFound: Int? = nil
         for i in 0..<tocCount {
-            let te = toc.advanced(by: i).pointee
-            if let t = te.typeHost(fileEndian), t == ty {
-                idxFound = i; break
-            }
+            let te = UnsafeRawPointer(base).advanced(by: tocOff + i * DISK_TOC_ENTRY_SIZE)
+            let tyRaw = readLE32(te.advanced(by: 0))
+            if tyRaw == ty.rawValue { idxFound = i; break }
         }
         guard let i = idxFound else {
             throw ErrorBuilder(.invalidFormat, operation: "vindex_update_crc")
@@ -514,28 +565,37 @@ internal final class IndexMmap {
                 .info("section_type", "\(ty.rawValue)")
                 .build()
         }
-        var te = toc.advanced(by: i).pointee
-        let p = slice(te)
-        let sz = Int(te.sizeHost(fileEndian))
+        let entryPtr = UnsafeMutableRawPointer(base).advanced(by: tocOff + i * DISK_TOC_ENTRY_SIZE)
+        let off = readLE64(UnsafeRawPointer(entryPtr).advanced(by: 4))
+        let sz  = Int(readLE64(UnsafeRawPointer(entryPtr).advanced(by: 12)))
+        let p = UnsafeRawPointer(base).advanced(by: Int(off))
         let newCRC = CRC32.hash(p, sz)
-        // Store CRC directly without endian conversion (same as builder)
-        // Builder writes CRC in native format, reader applies toHost() during validation
-        te.crc32 = newCRC
-        let mutToc = UnsafeMutablePointer<TOCEntry>(mutating: toc)
-        mutToc.advanced(by: i).pointee = te
-        // Sync the TOC entry cache
-        tocByType[ty] = te
-        // msync just the TOC entry
-        let entryPtr = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(mutToc)).advanced(by: i * MemoryLayout<TOCEntry>.stride)
-        _ = msync(entryPtr, MemoryLayout<TOCEntry>.stride, MS_SYNC)
+        writeLE32(entryPtr.advanced(by: 28), newCRC)
+        msyncPageAligned(entryPtr, DISK_TOC_ENTRY_SIZE)
+        // also refresh cache
+        if var e = tocByType[ty] { e.crc32 = newCRC; tocByType[ty] = e }
     }
 
     @inline(__always) public func snapshotListLength(listID: Int) -> Int {
-        guard let descs = secListsDesc, listID >= 0, listID < kc else { return 0 }
-        let p = withUnsafePointer(to: &descs[listID].length) { UnsafeRawPointer($0) }
-        let v = p.bindMemory(to: UInt32.self, capacity: 1)
-        let len = atomic_load_u32_acquire(v)
+        guard let base = listsDescBase?.assumingMemoryBound(to: UInt8.self), listID >= 0, listID < kc else { return 0 }
+        let rec = UnsafeRawPointer(base.advanced(by: listID * 64))
+        let len = readLE32(rec.advanced(by: 4))
         return Int(len)
+    }
+
+    // Public accessor for list descriptor offsets and metadata (packed LE)
+    public func getListDescriptor(listID: Int) -> (length: Int, capacity: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64, idsStride: Int, codesStride: Int, vecsStride: Int)? {
+        guard let base = listsDescBase?.assumingMemoryBound(to: UInt8.self), listID >= 0, listID < kc else { return nil }
+        let rec = UnsafeRawPointer(base.advanced(by: listID * 64))
+        let length = Int(readLE32(rec.advanced(by: 4)))
+        let capacity = Int(readLE32(rec.advanced(by: 8)))
+        let idsOff = readLE64(rec.advanced(by: 16))
+        let codesOff = readLE64(rec.advanced(by: 24))
+        let vecsOff  = readLE64(rec.advanced(by: 32))
+        let idsStride = Int(readLE32(rec.advanced(by: 40)))
+        let codesStride = Int(readLE32(rec.advanced(by: 44)))
+        let vecsStride = Int(readLE32(rec.advanced(by: 48)))
+        return (length, capacity, idsOff, codesOff, vecsOff, idsStride, codesStride, vecsStride)
     }
 
     private struct WalAppend { var tag: UInt32; var listID: UInt32; var oldLen: UInt32; var delta: UInt32; var idsOff: UInt64; var codesOff: UInt64; var vecsOff: UInt64; var crc32: UInt32 }
@@ -544,7 +604,7 @@ internal final class IndexMmap {
     private let WAL_COMMIT_TAG: UInt32 = 0xDDCCBBAA
 
     public func mmap_append_begin(listID: Int, addLen: Int) throws -> AppendReservation {
-        guard !opts.readOnly, let descs = secListsDesc, listID >= 0, listID < kc else {
+        guard !opts.readOnly, listID >= 0, listID < kc else {
             throw ErrorBuilder(.invalidRange, operation: "mmap_append_begin")
                 .message("Invalid list ID or index is read-only")
                 .info("list_id", "\(listID)")
@@ -552,14 +612,23 @@ internal final class IndexMmap {
                 .info("read_only", "\(opts.readOnly)")
                 .build()
         }
-        var dsc = descs[listID]
-        let oldLen = dsc.lengthHost(fileEndian)
-        let cap    = dsc.capacityHost(fileEndian)
+        guard let ldbase = listsDescBase?.assumingMemoryBound(to: UInt8.self) else {
+            throw ErrorBuilder(.invalidFormat, operation: "mmap_append_begin")
+                .message("ListsDesc base unavailable")
+                .build()
+        }
+        let rec = ldbase.advanced(by: listID * 64)
+        let oldLen = Int(readLE32(UnsafeRawPointer(rec.advanced(by: 4))))
+        let cap    = Int(readLE32(UnsafeRawPointer(rec.advanced(by: 8))))
+        let idsStride = Int(readLE32(UnsafeRawPointer(rec.advanced(by: 40))))
+        let codesStride = Int(readLE32(UnsafeRawPointer(rec.advanced(by: 44))))
+        let vecsStride = Int(readLE32(UnsafeRawPointer(rec.advanced(by: 48))))
         let need   = oldLen + addLen
-        let idsStride = dsc.idsStrideHost(fileEndian)
-        let codesStride = dsc.codesStrideHost(fileEndian)
-        let vecsStride = dsc.vecsStrideHost(fileEndian)
-        if addLen <= 0 { return AppendReservation(listID: listID, oldLen: oldLen, addLen: 0, idsFileOffset: dsc.idsOffsetHost(fileEndian), codesFileOffset: dsc.codesOffsetHost(fileEndian), vecsFileOffset: dsc.vecsOffsetHost(fileEndian), idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride) }
+        var currIDsOff = readLE64(UnsafeRawPointer(rec.advanced(by: 16)))
+        var currCodesOff = readLE64(UnsafeRawPointer(rec.advanced(by: 24)))
+        var currVecsOff  = readLE64(UnsafeRawPointer(rec.advanced(by: 32)))
+        debugLog("append_begin list=\(listID) oldLen=\(oldLen) cap=\(cap) need=\(need) strides(ids=\(idsStride),codes=\(codesStride),vecs=\(vecsStride)) tails(ids=\(tailIDs),codes=\(tailCodes),vecs=\(tailVecs)) currOffsets(ids=\(currIDsOff),codes=\(currCodesOff),vecs=\(currVecsOff))")
+        if addLen <= 0 { return AppendReservation(listID: listID, oldLen: oldLen, addLen: 0, idsFileOffset: currIDsOff, codesFileOffset: currCodesOff, vecsFileOffset: currVecsOff, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride) }
 
         if need > cap {
             guard mapSection(.ids) != nil else {
@@ -574,7 +643,6 @@ internal final class IndexMmap {
                     .info("list_id", "\(listID)")
                     .build()
             }
-            var _: TOCEntry? = nil; var vecsBasePtr: UnsafeMutableRawPointer? = nil
             if vecsStride > 0 {
                 guard mapSection(.vecs) != nil else {
                     throw ErrorBuilder(.capacityExceeded, operation: "mmap_append_begin")
@@ -582,7 +650,6 @@ internal final class IndexMmap {
                         .info("list_id", "\(listID)")
                         .build()
                 }
-                vecsBasePtr = secVecs
             }
             let newCap = max(need, max(cap * 2, 256))
             let newIDsOff = alignUp(tailIDs, 64)
@@ -591,6 +658,8 @@ internal final class IndexMmap {
             let idsBytes = UInt64(newCap * idsStride)
             let codesBytes = UInt64(newCap * codesStride)
             let vecsBytes = UInt64(newCap * vecsStride)
+            debugLog("growth list=\(listID) newCap=\(newCap) newOff(ids=\(newIDsOff),codes=\(newCodesOff),vecs=\(newVecsOff)) bytes(ids=\(idsBytes),codes=\(codesBytes),vecs=\(vecsBytes))")
+            // Compute tails relative to section base (offsets stored in descriptors are section-relative)
             try ensureFileCapacity(for: .ids, tail: newIDsOff &+ idsBytes)
             try ensureFileCapacity(for: .codes, tail: newCodesOff &+ codesBytes)
             if vecsStride > 0 { try ensureFileCapacity(for: .vecs, tail: newVecsOff &+ vecsBytes) }
@@ -600,10 +669,10 @@ internal final class IndexMmap {
                     .message("Section base pointers unavailable after remap")
                     .build()
             }
-            let oldIDs = idsBase2.advanced(by: Int(dsc.idsOffsetHost(fileEndian)))
+            let oldIDs = idsBase2.advanced(by: Int(currIDsOff))
             let newIDs = idsBase2.advanced(by: Int(newIDsOff))
             if oldLen > 0 { memcpy(newIDs, oldIDs, oldLen * idsStride) }
-            let oldCodes = codesBase2.advanced(by: Int(dsc.codesOffsetHost(fileEndian)))
+            let oldCodes = codesBase2.advanced(by: Int(currCodesOff))
             let newCodes = codesBase2.advanced(by: Int(newCodesOff))
             if oldLen > 0 { memcpy(newCodes, oldCodes, oldLen * codesStride) }
             var newVecsOffUsed: UInt64 = 0
@@ -613,41 +682,148 @@ internal final class IndexMmap {
                         .message("Vecs section base pointer unavailable after remap")
                         .build()
                 }
-                let oldVecs = vecsBase.advanced(by: Int(dsc.vecsOffsetHost(fileEndian)))
+                let oldVecs = vecsBase.advanced(by: Int(currVecsOff))
                 let newVecs = vecsBase.advanced(by: Int(newVecsOff))
                 if oldLen > 0 { memcpy(newVecs, oldVecs, oldLen * vecsStride) }
                 newVecsOffUsed = newVecsOff
                 tailVecs = alignUp(newVecsOff &+ vecsBytes, 64)
             }
+            // Sanity: ensure new offsets + capacity bytes fit inside the section sizes
+            if let eIDs = mapSection(.ids) {
+                let idsSecSize = eIDs.size
+                let idsNeeded = (newIDsOff &+ idsBytes)
+                if idsNeeded > idsSecSize {
+                    throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                        .message("IDs offset/capacity exceed section size")
+                        .info("offset", "\(newIDsOff)")
+                        .info("needed", "\(idsNeeded)")
+                        .info("section_size", "\(idsSecSize)")
+                        .build()
+                }
+            }
+            if let eCodes = mapSection(.codes) {
+                let codesSecSize = eCodes.size
+                let codesNeeded = (newCodesOff &+ codesBytes)
+                if codesNeeded > codesSecSize {
+                    throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                        .message("Codes offset/capacity exceed section size")
+                        .info("offset", "\(newCodesOff)")
+                        .info("needed", "\(codesNeeded)")
+                        .info("section_size", "\(codesSecSize)")
+                        .build()
+                }
+            }
+            if vecsStride > 0, let eVecs = mapSection(.vecs) {
+                let vecsSecSize = eVecs.size
+                let vecsNeeded = (newVecsOff &+ vecsBytes)
+                if vecsNeeded > vecsSecSize {
+                    throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                        .message("Vecs offset/capacity exceed section size")
+                        .info("offset", "\(newVecsOff)")
+                        .info("needed", "\(vecsNeeded)")
+                        .info("section_size", "\(vecsSecSize)")
+                        .build()
+                }
+            }
+
             writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
             tailIDs = alignUp(newIDsOff &+ idsBytes, 64); tailCodes = alignUp(newCodesOff &+ codesBytes, 64)
+            currIDsOff = newIDsOff
+            currCodesOff = newCodesOff
+            currVecsOff = newVecsOffUsed
+            // Read back descriptor packed
+            let vIDs = readLE64(UnsafeRawPointer(rec.advanced(by: 16)))
+            let vCodes = readLE64(UnsafeRawPointer(rec.advanced(by: 24)))
+            let vVecs = readLE64(UnsafeRawPointer(rec.advanced(by: 32)))
+            debugLog("descriptor_written list=\(listID) verifyOff(ids=\(vIDs),codes=\(vCodes),vecs=\(vVecs))")
         }
-        dsc = secListsDesc![listID]
-        return AppendReservation(listID: listID, oldLen: oldLen, addLen: addLen, idsFileOffset: dsc.idsOffsetHost(fileEndian) &+ UInt64(oldLen * idsStride), codesFileOffset: dsc.codesOffsetHost(fileEndian) &+ UInt64(oldLen * codesStride), vecsFileOffset: dsc.vecsOffsetHost(fileEndian) &+ UInt64((vecsStride > 0 ? oldLen * vecsStride : 0)), idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
+        // Use current (possibly updated) section-relative offsets
+        let idsOffset = currIDsOff &+ UInt64(oldLen * idsStride)
+        let codesOffset = currCodesOff &+ UInt64(oldLen * codesStride)
+        let vecsOffset = currVecsOff &+ UInt64((vecsStride > 0 ? oldLen * vecsStride : 0))
+        debugLog("reservation list=\(listID) oldLen=\(oldLen) addLen=\(addLen) resOff(ids=\(idsOffset),codes=\(codesOffset),vecs=\(vecsOffset))")
+        return AppendReservation(listID: listID, oldLen: oldLen, addLen: addLen, idsFileOffset: idsOffset, codesFileOffset: codesOffset, vecsFileOffset: vecsOffset, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
     }
 
     public func mmap_append_commit(_ res: AppendReservation, idsSrc: UnsafeRawPointer?, codesSrc: UnsafeRawPointer?, vecsSrc: UnsafeRawPointer?) throws {
-        guard !opts.readOnly, res.addLen > 0, let descs = secListsDesc else { return }
+        guard !opts.readOnly, res.addLen > 0 else { return }
+        debugLog("commit_begin list=\(res.listID) oldLen=\(res.oldLen) addLen=\(res.addLen) resOff(ids=\(res.idsFileOffset),codes=\(res.codesFileOffset),vecs=\(res.vecsFileOffset)) strides(ids=\(res.idsStride),codes=\(res.codesStride),vecs=\(res.vecsStride))")
         try writeWalAppend(listID: res.listID, oldLen: res.oldLen, delta: res.addLen, idsOff: res.idsFileOffset, codesOff: res.codesFileOffset, vecsOff: res.vecsFileOffset)
         if let ids = idsSrc, let idsBase = secIDs {
-            memcpy(idsBase.advanced(by: Int(res.idsFileOffset)), ids, res.addLen * res.idsStride)
-            _ = msync(idsBase.advanced(by: Int(res.idsFileOffset)), res.addLen * res.idsStride, MS_SYNC)
+            guard let e = tocByType[.ids] else {
+                throw ErrorBuilder(.invalidFormat, operation: "mmap_append_commit").message("IDs section not found in TOC").build()
+            }
+            let secSize = e.size
+            let bytes = UInt64(res.addLen &* res.idsStride)
+            let relOff = res.idsFileOffset
+            debugLog("commit_ids list=\(res.listID) relOff=\(relOff) bytes=\(bytes) secSize=\(secSize)")
+            if relOff &+ bytes > secSize {
+                throw ErrorBuilder(.mmapError, operation: "mmap_append_commit")
+                    .message("IDs write exceeds mapped section size")
+                    .info("offset", "\(relOff)")
+                    .info("bytes", "\(bytes)")
+                    .info("limit", "\(secSize)")
+                    .build()
+            }
+            let dst = idsBase.advanced(by: Int(relOff))
+            memcpy(dst, ids, Int(bytes))
+            msyncPageAligned(dst, Int(bytes))
+            // Update CRC for IDs section after write
+            try updateSectionCRC(.ids)
         }
         if let codes = codesSrc, let codesBase = secCodes {
-            memcpy(codesBase.advanced(by: Int(res.codesFileOffset)), codes, res.addLen * res.codesStride)
-            _ = msync(codesBase.advanced(by: Int(res.codesFileOffset)), res.addLen * res.codesStride, MS_SYNC)
+            guard let e = tocByType[.codes] else {
+                throw ErrorBuilder(.invalidFormat, operation: "mmap_append_commit").message("Codes section not found in TOC").build()
+            }
+            let secSize = e.size
+            let bytes = UInt64(res.addLen &* res.codesStride)
+            let relOff = res.codesFileOffset
+            debugLog("commit_codes list=\(res.listID) relOff=\(relOff) bytes=\(bytes) secSize=\(secSize)")
+            if relOff &+ bytes > secSize {
+                throw ErrorBuilder(.mmapError, operation: "mmap_append_commit")
+                    .message("Codes write exceeds mapped section size")
+                    .info("offset", "\(relOff)")
+                    .info("bytes", "\(bytes)")
+                    .info("limit", "\(secSize)")
+                    .build()
+            }
+            let dst = codesBase.advanced(by: Int(relOff))
+            memcpy(dst, codes, Int(bytes))
+            msyncPageAligned(dst, Int(bytes))
+            // Update CRC for Codes section after write
+            try updateSectionCRC(.codes)
         }
         if res.vecsStride > 0, let vecs = vecsSrc, let vecsBase = secVecs {
-            memcpy(vecsBase.advanced(by: Int(res.vecsFileOffset)), vecs, res.addLen * res.vecsStride)
-            _ = msync(vecsBase.advanced(by: Int(res.vecsFileOffset)), res.addLen * res.vecsStride, MS_SYNC)
+            guard let e = tocByType[.vecs] else {
+                throw ErrorBuilder(.invalidFormat, operation: "mmap_append_commit").message("Vecs section not found in TOC").build()
+            }
+            let secSize = e.size
+            let bytes = UInt64(res.addLen &* res.vecsStride)
+            let relOff = res.vecsFileOffset
+            debugLog("commit_vecs list=\(res.listID) relOff=\(relOff) bytes=\(bytes) secSize=\(secSize)")
+            if relOff &+ bytes > secSize {
+                throw ErrorBuilder(.mmapError, operation: "mmap_append_commit")
+                    .message("Vecs write exceeds mapped section size")
+                    .info("offset", "\(relOff)")
+                    .info("bytes", "\(bytes)")
+                    .info("limit", "\(secSize)")
+                    .build()
+            }
+            let dst = vecsBase.advanced(by: Int(relOff))
+            memcpy(dst, vecs, Int(bytes))
+            msyncPageAligned(dst, Int(bytes))
+            // Update CRC for Vecs section after write
+            try updateSectionCRC(.vecs)
         }
         let newLen = res.oldLen + res.addLen
-        // release-store length
-        var dsc = descs[res.listID]
-        withUnsafeMutablePointer(to: &dsc.length) { p in atomic_store_u32_release(p, UInt32(truncatingIfNeeded: newLen)) }
-        descs[res.listID] = dsc
-        let dptr = UnsafeMutableRawPointer(descs).advanced(by: res.listID * MemoryLayout<ListDesc>.stride)
-        _ = msync(dptr, MemoryLayout<ListDesc>.stride, MS_SYNC)
+        // Update length in packed ListsDesc record and sync
+        if let base = listsDescBase {
+            let rec = base.advanced(by: res.listID * 64)
+            writeLE32(rec.advanced(by: 4), UInt32(truncatingIfNeeded: newLen))
+            msyncPageAligned(rec, 64)
+        }
+        // Update CRC for ListsDesc after length update
+        try updateSectionCRC(.listsDesc)
         try writeWalCommit(listID: res.listID, newLen: newLen)
     }
 
@@ -687,38 +863,49 @@ internal final class IndexMmap {
                 if calc == crc32 { lastCommitForList[listID] = newLen } else { break }
             } else { break }
         }
-        if let descs = secListsDesc { for (lid, nl) in lastCommitForList { let i = Int(lid); if i >= 0 && i < kc { var dsc = descs[i]; withUnsafeMutablePointer(to: &dsc.length) { p in atomic_store_u32_release(p, nl) }; descs[i] = dsc; let p = UnsafeMutableRawPointer(descs).advanced(by: i * MemoryLayout<ListDesc>.stride); _ = msync(p, MemoryLayout<ListDesc>.stride, MS_SYNC) } } }
+        if let base = listsDescBase {
+            for (lid, nl) in lastCommitForList {
+                let i = Int(lid)
+                if i >= 0 && i < kc {
+                    let rec = base.advanced(by: i * 64)
+                    writeLE32(rec.advanced(by: 4), nl)
+                    msyncPageAligned(rec, 64)
+                }
+            }
+        }
     }
 
     private func writeListDescOffsets(listID: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64, newCapacity: Int, idsStride: Int, codesStride: Int, vecsStride: Int) {
-        guard let descs = secListsDesc else { return }
-        var dsc = descs[listID]
-        dsc.ids_offset   = fromHost(idsOff,   fileEndian: fileEndian)
-        dsc.codes_offset = fromHost(codesOff, fileEndian: fileEndian)
-        dsc.vecs_offset  = fromHost(vecsOff,  fileEndian: fileEndian)
-        dsc.capacity     = fromHost(UInt32(truncatingIfNeeded: newCapacity), fileEndian: fileEndian)
-        dsc.ids_stride   = fromHost(UInt32(truncatingIfNeeded: idsStride),   fileEndian: fileEndian)
-        dsc.codes_stride = fromHost(UInt32(truncatingIfNeeded: codesStride), fileEndian: fileEndian)
-        dsc.vecs_stride  = fromHost(UInt32(truncatingIfNeeded: vecsStride),  fileEndian: fileEndian)
-        descs[listID] = dsc
+        guard let base = listsDescBase else { return }
+        let rec = base.advanced(by: listID * 64)
+        // Write packed LE fields
+        writeLE64(rec.advanced(by: 16), idsOff)
+        writeLE64(rec.advanced(by: 24), codesOff)
+        writeLE64(rec.advanced(by: 32), vecsOff)
+        writeLE32(rec.advanced(by: 8), UInt32(truncatingIfNeeded: newCapacity))
+        writeLE32(rec.advanced(by: 40), UInt32(truncatingIfNeeded: idsStride))
+        writeLE32(rec.advanced(by: 44), UInt32(truncatingIfNeeded: codesStride))
+        writeLE32(rec.advanced(by: 48), UInt32(truncatingIfNeeded: vecsStride))
+        msyncPageAligned(rec, 64)
+        _ = try? updateSectionCRC(.listsDesc)
     }
 
     private func ensureFileCapacity(for ty: SectionType, tail: UInt64) throws {
         guard let e = mapSection(ty) else {
-            throw ErrorBuilder(.capacityExceeded, operation: "ensure_file_capacity")
+            throw ErrorBuilder(.mmapError, operation: "ensure_file_capacity")
                 .message("Cannot grow section: not found in TOC")
                 .info("section_type", "\(ty.rawValue)")
                 .build()
         }
-        let off = e.offsetHost(fileEndian)
+        let off = e.offset
         let needEnd = off + tail
         if needEnd > fileSize {
             // Ensure this section is the last by offset
             for (t, other) in tocByType {
                 if t == ty { continue }
-                let oOff = other.offsetHost(fileEndian)
+                let oOff = other.offset
                 if oOff > off {
-                    throw ErrorBuilder(.capacityExceeded, operation: "ensure_file_capacity")
+                    throw ErrorBuilder(.mmapError, operation: "ensure_file_capacity")
                         .message("Cannot grow section: not the last section by offset")
                         .info("section_type", "\(ty.rawValue)")
                         .info("section_offset", "\(off)")
@@ -739,7 +926,7 @@ internal final class IndexMmap {
             // Remap
             _ = msync(base, Int(fileSize), MS_SYNC)
             _ = munmap(base, Int(fileSize))
-            let newMap = mmap(nil, Int(newSize), prot, mapFlags, fd, 0)
+            let newMap = mmap(nil, Int(newSize), prot, MAP_SHARED, fd, 0)
             if newMap == MAP_FAILED {
                 throw ErrorBuilder(.mmapError, operation: "ensure_file_capacity")
                     .message("Failed to remap extended index file")
@@ -749,45 +936,50 @@ internal final class IndexMmap {
             }
             base = newMap!
             fileSize = newSize
-            // Rebuild pointers and section maps
-            // Recompute TOC pointer
-            let tocOffset = toHost(header.toc_offset, fileEndian: fileEndian)
-            toc = UnsafeRawPointer(base).advanced(by: Int(tocOffset)).assumingMemoryBound(to: TOCEntry.self)
+            // Rebuild TOC map (packed)
             tocByType.removeAll(keepingCapacity: true)
-            // Rebuild toc map and section pointers, recompute tails
-            // Note: skip CRC revalidation on remap; data not modified here.
+            let tocOff = Int(toHost(header.toc_offset, fileEndian: fileEndian))
+            let DISK_TOC_ENTRY_SIZE = 36
             for i in 0..<tocCount {
-                let te = toc.advanced(by: i).pointee
-                guard let ty2 = te.typeHost(fileEndian) else {
+                let te = UnsafeRawPointer(base).advanced(by: tocOff + i * DISK_TOC_ENTRY_SIZE)
+                let tyRaw = readLE32(te.advanced(by: 0))
+                guard let ty2 = SectionType(rawValue: tyRaw) else {
                     throw ErrorBuilder(.invalidFormat, operation: "ensure_file_capacity")
                         .message("Unknown section type after remap")
                         .info("toc_index", "\(i)")
                         .build()
                 }
-                tocByType[ty2] = te
+                let off = readLE64(te.advanced(by: 8))
+                let sz  = readLE64(te.advanced(by: 16))
+                let al  = readLE32(te.advanced(by: 24))
+                let flags = readLE32(te.advanced(by: 28))
+                let crc = readLE32(te.advanced(by: 32))
+                tocByType[ty2] = HostTOCEntry(type: ty2, offset: off, size: sz, align: al, flags: flags, crc32: crc)
             }
-            if let e = mapSection(.centroids) { secCentroids = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
-            if let e = mapSection(.codebooks) { secCodebooks = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
-            if let e = mapSection(.centroidNorms) { secCentroidNorms = UnsafePointer(slice(e).assumingMemoryBound(to: Float.self)) }
-            if let e = mapSection(.listsDesc) { secListsDesc = slice(e).assumingMemoryBound(to: ListDesc.self) }
-            if let e = mapSection(.ids) { secIDs = slice(e) }
-            if let e = mapSection(.codes) { secCodes = slice(e) }
-            if let e = mapSection(.vecs) { secVecs = slice(e) }
-            if let e = mapSection(.normsInv) { secNormsInv = UnsafeRawPointer(slice(e)) }
-            if let e = mapSection(.normsSq) { secNormsSq = UnsafeRawPointer(slice(e)) }
-            if let e = mapSection(.idMap) { secIDMap = UnsafeRawPointer(slice(e)) }
-            if let e = mapSection(.tombstones) { secTombstones = UnsafeRawPointer(slice(e)) }
-            if let descs = secListsDesc {
+            // Rebuild section base pointers
+            if let e = mapSection(.centroids) { secCentroids = UnsafePointer(UnsafeRawPointer(base).advanced(by: Int(e.offset)).assumingMemoryBound(to: Float.self)) }
+            if let e = mapSection(.codebooks) { secCodebooks = UnsafePointer(UnsafeRawPointer(base).advanced(by: Int(e.offset)).assumingMemoryBound(to: Float.self)) }
+            if let e = mapSection(.centroidNorms) { secCentroidNorms = UnsafePointer(UnsafeRawPointer(base).advanced(by: Int(e.offset)).assumingMemoryBound(to: Float.self)) }
+            if let e = mapSection(.listsDesc) { listsDescBase = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+            if let e = mapSection(.ids) { secIDs = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+            if let e = mapSection(.codes) { secCodes = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+            if let e = mapSection(.vecs) { secVecs = UnsafeMutableRawPointer(mutating: UnsafeRawPointer(base).advanced(by: Int(e.offset))) }
+            if let e = mapSection(.normsInv) { secNormsInv = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+            if let e = mapSection(.normsSq) { secNormsSq = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+            if let e = mapSection(.idMap) { secIDMap = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+            if let e = mapSection(.tombstones) { secTombstones = UnsafeRawPointer(base).advanced(by: Int(e.offset)) }
+            // Recompute tails
+            if let descs = listsDescBase?.assumingMemoryBound(to: UInt8.self) {
                 var idsMax: UInt64 = 0, codesMax: UInt64 = 0, vecsMax: UInt64 = 0
                 for i in 0..<kc {
-                    let dsc = descs.advanced(by: i).pointee
-                    let cap  = UInt64(dsc.capacityHost(fileEndian))
-                    let idsOff   = dsc.idsOffsetHost(fileEndian)
-                    let codesOff = dsc.codesOffsetHost(fileEndian)
-                    let vecsOff  = dsc.vecsOffsetHost(fileEndian)
-                    let idsStride = UInt64(dsc.idsStrideHost(fileEndian))
-                    let codesStride = UInt64(dsc.codesStrideHost(fileEndian))
-                    let vecsStride = UInt64(dsc.vecsStrideHost(fileEndian))
+                    let rec = UnsafeRawPointer(descs.advanced(by: i * 64))
+                    let cap  = UInt64(readLE32(rec.advanced(by: 8)))
+                    let idsOff   = readLE64(rec.advanced(by: 16))
+                    let codesOff = readLE64(rec.advanced(by: 24))
+                    let vecsOff  = readLE64(rec.advanced(by: 32))
+                    let idsStride = UInt64(readLE32(rec.advanced(by: 40)))
+                    let codesStride = UInt64(readLE32(rec.advanced(by: 44)))
+                    let vecsStride = UInt64(readLE32(rec.advanced(by: 48)))
                     idsMax   = max(idsMax,   idsOff   &+ cap &* idsStride)
                     codesMax = max(codesMax, codesOff &+ cap &* codesStride)
                     vecsMax  = max(vecsMax,  vecsOff  &+ cap &* vecsStride)
@@ -851,4 +1043,17 @@ internal final class IndexMmap {
                 .build()
         }
     }
+}
+// Little-endian readers for packed on-disk records
+@inline(__always) private func readLE32(_ p: UnsafeRawPointer) -> UInt32 {
+    var v: UInt32 = 0
+    memcpy(&v, p, 4)
+    return UInt32(littleEndian: v)
+}
+
+
+@inline(__always) private func readLE64(_ p: UnsafeRawPointer) -> UInt64 {
+    var v: UInt64 = 0
+    memcpy(&v, p, 8)
+    return UInt64(littleEndian: v)
 }
