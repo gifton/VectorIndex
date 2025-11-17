@@ -26,9 +26,19 @@ public struct PQTrainConfig: Sendable {
     public var seed: UInt64 = 42
     public var streamID: Int = 0
     public var emptyPolicy: EmptyClusterPolicy = .split
-    public var precomputeXNorm2: Bool = true
+    public var precomputeXNorm2: Bool = false
     public var computeCentroidNorms: Bool = true
     public var numThreads: Int = 0
+    public var verbose: Bool = false
+    // Optional warm-start: reuse existing codebooks as initial centroids
+    public var warmStart: Bool = false
+    // Tunables for sampling and evaluation
+    // - distEvalN: minibatch distortion evaluation sample (fallback when sampleN == 0)
+    // - repairEvalN: minibatch pass-level empty repair sample
+    // - streamingRepairEvalN: streaming pass-level empty repair sample
+    public var distEvalN: Int = 2000
+    public var repairEvalN: Int = 2000
+    public var streamingRepairEvalN: Int = 512
     public init() {}
 }
 
@@ -40,6 +50,7 @@ public struct PQTrainStats {
     public var timeInitSec: Double = 0
     public var timeTrainSec: Double = 0
     public var bytesRead: Int64 = 0
+    public var warmStartSubspaces: Int = 0
 }
 
 private final class SubspaceAccumulator: @unchecked Sendable {
@@ -64,6 +75,7 @@ struct SubspaceResults {
     var bytesRead: Int64 = 0
     var codebook: [Float] = []
     var norms: [Float]? = nil
+    var didWarmStart: Bool = false
 }
 
 @discardableResult
@@ -80,7 +92,7 @@ public func pq_train_f32(
     codebooksOut: inout [Float],
     centroidNormsOut: inout [Float]?
 ) throws -> PQTrainStats {
-    print("[PQTrain] enter pq_train_f32 n=\(n) d=\(d) m=\(m) ks=\(ks)")
+    if inCfg.verbose { print("[PQTrain] enter pq_train_f32 n=\(n) d=\(d) m=\(m) ks=\(ks)") }
     guard d > 0, m > 0, n >= 0 else {
         throw ErrorBuilder(.invalidDimension, operation: "pq_train")
             .message("Invalid dimensions: d, m must be positive, n must be non-negative")
@@ -112,7 +124,7 @@ public func pq_train_f32(
             .build()
     }
     let dsub = d / m
-    print("[PQTrain] dsub=\(dsub)")
+    if inCfg.verbose { print("[PQTrain] dsub=\(dsub)") }
     let needN = (inCfg.sampleN > 0 ? inCfg.sampleN : n)
     if needN < ks {
         throw ErrorBuilder(.emptyInput, operation: "pq_train")
@@ -130,7 +142,7 @@ public func pq_train_f32(
     var cfg = inCfg
     // Adaptive defaults for minibatch to keep training time reasonable in tests/CI
     if cfg.algo == .minibatch {
-        if cfg.sampleN <= 0 && n > 2000 { cfg.sampleN = 2000 }
+        if cfg.sampleN <= 0 && n > cfg.distEvalN { cfg.sampleN = Int64(cfg.distEvalN) }
         if cfg.batchSize <= 0 { cfg.batchSize = 512 }
         // Prefer cheap reseed for empty clusters in minibatch to avoid expensive scans
         cfg.emptyPolicy = .reseed
@@ -146,47 +158,91 @@ public func pq_train_f32(
     // Pre-allocate local copies to avoid capturing inout parameters
     _ = codebooksOut
     _ = centroidNormsOut
+    // Local snapshot for warm-start (opt-in)
+    let initialCodebooks = codebooksOut
 
     let t0 = nowSec()
-    print("[PQTrain] cfg: algo=\(cfg.algo) maxIters=\(cfg.maxIters) tol=\(cfg.tol) batchSize=\(cfg.batchSize) sampleN=\(cfg.sampleN) seed=\(cfg.seed) threads=\(cfg.numThreads) preX2=\(cfg.precomputeXNorm2) norms=\(cfg.computeCentroidNorms) empty=\(cfg.emptyPolicy)")
+    if cfg.verbose { print("[PQTrain] cfg: algo=\(cfg.algo) maxIters=\(cfg.maxIters) tol=\(cfg.tol) batchSize=\(cfg.batchSize) sampleN=\(cfg.sampleN) seed=\(cfg.seed) threads=\(cfg.numThreads) preX2=\(cfg.precomputeXNorm2) norms=\(cfg.computeCentroidNorms) empty=\(cfg.emptyPolicy)") }
 
     let cfgLocal = cfg  // capture immutable copy for tasks
 
     func runOneSubspace(_ j: Int) {
-        print("[PQTrain] subspace \(j): begin")
+        if cfgLocal.verbose { print("[PQTrain] subspace \(j): begin") }
         var rng = Xoroshiro128(splitFrom: cfgLocal.seed, streamID: UInt64(cfgLocal.streamID), taskID: UInt64(j))
         let (idx, ns) = buildSampleIndex(n: n, sampleN: cfgLocal.sampleN, rng: &rng)
-        print("[PQTrain] subspace \(j): sample ns=\(ns) (n=\(n)) path=\(ns == n ? "full" : "dense")")
+        if cfgLocal.verbose { print("[PQTrain] subspace \(j): sample ns=\(ns) (n=\(n)) path=\(ns == n ? "full" : "dense")") }
 
         let tInitS = nowSec()
         var Cj = [Float](repeating: 0, count: ks * dsub)
+        // Warm-start: reuse provided codebooks when enabled and shaped correctly
+        var didWarmStart = false
+        if cfgLocal.warmStart && initialCodebooks.count == m * ks * dsub {
+            let off = j * ks * dsub
+            var anyNonZero = false
+            for t in 0..<(ks * dsub) {
+                let v = initialCodebooks[off + t]
+                if v.isFinite && v != 0 { anyNonZero = true }
+                Cj[t] = v.isFinite ? v : 0
+            }
+            didWarmStart = anyNonZero
+            if cfgLocal.verbose && didWarmStart { print("[PQTrain] subspace \(j): warm-started from initial codebooks") }
+        }
+        // Cap KMeans++ seeding sample to ~4×ks to reduce initialization time
+        let __seedingCap = Int64(4 * ks)
+        let __useSeedSubset = ns > __seedingCap
+        let __nsSeed: Int = __useSeedSubset ? Int(__seedingCap) : Int(ns)
 
-        if ns == n {
+        if !didWarmStart && ns == n && !__useSeedSubset {
             kmeansppSeedSubspace(
                 x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
                 coarse: coarseCentroids, assign: assignments,
                 rng: &rng, outC: &Cj
             )
-        } else {
-            var tmp = [Float](repeating: 0, count: Int(ns) * dsub)
-            for (t, i32) in idx.enumerated() {
-                let i = Int(i32)
-                let base = i * d + j * dsub
-                if let coarse = coarseCentroids, let a = assignments {
-                    let gid = Int(a[i])
-                    let gBase = gid * d + j * dsub
-                    for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] - coarse[gBase + u] }
-                } else {
-                    for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] }
+        } else if !didWarmStart {
+            if __useSeedSubset {
+                // Downsample candidate set to __nsSeed uniformly without replacement
+                let poolCount = Int(ns)
+                let pos = sampleWithoutReplacement(n: UInt32(poolCount), k: UInt32(__nsSeed), rng: &rng)
+                var tmp = [Float](repeating: 0, count: __nsSeed * dsub)
+                for (t, p) in pos.enumerated() {
+                    let poolIndex = Int(p)
+                    // If ns==n, idx is 0..n-1; else map via idx
+                    let i = (ns == n) ? poolIndex : Int(idx[poolIndex])
+                    let base = i * d + j * dsub
+                    if let coarse = coarseCentroids, let a = assignments {
+                        let gid = Int(a[i])
+                        let gBase = gid * d + j * dsub
+                        for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] - coarse[gBase + u] }
+                    } else {
+                        for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] }
+                    }
                 }
+                kmeansppSeedSubspaceDense(
+                    xDense: tmp, n: __nsSeed, dsub: dsub, ks: ks,
+                    rng: &rng, outC: &Cj
+                )
+            } else {
+                // Existing dense seeding on provided sample idx
+                var tmp = [Float](repeating: 0, count: Int(ns) * dsub)
+                for (t, i32) in idx.enumerated() {
+                    let i = Int(i32)
+                    let base = i * d + j * dsub
+                    if let coarse = coarseCentroids, let a = assignments {
+                        let gid = Int(a[i])
+                        let gBase = gid * d + j * dsub
+                        for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] - coarse[gBase + u] }
+                    } else {
+                        for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] }
+                    }
+                }
+                kmeansppSeedSubspaceDense(
+                    xDense: tmp, n: Int(ns), dsub: dsub, ks: ks,
+                    rng: &rng, outC: &Cj
+                )
             }
-            kmeansppSeedSubspaceDense(
-                xDense: tmp, n: Int(ns), dsub: dsub, ks: ks,
-                rng: &rng, outC: &Cj
-            )
         }
         let tInitE = nowSec()
-        print("[PQTrain] subspace \(j): seeding done dt=\(tInitE - tInitS)s")
+        if cfgLocal.verbose { print("[PQTrain] subspace \(j): seeding done dt=\(tInitE - tInitS)s") }
 
         let tTrainS = nowSec()
         var distortion = 0.0
@@ -195,7 +251,7 @@ public func pq_train_f32(
 
         switch cfgLocal.algo {
         case .minibatch:
-            print("[PQTrain] subspace \(j): train algo=minibatch ...")
+            if cfgLocal.verbose { print("[PQTrain] subspace \(j): train algo=minibatch ...") }
             minibatchKMeansSubspace(
                 x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
                 coarse: coarseCentroids, assign: assignments,
@@ -203,7 +259,7 @@ public func pq_train_f32(
                 outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
             )
         case .lloyd:
-            print("[PQTrain] subspace \(j): train algo=lloyd ...")
+            if cfgLocal.verbose { print("[PQTrain] subspace \(j): train algo=lloyd ...") }
             lloydKMeansSubspace(
                 x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
                 coarse: coarseCentroids, assign: assignments,
@@ -212,7 +268,7 @@ public func pq_train_f32(
             )
         }
         let tTrainE = nowSec()
-        print("[PQTrain] subspace \(j): train done dt=\(tTrainE - tTrainS)s iters=\(iters) emptiesFixed=\(emptiesFixed) distortion=\(distortion)")
+        if cfgLocal.verbose { print("[PQTrain] subspace \(j): train done dt=\(tTrainE - tTrainS)s iters=\(iters) emptiesFixed=\(emptiesFixed) distortion=\(distortion)") }
 
         // Compute norms if needed
         var normsJ: [Float]? = nil
@@ -237,23 +293,25 @@ public func pq_train_f32(
             emptiesFixed: emptiesFixed,
             bytesRead: Int64(iters) * n * Int64(dsub) * 4,
             codebook: Cj,
-            norms: normsJ
+            norms: normsJ,
+            didWarmStart: didWarmStart
         )
         resultAcc.set(j, res)
-        print("[PQTrain] subspace \(j): result stored")
+        if cfgLocal.verbose { print("[PQTrain] subspace \(j): result stored") }
     }
 
     if cfg.numThreads <= 1 {
-        print("[PQTrain] execution mode: serial (threads<=1)")
-        for j in 0..<m { runOneSubspace(j) }
+        if cfg.verbose { print("[PQTrain] execution mode: serial (threads<=1)") }
+        var warmStartCount = 0
+    for j in 0..<m { runOneSubspace(j) }
     } else {
-        print("[PQTrain] execution mode: parallel (threads=\(cfg.numThreads))")
+        if cfg.verbose { print("[PQTrain] execution mode: parallel (threads=\(cfg.numThreads))") }
         let group = DispatchGroup()
         let q = DispatchQueue(label: "pq.train.concurrent", attributes: .concurrent)
         for j in 0..<m { q.async(group: group) { runOneSubspace(j) } }
-        print("[PQTrain] waiting for \(m) subspaces ...")
+        if cfg.verbose { print("[PQTrain] waiting for \(m) subspaces ...") }
         group.wait()
-        print("[PQTrain] all subspaces finished")
+        if cfg.verbose { print("[PQTrain] all subspaces finished") }
     }
 
     // Copy results back to inout parameters and merge stats
@@ -269,7 +327,7 @@ public func pq_train_f32(
 
     for j in 0..<m {
         let result = resultAcc.get(j) ?? SubspaceResults()
-        print("[PQTrain] merge subspace \(j): iters=\(result.iters) timeInit=\(result.timeInit) timeTrain=\(result.timeTrain) distortion=\(result.distortion) codebook=\(result.codebook.count)")
+        if cfg.verbose { print("[PQTrain] merge subspace \(j): iters=\(result.iters) timeInit=\(result.timeInit) timeTrain=\(result.timeTrain) distortion=\(result.distortion) codebook=\(result.codebook.count)") }
 
         // Copy codebook
         let cbOffset = j * ks * dsub
@@ -294,12 +352,15 @@ public func pq_train_f32(
         stats.itersPerSubspace[j] = result.iters
         stats.emptiesRepaired += result.emptiesFixed
         stats.bytesRead += result.bytesRead
+        if result.didWarmStart { stats.warmStartSubspaces += 1 }
     }
 
     stats.distortion = stats.distortionPerSubspace.prefix(m).reduce(0, +)
     let t1 = nowSec()
     stats.timeTrainSec += (t1 - t0) - stats.timeInitSec
-    print("[PQTrain] done: distortion=\(stats.distortion) timeInit=\(stats.timeInitSec)s timeTrain=\(stats.timeTrainSec)s bytes=\(stats.bytesRead)")
+    if cfg.verbose {
+        let ws = stats.warmStartSubspaces
+        print("[PQTrain] done: distortion=\(stats.distortion) timeInit=\(stats.timeInitSec)s timeTrain=\(stats.timeTrainSec)s bytes=\(stats.bytesRead) warmStartSubspaces=\(ws)/\(m)") }
     return stats
 }
 
@@ -349,6 +410,9 @@ public func pq_train_streaming_f32(
     cfg.algo = .minibatch
     if cfg.maxIters <= 0 { cfg.maxIters = 15 }
     if cfg.batchSize <= 0 { cfg.batchSize = 8192 }
+    // Derive total rows and set a safe default sample cap for CI friendliness
+    let totalN: Int64 = nChunks.reduce(0, +)
+    if cfg.sampleN <= 0 && totalN > 2000 { cfg.sampleN = 2000 }
 
     let dsub = d / m
     if codebooksOut.count != m * ks * dsub { codebooksOut = .init(repeating: 0, count: m * ks * dsub) }
@@ -368,29 +432,165 @@ public func pq_train_streaming_f32(
 
     let t0 = nowSec()
 
+    var warmStartCount = 0
     for j in 0..<m {
         var rng = Xoroshiro128(splitFrom: cfg.seed, streamID: UInt64(cfg.streamID), taskID: UInt64(j))
         var Cj = [Float](repeating: 0, count: ks * dsub)
         let tInitS = nowSec()
-        streamingKMeansppSeed(
-            xChunks: xChunks, nChunks: nChunks,
-            d: d, j: j, dsub: dsub, ks: ks,
-            coarse: coarseCentroids, assignChunks: assignChunks,
-            rng: &rng, outC: &Cj
-        )
+        // Cap streaming seeding to ~4×ks to avoid O(n * ks^2) scans
+        let totalN: Int64 = nChunks.reduce(0, +)
+        let seedingCap = Int64(4 * ks)
+        if totalN > seedingCap {
+            let sampleN = Int(min(totalN, seedingCap))
+            // Build prefix sums to map global index -> (chunk, local)
+            var prefix: [Int64] = [0]
+            for nc in nChunks { prefix.append(prefix.last! + nc) }
+            func mapIndex(_ g: Int64) -> (Int, Int) {
+                var c = 0
+                while c < nChunks.count - 1 && g >= prefix[c+1] { c += 1 }
+                let local = Int(g - prefix[c])
+                return (c, local)
+            }
+            // Sample without replacement from [0, totalN)
+            var tmp = [Float](repeating: 0, count: sampleN * dsub)
+            if totalN <= Int64(UInt32.max) {
+                let picks = sampleWithoutReplacement(n: UInt32(totalN), k: UInt32(sampleN), rng: &rng)
+                for (t, gi32) in picks.enumerated() {
+                    let g = Int64(gi32)
+                    let (c, i) = mapIndex(g)
+                    var xc = xChunks[c]
+                    let base = i * d + j * dsub
+                    if let coarse = coarseCentroids, let aChunks = assignChunks {
+                        var coarse = coarse
+                        let gid = Int(aChunks[c][i])
+                        let gbase = gid * d + j * dsub
+                        for u in 0..<dsub { tmp[t*dsub + u] = xc[base + u] - coarse[gbase + u] }
+                    } else {
+                        for u in 0..<dsub { tmp[t*dsub + u] = xc[base + u] }
+                    }
+                }
+            } else {
+                // Fallback: uniform stride sampling
+                let stride = max(Int64(1), totalN / Int64(sampleN))
+                var g: Int64 = 0
+                var t = 0
+                while t < sampleN && g < totalN {
+                    let (c, i) = mapIndex(g)
+                    var xc = xChunks[c]
+                    let base = i * d + j * dsub
+                    if let coarse = coarseCentroids, let aChunks = assignChunks {
+                        var coarse = coarse
+                        let gid = Int(aChunks[c][i])
+                        let gbase = gid * d + j * dsub
+                        for u in 0..<dsub { tmp[t*dsub + u] = xc[base + u] - coarse[gbase + u] }
+                    } else {
+                        for u in 0..<dsub { tmp[t*dsub + u] = xc[base + u] }
+                    }
+                    t += 1; g += stride
+                }
+            }
+            kmeansppSeedSubspaceDense(
+                xDense: tmp, n: sampleN, dsub: dsub, ks: ks,
+                rng: &rng, outC: &Cj
+            )
+        } else {
+            streamingKMeansppSeed(
+                xChunks: xChunks, nChunks: nChunks,
+                d: d, j: j, dsub: dsub, ks: ks,
+                coarse: coarseCentroids, assignChunks: assignChunks,
+                rng: &rng, outC: &Cj
+            )
+        }
         let tInitE = nowSec()
 
         let tTrainS = nowSec()
-        for _ in 0..<cfg.maxIters {
+        var globalCounts = [Int64](repeating: 0, count: ks)
+        for pass in 0..<cfg.maxIters {
+            var passCounts = [Int64](repeating: 0, count: ks)
+            // Thinning probability per row across all chunks to meet sampleN target per pass
+            let limit = (cfg.sampleN > 0) ? min(totalN, cfg.sampleN) : totalN
+            let sampleProb = max(0.0, min(1.0, Double(limit) / Double(max(totalN, 1))))
             for (c, nc) in nChunks.enumerated() {
                 guard nc > 0 else { continue }
                 minibatchKMeansSubspaceChunk(
                     xChunk: xChunks[c], n: nc, d: d, j: j, dsub: dsub, ks: ks,
                     coarse: coarseCentroids, assignChunk: assignChunks?[c],
-                    cfg: cfg, rng: &rng, C: &Cj
+                    cfg: cfg, rng: &rng, C: &Cj, globalCounts: &globalCounts, passCounts: &passCounts,
+                    sampleProb: sampleProb
                 )
                 stats.bytesRead += nc * Int64(dsub) * 4
             }
+            // Pass-level empty repair for streaming
+            var emptyKs: [Int] = []
+            for k in 0..<ks { if globalCounts[k] == 0 { emptyKs.append(k) } }
+            if !emptyKs.isEmpty {
+                // Build a sampled set of global indices across chunks
+                let evalN = Int(min(totalN, Int64(cfg.streamingRepairEvalN)))
+                if evalN > 0 {
+                    // Precompute chunk prefix sums to map global index -> (chunk, local)
+                    var prefix: [Int64] = [0]
+                    for nc in nChunks { prefix.append(prefix.last! + nc) }
+                    func mapIndex(_ g: Int64) -> (Int, Int) {
+                        var c = 0
+                        while c < nChunks.count - 1 && g >= prefix[c+1] { c += 1 }
+                        let local = Int(g - prefix[c])
+                        return (c, local)
+                    }
+                    // Precompute min distance per sampled point
+                    var mins = [Float](repeating: 0, count: evalN)
+                    var pts: [(c: Int, i: Int)] = Array(repeating: (0,0), count: evalN)
+                    for t in 0..<evalN {
+                        let g = Int64(rng.uniformF64() * Double(totalN))
+                        let (c, i) = mapIndex(g)
+                        pts[t] = (c, i)
+                        var xc = xChunks[c]
+                        let base = i * d + j * dsub
+                        var minD: Float
+                        if let coarse = coarseCentroids, let aChunks = assignChunks {
+                            var coarse = coarse
+                            let gid = Int(aChunks[c][i])
+                            let gbase = gid * d + j * dsub
+                            minD = l2Sq(&xc[base], &Cj[0], dsub, subtract: &coarse[gbase])
+                            for kk in 1..<ks {
+                                let di = l2Sq(&xc[base], &Cj[kk*dsub], dsub, subtract: &coarse[gbase])
+                                if di < minD { minD = di }
+                            }
+                        } else {
+                            minD = l2Sq(&xc[base], &Cj[0], dsub)
+                            for kk in 1..<ks {
+                                let di = l2Sq(&xc[base], &Cj[kk*dsub], dsub)
+                                if di < minD { minD = di }
+                            }
+                        }
+                        mins[t] = minD
+                    }
+                    // Select farthest points for empties
+                    let order = (0..<evalN).sorted { mins[$0] > mins[$1] }
+                    for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
+                        let pick = order[rank]
+                        let (c, i) = pts[pick]
+                        let base = i * d + j * dsub
+                        if let coarse = coarseCentroids, let aChunks = assignChunks {
+                            let gid = Int(aChunks[c][i])
+                            let gbase = gid * d + j * dsub
+                            for u in 0..<dsub { Cj[kEmpty*dsub + u] = xChunks[c][base + u] - coarse[gbase + u] }
+                        } else {
+                            for u in 0..<dsub { Cj[kEmpty*dsub + u] = xChunks[c][base + u] }
+                        }
+                        globalCounts[kEmpty] = 1
+                    }
+                }
+            }
+            #if DEBUG
+            let nonEmptyPass = passCounts.filter { $0 > 0 }.count
+            let emptyPass = ks - nonEmptyPass
+            let nonEmptyTotal = globalCounts.filter { $0 > 0 }.count
+            let emptyTotal = ks - nonEmptyTotal
+            let maxCount = passCounts.max() ?? 0
+            let minCount = passCounts.filter { $0 > 0 }.min() ?? 0
+            print("[PQTrain][stream][debug] j=\(j) pass=\(pass+1) emptyPass=\(emptyPass) emptyTotal=\(emptyTotal) minPassCount=\(minCount) maxPassCount=\(maxCount)")
+            for v in Cj { if !v.isFinite { print("[PQTrain][stream][debug] non-finite centroid value detected"); assertionFailure("Non-finite centroid") } }
+            #endif
         }
         let tTrainE = nowSec()
 
@@ -423,7 +623,8 @@ public func pq_train_streaming_f32(
                     let dval = l2Sq(&xc[base], &Cj[k*dsub], dsub)
                     if dval < best { best = dval }
                 }
-                Dj += Double(best)
+                if best < 0 { best = 0 }
+                if best.isFinite { Dj += Double(best) }
             }
             seen += nc
         }
@@ -435,6 +636,7 @@ public func pq_train_streaming_f32(
 
     stats.distortion = stats.distortionPerSubspace.prefix(m).reduce(0, +)
     stats.timeTrainSec += (nowSec() - t0) - stats.timeInitSec
+    stats.warmStartSubspaces = warmStartCount
     return stats
 }
 
@@ -691,7 +893,8 @@ private func lloydKMeansSubspace(
     var it = 0
 
     var qnorms: [Float]? = nil
-    if cfg.precomputeXNorm2 && coarse == nil {
+    let useDot = (cfg.precomputeXNorm2 && coarse == nil)
+    if useDot {
         qnorms = [Float](repeating: 0, count: nI)
         for i in 0..<nI {
             let base = i * d + j * dsub
@@ -709,7 +912,7 @@ private func lloydKMeansSubspace(
     let maxIters = max(1, cfg.maxIters)
     for iter in 0..<maxIters {
         // ✅ Refresh norms each iteration
-        if cfg.precomputeXNorm2 && coarse == nil {
+        if useDot {
             for k in 0..<ks {
                 var s: Float = 0
                 for u in 0..<dsub { let v = C[k*dsub + u]; s += v * v }
@@ -736,14 +939,28 @@ private func lloydKMeansSubspace(
                 }
                 for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u] - coarse[gbase+u]) }
             } else {
-                bestD = l2Sq(&x[base], &C[0], dsub)
-                for k in 1..<ks {
-                    let dk = l2Sq(&x[base], &C[k*dsub], dsub)
-                    if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                if useDot, let qn = qnorms {
+                    bestD = distDotTrick(x: &x[base], c: &C[0], dsub: dsub, x2: qn[i], c2: Cnorms[0])
+                    for k in 1..<ks {
+                        let dk = distDotTrick(x: &x[base], c: &C[k*dsub], dsub: dsub, x2: qn[i], c2: Cnorms[k])
+                        if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                    }
+                } else {
+                    bestD = l2Sq(&x[base], &C[0], dsub)
+                    for k in 1..<ks {
+                        let dk = l2Sq(&x[base], &C[k*dsub], dsub)
+                        if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                    }
                 }
                 for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u]) }
             }
             kAssign[i] = bestK
+            #if DEBUG
+            if useDot && bestD < -1e-6 {
+                print("[PQTrain][lloyd][debug] j=\(j) i=\(i) negative dist from dot-trick: \(bestD)")
+            }
+            #endif
+            if bestD < 0 { bestD = 0 }
             counts[bestK] += 1
             distortion += Double(bestD)
         }
@@ -773,29 +990,48 @@ private func lloydKMeansSubspace(
                 }
                 outEmpties += empties
             case .split:
-                // Approximate split-largest: sample limited subset for farthest
+                // Approximate split-largest: compute min-distance once for a sampled subset,
+                // then assign the top-|empties| farthest points to empty clusters.
                 let sample = min(nI, max(128, nI / 4))
                 let stride = max(1, nI / sample)
-                for k in 0..<ks where counts[k] == 0 {
-                    var best: Float = -1
-                    var iFar = 0
-                    var i = 0
-                    while i < nI {
-                        let base = i * d + j * dsub
-                        var minDi: Float = .infinity
-                        for kk in 0..<ks {
-                            let di = l2Sq(&x[base], &C[kk*dsub], dsub)
-                            if di < minDi { minDi = di }
-                        }
-                        if minDi > best { best = minDi; iFar = i }
-                        i += stride
+                var sampledIdx: [Int] = []
+                sampledIdx.reserveCapacity(sample)
+                var i = 0
+                while i < nI { sampledIdx.append(i); i += stride }
+                // Compute min distance to any centroid for sampled points
+                var mins = [Float](repeating: 0, count: sampledIdx.count)
+                for (t, ii) in sampledIdx.enumerated() {
+                    let base = ii * d + j * dsub
+                    var md = l2Sq(&x[base], &C[0], dsub)
+                    for kk in 1..<ks {
+                        let di = l2Sq(&x[base], &C[kk*dsub], dsub)
+                        if di < md { md = di }
                     }
-                    let base = iFar * d + j * dsub
-                    for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
+                    mins[t] = md
+                }
+                // Prepare list of empty cluster ids
+                var emptyIds: [Int] = []
+                emptyIds.reserveCapacity(empties)
+                for k in 0..<ks where counts[k] == 0 { emptyIds.append(k) }
+                // Sort sampled points by descending min-distance (farthest first)
+                let order = (0..<sampledIdx.count).sorted { mins[$0] > mins[$1] }
+                let assignCount = min(emptyIds.count, order.count)
+                for r in 0..<assignCount {
+                    let kEmpty = emptyIds[r]
+                    let pick = sampledIdx[order[r]]
+                    let base = pick * d + j * dsub
+                    for u in 0..<dsub { C[kEmpty*dsub + u] = x[base + u] }
                 }
                 outEmpties += empties
             }
         }
+
+        #if DEBUG
+        let distPer = distortion / Double(max(nI, 1))
+        print("[PQTrain][lloyd][debug] j=\(j) iter=\(iter+1) distortion=\(distPer) empties=\(empties)")
+        // Centroid finiteness check
+        for v in C { if !v.isFinite { print("[PQTrain][lloyd][debug] non-finite centroid value detected"); assertionFailure("Non-finite centroid") } }
+        #endif
 
         let improve = (prevDist - distortion) / (prevDist == 0 ? 1 : prevDist)
         prevDist = distortion
@@ -803,7 +1039,12 @@ private func lloydKMeansSubspace(
         if cfg.tol > 0 && iter > 0 && improve >= 0 && improve < Double(cfg.tol) { break }
     }
 
-    outDistortion = prevDist / Double(n)
+    let denom = Double(max(nI, 1))
+    if !prevDist.isFinite || prevDist < 0 {
+        outDistortion = max(prevDist, 0) / denom
+    } else {
+        outDistortion = prevDist / denom
+    }
     outIters = it
 }
 
@@ -828,18 +1069,27 @@ private func minibatchKMeansSubspace(
     var iters = 0
     var emptiesFixed = 0
 
+    // Global counts across all batches/passes for incremental means
+    var globalCounts = [Int64](repeating: 0, count: ks)
+    // Reusable per-batch accumulators
+    var sums = [Double](repeating: 0, count: ks * dsub)
+    var counts = [Int64](repeating: 0, count: ks)
+
     let passes = max(1, cfg.maxIters)
     for p in 0..<passes {
-        print("[PQTrain][mini] j=\(j) pass=\(p+1)/\(passes) B=\(B) n=\(nI) ks=\(ks)")
+        if cfg.verbose { print("[PQTrain][mini] j=\(j) pass=\(p+1)/\(passes) B=\(B) n=\(nI) ks=\(ks)") }
         randpermInPlace(&idx, rng: &rng)
         var processed = 0
         let limit = (cfg.sampleN > 0) ? min(nI, Int(cfg.sampleN)) : nI
+        // Per-pass counts to detect persistently empty clusters
+        var passCounts = [Int64](repeating: 0, count: ks)
         while processed < limit {
             let s = processed
             let e = min(s + B, limit)
             let nb = e - s
-            var sums = [Double](repeating: 0, count: ks * dsub)
-            var counts = [Int64](repeating: 0, count: ks)
+            // zero reusable accumulators
+            for i in 0..<(ks * dsub) { sums[i] = 0 }
+            for i in 0..<ks { counts[i] = 0 }
 
             for t in 0..<nb {
                 let i = Int(idx[s + t])
@@ -866,42 +1116,26 @@ private func minibatchKMeansSubspace(
                 }
 
                 counts[bestK] += 1
+                passCounts[bestK] += 1
             }
 
+            // Incremental centroid update per cluster
             for k in 0..<ks {
-                if counts[k] > 0 {
-                    let inv = 1.0 / Double(counts[k])
+                let ck = counts[k]
+                if ck > 0 {
+                    let oldN = globalCounts[k]
+                    let newN = oldN &+ ck
+                    globalCounts[k] = newN
+                    let oldW = Double(oldN) / Double(newN)
+                    let newW = Double(ck) / Double(newN)
+                    let baseC = k * dsub
+                    // Compute batch mean and blend with existing centroid
                     for u in 0..<dsub {
-                        let v = Float(sums[k*dsub + u] * inv)
-                        C[k*dsub + u] = v.isFinite ? v : 0
-                    }
-                } else if nb > 0 {
-                    if cfg.emptyPolicy == .ignore {
-                        continue
-                    } else if cfg.emptyPolicy == .reseed {
-                        // Cheap reseed: pick a random vector from the current batch
-                        let r = Int(rng.nextU32() % UInt32(nb))
-                        let i = Int(idx[s + r])
-                        let base = i * d + j * dsub
-                        for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
-                        emptiesFixed += 1
-                    } else {
-                        // Split-largest within this batch (limited scope)
-                        var iFar = Int(idx[s])
-                        var best: Float = -1
-                        for t in 0..<nb {
-                            let i = Int(idx[s + t])
-                            let base = i * d + j * dsub
-                            var minDi: Float = .infinity
-                            for kk in 0..<ks {
-                                let di = l2Sq(&x[base], &C[kk*dsub], dsub)
-                                if di < minDi { minDi = di }
-                            }
-                            if minDi > best { best = minDi; iFar = i }
-                        }
-                        let base = iFar * d + j * dsub
-                        for u in 0..<dsub { C[k*dsub + u] = x[base + u] }
-                        emptiesFixed += 1
+                        let oldVal = Double(C[baseC + u])
+                        let batchMean = sums[baseC + u] / Double(ck)
+                        let updated = oldW * oldVal + newW * batchMean
+                        let v = Float(updated)
+                        C[baseC + u] = v.isFinite ? v : 0
                     }
                 }
             }
@@ -909,7 +1143,70 @@ private func minibatchKMeansSubspace(
             iters += 1
             processed = e
         }
-        print("[PQTrain][mini] j=\(j) pass=\(p+1) completed; iters so far=\(iters)")
+
+        // Pass-level empty repair: operate only on clusters that never received assignments overall
+        var emptyKs: [Int] = []
+        for k in 0..<ks {
+            if globalCounts[k] == 0 { emptyKs.append(k) }
+        }
+        if !emptyKs.isEmpty {
+            let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : cfg.distEvalN))
+            if evalLim > 0 {
+                // Precompute min distance to any centroid for sampled points
+                var mins = [Float](repeating: 0, count: evalLim)
+                var inds = [Int](repeating: 0, count: evalLim)
+                for t in 0..<evalLim {
+                    let i = Int(idx[t % idx.count])
+                    inds[t] = i
+                    let base = i * d + j * dsub
+                    var minD: Float
+                    if let coarse = coarse, let assign = assign {
+                        var coarse = coarse
+                        let gid = Int(assign[i])
+                        let gbase = gid * d + j * dsub
+                        minD = l2Sq(&x[base], &C[0], dsub, subtract: &coarse[gbase])
+                        for kk in 1..<ks {
+                            let di = l2Sq(&x[base], &C[kk*dsub], dsub, subtract: &coarse[gbase])
+                            if di < minD { minD = di }
+                        }
+                    } else {
+                        minD = l2Sq(&x[base], &C[0], dsub)
+                        for kk in 1..<ks {
+                            let di = l2Sq(&x[base], &C[kk*dsub], dsub)
+                            if di < minD { minD = di }
+                        }
+                    }
+                    mins[t] = minD
+                }
+                // Select top-|emptyKs| farthest points (largest min distance)
+                let ecount = emptyKs.count
+                let order = (0..<evalLim).sorted { mins[$0] > mins[$1] }
+                for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
+                    let pickIdx = order[rank]
+                    let i = inds[pickIdx]
+                    let base = i * d + j * dsub
+                    if let coarse = coarse, let assign = assign {
+                        let gid = Int(assign[i]); let gbase = gid * d + j * dsub
+                        for u in 0..<dsub { C[kEmpty*dsub + u] = x[base + u] - coarse[gbase + u] }
+                    } else {
+                        for u in 0..<dsub { C[kEmpty*dsub + u] = x[base + u] }
+                    }
+                    globalCounts[kEmpty] = 1
+                    emptiesFixed += 1
+                }
+            }
+        }
+        #if DEBUG
+        let nonEmptyPass = passCounts.filter { $0 > 0 }.count
+        let emptyPass = ks - nonEmptyPass
+        let nonEmptyTotal = globalCounts.filter { $0 > 0 }.count
+        let emptyTotal = ks - nonEmptyTotal
+        let maxCount = passCounts.max() ?? 0
+        let minCount = passCounts.filter { $0 > 0 }.min() ?? 0
+        print("[PQTrain][mini][debug] j=\(j) pass=\(p+1) emptyPass=\(emptyPass) emptyTotal=\(emptyTotal) minPassCount=\(minCount) maxPassCount=\(maxCount)")
+        for v in C { if !v.isFinite { print("[PQTrain][mini][debug] non-finite centroid value detected"); assertionFailure("Non-finite centroid") } }
+        #endif
+        if cfg.verbose { print("[PQTrain][mini] j=\(j) pass=\(p+1) completed; iters so far=\(iters)") }
     }
 
     // Final sanitation of centroids to eliminate any residual non-finite values
@@ -921,7 +1218,7 @@ private func minibatchKMeansSubspace(
     // Estimate distortion on a limited sample to keep runtime bounded
     var total: Double = 0
     var used = 0
-    let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : 2000))
+    let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : cfg.distEvalN))
     // Reuse current permutation for sampling
     for t in 0..<evalLim {
         let i = Int(idx[t % idx.count])
@@ -931,12 +1228,17 @@ private func minibatchKMeansSubspace(
             let dk = l2Sq(&x[base], &C[k*dsub], dsub)
             if dk < best { best = dk }
         }
+        if best < 0 { best = 0 }
         if best.isFinite {
             total += Double(best)
             used += 1
         }
     }
-    outDistortion = (used > 0) ? (total / Double(used)) : 1.0
+    if used > 0 && total.isFinite {
+        outDistortion = total / Double(used)
+    } else {
+        outDistortion = 1.0
+    }
     outIters = iters
     outEmpties += emptiesFixed
 }
@@ -944,7 +1246,9 @@ private func minibatchKMeansSubspace(
 private func minibatchKMeansSubspaceChunk(
     xChunk: [Float], n: Int64, d: Int, j: Int, dsub: Int, ks: Int,
     coarse: [Float]?, assignChunk: [Int32]?,
-    cfg: PQTrainConfig, rng: inout Xoroshiro128, C: inout [Float]
+    cfg: PQTrainConfig, rng: inout Xoroshiro128, C: inout [Float],
+    globalCounts: inout [Int64], passCounts: inout [Int64],
+    sampleProb: Double = 1.0
 ) {
     // Create local var copies for &array[index] syntax
     var xChunk = xChunk
@@ -957,13 +1261,22 @@ private func minibatchKMeansSubspaceChunk(
     randpermInPlace(&idx, rng: &rng)
 
     let B = max(1, cfg.batchSize)
+    // Reusable per-batch accumulators
+    var sums = [Double](repeating: 0, count: ks * dsub)
+    var counts = [Int64](repeating: 0, count: ks)
     var s = 0
     while s < nI {
         let e = min(s + B, nI)
         let nb = e - s
-        var sums = [Double](repeating: 0, count: ks * dsub)
-        var counts = [Int64](repeating: 0, count: ks)
+        // zero reusable accumulators
+        for i in 0..<(ks * dsub) { sums[i] = 0 }
+        for i in 0..<ks { counts[i] = 0 }
         for t in 0..<nb {
+            // Probabilistic thinning to reduce per-pass workload across chunks
+            if sampleProb < 1.0 {
+                let u = rng.uniformF64()
+                if u > sampleProb { continue }
+            }
             let i = Int(idx[s + t])
             let base = i * d + j * dsub
             var bestK = 0
@@ -988,9 +1301,22 @@ private func minibatchKMeansSubspaceChunk(
             }
             counts[bestK] += 1
         }
-        for k in 0..<ks where counts[k] > 0 {
-            let inv = 1.0 / Double(counts[k])
-            for u in 0..<dsub { C[k*dsub + u] = Float(sums[k*dsub + u] * inv) }
+        for k in 0..<ks {
+            let ck = counts[k]
+            if ck > 0 {
+                let oldN = globalCounts[k]
+                let newN = oldN &+ ck
+                globalCounts[k] = newN
+                let oldW = Double(oldN) / Double(newN)
+                let newW = Double(ck) / Double(newN)
+                let baseC = k * dsub
+                for u in 0..<dsub {
+                    let oldVal = Double(C[baseC + u])
+                    let batchMean = sums[baseC + u] / Double(ck)
+                    C[baseC + u] = Float(oldW * oldVal + newW * batchMean)
+                }
+                passCounts[k] &+= ck
+            }
         }
         s = e
     }

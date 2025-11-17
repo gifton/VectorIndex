@@ -159,6 +159,10 @@ See [ERRORS.md](ERRORS.md) for complete error handling guide.
 
 - The package is CPU‑only by design. A future bridge (e.g., `VectorIndexAccelerate`) can inject GPU‑accelerated distance providers for IVF building and scoring.
 
+## Kernel Documentation
+
+- See Kernel Overview at `docs/kernels/README.md` for details on scoring, selection, layout, and training kernels. The PQTrain section covers algorithms, practical defaults, and tunables (`sampleN`, `distEvalN`, `repairEvalN`, `streamingRepairEvalN`, `warmStart`, `verbose`).
+
 ## Known Issues
 
 See [KNOWN_ISSUES.md](KNOWN_ISSUES.md) for documented issues in 0.1.0-alpha.

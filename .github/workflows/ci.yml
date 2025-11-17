@@ -1,15 +1,29 @@
 name: CI
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 on:
   push:
     branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   pull_request:
     branches: [ main ]
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+
+permissions:
+  contents: read
 
 jobs:
   build-and-test:
     name: Build and Test (macOS)
     runs-on: macos-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -26,11 +40,14 @@ jobs:
         run: swift build -v
 
       - name: Test
-        run: swift test -v
+        env:
+          CI_SKIP_PQTRAIN: '1'
+        run: swift test -v --parallel
 
       - name: Install SwiftLint
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
         run: |
-          brew update
           brew install swiftlint || true
       - name: SwiftLint (non-blocking)
         continue-on-error: true

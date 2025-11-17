@@ -123,6 +123,22 @@ See [ERRORS.md](ERRORS.md) for complete error handling guide.
 - Journaling Filter DSL (`JournalFilter`) with date/tags/custom predicates + comprehensive tests.
 - IVFSelect batch sugar: `IndexOps.Batch.ivfSelectNprobe` returning per‑query `[nprobe]` arrays of IDs/scores.
 
+### Kernel: PQTrain (#19)
+- Mini-batch stability: switched to incremental running means with global counts; removed per-batch reseed/split; added per‑pass, bounded-cost empty repair (sampled farthest‑point).
+- Seeding caps: dense and streaming seeding capped to ~4×ks candidates to bound initialization time.
+- Streaming per-pass sampling: probabilistic thinning across chunks toward a pass budget (uses `sampleN` when set).
+- Distortion safeguards: clamp negatives to zero; handle non‑finite totals; robust sampled evaluation.
+- Lloyd correctness: optional dot‑trick gated (`precomputeXNorm2=false` by default) with per‑iteration centroid‑norm refresh and negative‑distance clamping.
+- Warm-start (opt-in): `PQTrainConfig.warmStart` reuses provided codebooks as initial centroids when shaped; default unchanged.
+- Tunables surfaced in `PQTrainConfig`:
+  - `distEvalN` (default 2000): minibatch distortion eval sample when `sampleN == 0`.
+  - `repairEvalN` (default 2000): minibatch pass-level empty repair sample when `sampleN == 0`.
+  - `streamingRepairEvalN` (default 512): streaming pass-level empty repair sample.
+  - `verbose` (default false): gate high-level prints; DEBUG-only diagnostics unaffected.
+
+### Docs
+- Added Kernel Overview at `docs/kernels/README.md` with a PQTrain quick guide, defaults, and tunables.
+
 ### Docs
 - README: added Journaling Quickstart and IVF batch sugar examples.
 
