@@ -461,12 +461,16 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try kmeansPlusPlusSeed(
-                data: data, count: n, dimension: d, k: k,
-                config: .default,
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: data, count: n, dimension: d, k: k,
+                    config: .default,
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
     }
 
@@ -484,12 +488,16 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try kmeansPlusPlusSeed(
-                data: data, count: n, dimension: d, k: k,
-                config: .default,
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: data, count: n, dimension: d, k: k,
+                    config: .default,
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
     }
 }

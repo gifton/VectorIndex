@@ -134,7 +134,9 @@ public final class IDMap {
     }
     public func lookup(externalID: UInt64) -> Int64? {
         let impl = self.impl
-        if let lock = impl.rwLock { lock.readLock(); defer { lock.readUnlock() } }
+        let lock: RWLock? = impl.rwLock
+        if let lock = lock { lock.readLock(); }
+        defer { lock?.readUnlock() }
         if let bloom = impl.bloom, !bloom.mightContain(externalID) { return nil }
         let (found, val, probes) = impl.hashTable.lookup(externalID)
         impl.probeTotal &+= Int64(probes); impl.probeOps &+= 1; impl.probeMax = max(impl.probeMax, probes)

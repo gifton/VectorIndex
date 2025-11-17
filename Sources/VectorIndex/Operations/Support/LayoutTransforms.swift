@@ -896,7 +896,16 @@ public func vecsInterleave_f32_parallel(
     }
 
     #if canImport(Darwin)
+    // Sendable wrappers for unsafe pointers
+    struct UnsafeSendablePtr<T>: @unchecked Sendable { let ptr: UnsafePointer<T> }
+    struct UnsafeSendableMutPtr<T>: @unchecked Sendable { let ptr: UnsafeMutablePointer<T> }
+
+    let aosS = UnsafeSendablePtr(ptr: aos)
+    let aosoaS = UnsafeSendableMutPtr(ptr: aosoa)
+
     DispatchQueue.concurrentPerform(iterations: numBlocks) { blockIdx in
+        let aosBase = aosS.ptr
+        let aosoaBase = aosoaS.ptr
         let rowStart = blockIdx * R
         let rowEnd = min(rowStart + R, n)
         let blockRows = rowEnd - rowStart
@@ -917,19 +926,19 @@ public func vecsInterleave_f32_parallel(
 
                 if chunkDims == V {
                     for _ in 0..<V {
-                        aosoa[outBase] = aos[inBase]
+                        aosoaBase[outBase] = aosBase[inBase]
                         outBase &+= blockRows
                         inBase &+= 1
                     }
                 } else {
                     while dim < chunkDims {
-                        aosoa[outBase] = aos[inBase]
+                        aosoaBase[outBase] = aosBase[inBase]
                         outBase &+= blockRows
                         inBase &+= 1
                         dim &+= 1
                     }
                     while dim < V {
-                        aosoa[outBase] = 0.0
+                        aosoaBase[outBase] = 0.0
                         outBase &+= blockRows
                         dim &+= 1
                     }
@@ -967,7 +976,16 @@ public func vecsDeinterleave_f32_parallel(
     }
 
     #if canImport(Darwin)
+    // Sendable wrappers for unsafe pointers
+    struct UnsafeSendablePtr<T>: @unchecked Sendable { let ptr: UnsafePointer<T> }
+    struct UnsafeSendableMutPtr<T>: @unchecked Sendable { let ptr: UnsafeMutablePointer<T> }
+
+    let aosoaS = UnsafeSendablePtr(ptr: aosoa)
+    let aosS = UnsafeSendableMutPtr(ptr: aos)
+
     DispatchQueue.concurrentPerform(iterations: numBlocks) { blockIdx in
+        let aosoaBase = aosoaS.ptr
+        let aosBase = aosS.ptr
         let rowStart = blockIdx * R
         let rowEnd   = min(rowStart + R, n)
         let blockRows = rowEnd - rowStart
@@ -988,7 +1006,7 @@ public func vecsDeinterleave_f32_parallel(
 
                 // Copy only real dimensions (skip padded tail)
                 for _ in 0..<realDims {
-                    aos[outBase] = aosoa[inBase]
+                    aosBase[outBase] = aosoaBase[inBase]
                     inBase &+= blockRows
                     outBase &+= 1
                 }
