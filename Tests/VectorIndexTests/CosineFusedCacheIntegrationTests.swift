@@ -33,4 +33,3 @@ final class CosineFusedCacheIntegrationTests: XCTestCase {
         await idx.disableCosineFusedNormCache()
     }
 }
-

@@ -48,7 +48,7 @@ final class S2EdgeCaseTests: XCTestCase {
             16777216.0,    // Exactly 2^24
             33554432.0,    // 2^25
             1.0e10,        // Very large
-            -1.0e10,       // Very large negative
+            -1.0e10       // Very large negative
         ]
         let scale: Float = 127.0  // scale = max(|x|) / 127; use 127 to saturate large values
 
@@ -73,7 +73,7 @@ final class S2EdgeCaseTests: XCTestCase {
             maxVal,
             -maxVal,
             maxVal * 0.5,
-            -maxVal * 0.5,
+            -maxVal * 0.5
         ]
         let scale: Float = maxVal / 127.0  // Scale = max/127 for symmetric quantization
 
@@ -105,7 +105,7 @@ final class S2EdgeCaseTests: XCTestCase {
             50.0,    // Won't saturate
             100.0,   // Won't saturate
             150.0,   // Will saturate to 127
-            -150.0,  // Will saturate to -128
+            -150.0  // Will saturate to -128
         ]
         let scale: Float = 1.0  // Direct mapping
 
@@ -195,7 +195,7 @@ final class S2EdgeCaseTests: XCTestCase {
             -0.0,
             Float.greatestFiniteMagnitude,  // Will overflow to f16 Inf
             -Float.greatestFiniteMagnitude,
-            1.0e-20,  // Underflows to f16 zero
+            1.0e-20  // Underflows to f16 zero
         ]
 
         var f16Buffer = [UInt16](repeating: 0, count: testVectors.count)

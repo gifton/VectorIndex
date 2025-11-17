@@ -74,4 +74,3 @@ final class HNSWNeighborSelectionTests: XCTestCase {
         XCTAssertEqual(Array(out.prefix(kept)), [1, 2])
     }
 }
-

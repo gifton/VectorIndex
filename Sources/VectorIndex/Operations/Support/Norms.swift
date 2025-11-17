@@ -15,7 +15,7 @@ public extension IndexOps.Support {
             case sq   = 2
             case both = 3
             @inlinable public var needsInv: Bool { self == .inv || self == .both }
-            @inlinable public var needsSq:  Bool { self == .sq  || self == .both }
+            @inlinable public var needsSq: Bool { self == .sq  || self == .both }
         }
 
         // MARK: - Data Type
@@ -41,7 +41,7 @@ public extension IndexOps.Support {
             public var epsilon: Float
 
             public private(set) var invNorms: UnsafeMutablePointer<Float>? // when invDType == .float32
-            public private(set) var sqNorms:  UnsafeMutablePointer<Float>?
+            public private(set) var sqNorms: UnsafeMutablePointer<Float>?
 
             public private(set) var invRaw: UnsafeMutableRawPointer?
             private var mmapBase: UnsafeMutableRawPointer?
@@ -80,7 +80,7 @@ public extension IndexOps.Support {
                     if let base = mmapBase { munmap(base, mmapSize) }
                 } else {
                     if mode.needsInv, let p = invRaw { free(p) }
-                    if mode.needsSq,  let p = sqNorms { free(p) }
+                    if mode.needsSq, let p = sqNorms { free(p) }
                 }
             }
 
@@ -341,10 +341,10 @@ public extension IndexOps.Support {
             guard crc == hdr.checksum else { munmap(base, fileSize); throw NSError(domain: "NormCache.load", code: 16, userInfo: [NSLocalizedDescriptionKey: "checksum mismatch"]) }
 
             var cache = NormCache(count: n, dimension: d, mode: mode, invDType: invDT, epsilon: eps)
-            var invPtr: UnsafeMutableRawPointer? = nil
-            var sqPtr: UnsafeMutablePointer<Float>? = nil
+            var invPtr: UnsafeMutableRawPointer?
+            var sqPtr: UnsafeMutablePointer<Float>?
             if mode.needsInv { invPtr = dataPtr }
-            if mode.needsSq  { sqPtr = dataPtr.advanced(by: invBytes).assumingMemoryBound(to: Float.self) }
+            if mode.needsSq { sqPtr = dataPtr.advanced(by: invBytes).assumingMemoryBound(to: Float.self) }
             cache.setMapped(base: UnsafeMutableRawPointer(mutating: base!), size: fileSize, invPtr: invPtr, sqPtr: sqPtr)
             return cache
         }

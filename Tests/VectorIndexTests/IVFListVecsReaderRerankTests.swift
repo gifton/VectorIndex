@@ -6,8 +6,8 @@ final class IVFListVecsReaderRerankTests: XCTestCase {
         // Two lists, d=2. Internal IDs 0..3 mapped to (list,offset).
         // Vectors: id0 -> (0,0), id1 -> (1,0); id2 -> (0,1); id3 -> (1,1)
         let d = 2
-        let list0: [Float] = [0,0, 1,0]   // 2 rows
-        let list1: [Float] = [0,1, 1,1]   // 2 rows
+        let list0: [Float] = [0, 0, 1, 0]   // 2 rows
+        let list1: [Float] = [0, 1, 1, 1]   // 2 rows
         let N = 4
         // id2List and id2Offset
         var id2List = [Int32](repeating: 0, count: N)
@@ -27,7 +27,7 @@ final class IVFListVecsReaderRerankTests: XCTestCase {
         // Query near (1,0); choose components so a+b>1 to avoid a tie between [0,0] and [1,1]
         // For L2, tie occurs when a+b == 1 (equal distance to [0,0] and [1,1]).
         let q: [Float] = [0.95, 0.06]
-        var candIDs: [Int64] = [0,1,2,3]
+        var candIDs: [Int64] = [0, 1, 2, 3]
         var scores = [Float](repeating: 0, count: 2)
         var ids = [Int64](repeating: -1, count: 2)
         q.withUnsafeBufferPointer { qb in
@@ -67,8 +67,8 @@ final class IVFListVecsReaderRerankTests: XCTestCase {
         // Construct a tie for the second-closest candidate under L2.
         // Two lists, d=2; mapping same as previous test.
         let d = 2
-        let list0: [Float] = [0,0, 1,0]
-        let list1: [Float] = [0,1, 1,1]
+        let list0: [Float] = [0, 0, 1, 0]
+        let list1: [Float] = [0, 1, 1, 1]
         let N = 4
         var id2List = [Int32](repeating: 0, count: N)
         var id2Offset = [Int32](repeating: 0, count: N)
@@ -86,7 +86,7 @@ final class IVFListVecsReaderRerankTests: XCTestCase {
 
         // Query q = [a,b] with a+b == 1 creates equal distances to [0,0] and [1,1].
         let q: [Float] = [0.95, 0.05]
-        let candIDs: [Int64] = [0,1,2,3]
+        let candIDs: [Int64] = [0, 1, 2, 3]
         var scores = [Float](repeating: 0, count: 2)
         var ids = [Int64](repeating: -1, count: 2)
 

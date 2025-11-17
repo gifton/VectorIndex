@@ -28,7 +28,7 @@ public enum IVFPostADC {
         K: Int,
         opts: IndexOps.Rerank.RerankOpts
     ) -> (scores: [Float], ids: [Int64]) {
-        return IndexOps.Rerank.topKIVF(
+        IndexOps.Rerank.topKIVF(
             q: q, d: d, metric: metric,
             candInternalIDs: candInternalIDs,
             id2List: id2List, id2Offset: id2Offset,
@@ -36,4 +36,3 @@ public enum IVFPostADC {
         )
     }
 }
-

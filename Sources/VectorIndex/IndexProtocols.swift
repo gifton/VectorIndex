@@ -103,7 +103,7 @@ public protocol VectorIndexProtocol: Actor {
 
     /// Update an existing entry. Pass nil to leave field unchanged.
     /// Returns true if the id existed and was updated.
-    func update(id: VectorID, vector: [Float]?, metadata: [String:String]?) async throws -> Bool
+    func update(id: VectorID, vector: [Float]?, metadata: [String: String]?) async throws -> Bool
 
     /// Remove a batch of ids (best effort). Nonexistent ids are ignored.
     func batchRemove(_ ids: [VectorID]) async throws

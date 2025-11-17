@@ -48,7 +48,7 @@ public extension IndexOps {
             @inline(__always) public static func record(_ t: TopKTelemetry) { sink?(t) }
         }
 
-        @usableFromInline struct _HeapCounters { @usableFromInline var pushes=0, sifts=0, comps=0 }
+        @usableFromInline struct HeapCounters { @usableFromInline var pushes=0, sifts=0, comps=0 }
 
         // MARK: Fixed-size Top-K Heap (SoA)
         public struct TopKHeap {
@@ -71,16 +71,16 @@ public extension IndexOps {
                 free(UnsafeMutableRawPointer(ids))
             }
             public var root: (score: Float, id: Int32)? { count > 0 ? (scores[0], ids[0]) : nil }
-            public mutating func push(score: Float, id: Int32) { var c=_HeapCounters(); _push(score: score, id: id, counters: &c) }
+            public mutating func push(score: Float, id: Int32) { var c=HeapCounters(); _push(score: score, id: id, counters: &c) }
             public func extractSorted() -> [(score: Float, id: Int32)] {
                 var out = [(Float, Int32)](); out.reserveCapacity(count)
                 for i in 0..<count { out.append((scores[i], ids[i])) }
-                out.sort { a,b in ordering.isBetter(a.0, a.1, than: b.0, b.1) }
+                out.sort { a, b in ordering.isBetter(a.0, a.1, than: b.0, b.1) }
                 return out
             }
-            @inline(__always) mutating func heapify(counters: inout _HeapCounters) { var i=(count/2)-1; while i>=0 { counters.sifts &+= _siftDown(from:i); if i==0 {break}; i &-= 1 } }
-            @inline(__always) mutating func replaceRoot(score: Float, id: Int32, counters: inout _HeapCounters) { scores[0]=score; ids[0]=id; counters.sifts &+= _siftDown(from:0); counters.pushes &+= 1 }
-            @inline(__always) mutating func _push(score: Float, id: Int32, counters: inout _HeapCounters) {
+            @inline(__always) mutating func heapify(counters: inout HeapCounters) { var i=(count/2)-1; while i>=0 { counters.sifts &+= _siftDown(from: i); if i==0 {break}; i &-= 1 } }
+            @inline(__always) mutating func replaceRoot(score: Float, id: Int32, counters: inout HeapCounters) { scores[0]=score; ids[0]=id; counters.sifts &+= _siftDown(from: 0); counters.pushes &+= 1 }
+            @inline(__always) mutating func _push(score: Float, id: Int32, counters: inout HeapCounters) {
                 if capacity == 0 { return }
                 if count < capacity { scores[count]=score; ids[count]=id; counters.sifts &+= _siftUp(from: count); count &+= 1; counters.pushes &+= 1; return }
                 if ordering.shouldReplace(score, id, rootScore: scores[0], rootId: ids[0]) { replaceRoot(score: score, id: id, counters: &counters) }
@@ -106,11 +106,10 @@ public extension IndexOps {
         }
 
         @inline(__always) private static func _allocateAligned<T>(count: Int, align: Int, of: T.Type) -> UnsafeMutablePointer<T> {
-            precondition(count >= 0)
             var p: UnsafeMutableRawPointer?
-            let r = posix_memalign(&p, align, max(count,1)*MemoryLayout<T>.stride)
+            let r = posix_memalign(&p, align, max(count, 1)*MemoryLayout<T>.stride)
             precondition(r == 0 && p != nil, "posix_memalign failed")
-            return p!.bindMemory(to: T.self, capacity: max(count,1))
+            return p!.bindMemory(to: T.self, capacity: max(count, 1))
         }
 
         public struct TopKConfig: Sendable {
@@ -130,7 +129,7 @@ public extension IndexOps {
             ordering: HeapOrdering, config: TopKConfig = .default
         ) -> TopKHeap {
             let kEff = max(0, min(k, n))
-            var counters = _HeapCounters()
+            var counters = HeapCounters()
             let t0 = config.enableTelemetry ? DispatchTime.now().uptimeNanoseconds : 0
             let algo: TopKConfig.Algorithm = {
                 if let forced = config.forceAlgorithm { return forced }
@@ -152,9 +151,9 @@ public extension IndexOps {
         }
 
         public static func selectTopK_streaming(scores s: UnsafePointer<Float>, ids idsOpt: UnsafePointer<Int32>?, count n: Int, k: Int, ordering: HeapOrdering) -> TopKHeap {
-            var tmp=_HeapCounters(); return _streaming(scores:s, ids:idsOpt, n:n, k:k, ordering:ordering, counters:&tmp)
+            var tmp=HeapCounters(); return _streaming(scores: s, ids: idsOpt, n: n, k: k, ordering: ordering, counters: &tmp)
         }
-        @inline(__always) private static func _streaming(scores s: UnsafePointer<Float>, ids idsOpt: UnsafePointer<Int32>?, n: Int, k: Int, ordering: HeapOrdering, counters: inout _HeapCounters) -> TopKHeap {
+        @inline(__always) private static func _streaming(scores s: UnsafePointer<Float>, ids idsOpt: UnsafePointer<Int32>?, n: Int, k: Int, ordering: HeapOrdering, counters: inout HeapCounters) -> TopKHeap {
             var heap = TopKHeap(capacity: k, ordering: ordering); guard k>0 && n>0 else { return heap }
             let m = min(k, n)
             for i in 0..<m { let id = idsOpt?.advanced(by: i).pointee ?? Int32(i); heap._directWrite(at: i, score: s[i], id: id) }
@@ -164,30 +163,30 @@ public extension IndexOps {
         }
 
         public static func selectTopK_hybrid(scores s: UnsafePointer<Float>, ids idsOpt: UnsafePointer<Int32>?, count n: Int, k: Int, ordering: HeapOrdering) -> TopKHeap {
-            var tmp=_HeapCounters(); return _hybrid(scores:s, ids:idsOpt, n:n, k:k, ordering:ordering, counters:&tmp)
+            var tmp=HeapCounters(); return _hybrid(scores: s, ids: idsOpt, n: n, k: k, ordering: ordering, counters: &tmp)
         }
-        @inline(__always) private static func _hybrid(scores s: UnsafePointer<Float>, ids idsOpt: UnsafePointer<Int32>?, n: Int, k: Int, ordering: HeapOrdering, counters: inout _HeapCounters) -> TopKHeap {
+        @inline(__always) private static func _hybrid(scores s: UnsafePointer<Float>, ids idsOpt: UnsafePointer<Int32>?, n: Int, k: Int, ordering: HeapOrdering, counters: inout HeapCounters) -> TopKHeap {
             var heap = TopKHeap(capacity: k, ordering: ordering); guard k>0 && n>0 else { return heap }
-            var ws=[Float](repeating:0,count:n); var wi=[Int32](repeating:0,count:n)
-            for i in 0..<n { ws[i]=s[i]; wi[i]=idsOpt?.advanced(by:i).pointee ?? Int32(i) }
+            var ws=[Float](repeating: 0, count: n); var wi=[Int32](repeating: 0, count: n)
+            for i in 0..<n { ws[i]=s[i]; wi[i]=idsOpt?.advanced(by: i).pointee ?? Int32(i) }
             _quickselectTopK(&ws, &wi, k, ordering: ordering, counters: &counters)
-            for i in 0..<k { heap._directWrite(at:i, score:ws[i], id:wi[i]) }
-            heap.count=k; heap.heapify(counters:&counters); counters.pushes &+= k; return heap
+            for i in 0..<k { heap._directWrite(at: i, score: ws[i], id: wi[i]) }
+            heap.count=k; heap.heapify(counters: &counters); counters.pushes &+= k; return heap
         }
 
         @inline(__always) private static func _medianOfThree(_ scores: [Float], _ ids: [Int32], _ a: Int, _ b: Int, _ c: Int, ordering: HeapOrdering) -> Int {
             func better(_ i: Int, _ j: Int) -> Bool { ordering.isBetter(scores[i], ids[i], than: scores[j], ids[j]) }
-            let ab=better(a,b), ac=better(a,c), bc=better(b,c)
+            let ab=better(a, b), ac=better(a, c), bc=better(b, c)
             if ab { if ac { return a } ; return bc ? b : c } else { if !bc { return b } ; return ac ? a : c }
         }
-        @inline(__always) private static func _partition(_ scores: inout [Float], _ ids: inout [Int32], left: Int, right: Int, pivotIdx: Int, ordering: HeapOrdering, counters: inout _HeapCounters) -> Int {
-            let pScore=scores[pivotIdx], pId=ids[pivotIdx]; scores.swapAt(pivotIdx,right); ids.swapAt(pivotIdx,right)
-            var store=left; for i in left..<right { counters.comps &+= 1; if ordering.isBetter(scores[i], ids[i], than: pScore, pId) { scores.swapAt(i,store); ids.swapAt(i,store); store &+= 1 } }
-            scores.swapAt(store,right); ids.swapAt(store,right); return store
+        @inline(__always) private static func _partition(_ scores: inout [Float], _ ids: inout [Int32], left: Int, right: Int, pivotIdx: Int, ordering: HeapOrdering, counters: inout HeapCounters) -> Int {
+            let pScore=scores[pivotIdx], pId=ids[pivotIdx]; scores.swapAt(pivotIdx, right); ids.swapAt(pivotIdx, right)
+            var store=left; for i in left..<right { counters.comps &+= 1; if ordering.isBetter(scores[i], ids[i], than: pScore, pId) { scores.swapAt(i, store); ids.swapAt(i, store); store &+= 1 } }
+            scores.swapAt(store, right); ids.swapAt(store, right); return store
         }
-        @inline(__always) private static func _quickselectTopK(_ scores: inout [Float], _ ids: inout [Int32], _ k: Int, ordering: HeapOrdering, counters: inout _HeapCounters) {
-            var left=0, right=scores.count-1; let target=max(0,min(k,scores.count))
-            while left<=right { if left==right { break } ; let mid=(left+right)>>1; let piv=_medianOfThree(scores, ids, left, mid, right, ordering: ordering); let pf=_partition(&scores,&ids,left:left,right:right,pivotIdx:piv,ordering:ordering,counters:&counters); if pf==target { break } ; if pf<target { left=pf+1 } else { if pf==0 { break }; right=pf-1 } }
+        @inline(__always) private static func _quickselectTopK(_ scores: inout [Float], _ ids: inout [Int32], _ k: Int, ordering: HeapOrdering, counters: inout HeapCounters) {
+            var left=0, right=scores.count-1; let target=max(0, min(k, scores.count))
+            while left<=right { if left==right { break } ; let mid=(left+right)>>1; let piv=_medianOfThree(scores, ids, left, mid, right, ordering: ordering); let pf=_partition(&scores, &ids, left: left, right: right, pivotIdx: piv, ordering: ordering, counters: &counters); if pf==target { break } ; if pf<target { left=pf+1 } else { if pf==0 { break }; right=pf-1 } }
         }
 
         // Convenience using project metric

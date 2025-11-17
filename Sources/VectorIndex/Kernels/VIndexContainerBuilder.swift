@@ -32,8 +32,8 @@ private struct _CRC32 {
 }
 
 // These mirror VIndexMmap.swift disk structs
-fileprivate struct _TOCEntry { var type: UInt32; var offset: UInt64; var size: UInt64; var align: UInt32; var flags: UInt32; var crc32: UInt32; var reserved: UInt32 }
-fileprivate struct _Header {
+private struct _TOCEntry { var type: UInt32; var offset: UInt64; var size: UInt64; var align: UInt32; var flags: UInt32; var crc32: UInt32; var reserved: UInt32 }
+private struct _Header {
     var magic: UInt64
     var version_major: UInt16
     var version_minor: UInt16
@@ -276,13 +276,13 @@ internal enum VIndexContainerBuilder {
             kc: UInt32(k_c),
             id_bits: UInt8(idBits),
             code_group_g: UInt8(group),
-            reservedA: (0,0,0,0,0,0),
+            reservedA: (0, 0, 0, 0, 0, 0),
             N_total: 0,
             generation: 0,
             toc_offset: tocOffset,
             toc_entries: UInt32(tocCount),
             header_crc32: 0,
-            reservedRest: (0,0,0,0,0,0,0)
+            reservedRest: (0, 0, 0, 0, 0, 0, 0)
         )
         // Compute header CRC over 256 bytes with crc field zeroed
         let hdrPtr = UnsafeMutableRawPointer(base).assumingMemoryBound(to: _Header.self)

@@ -24,7 +24,7 @@ public enum RowBlockSize: Int, Sendable {
     /// Recommended block size based on dimension
     public static func recommended(dimension d: Int) -> RowBlockSize {
         // Larger dimensions benefit from smaller blocks (better L1 fit)
-        return d >= 1024 ? .r4 : .r8
+        d >= 1024 ? .r4 : .r8
     }
 }
 
@@ -34,7 +34,7 @@ public enum PQGroupSize: Int, Sendable {
     case g8 = 8   // better vectorization per group
 
     public static func recommended(subquantizers m: Int) -> PQGroupSize {
-        return m >= 16 ? .g8 : .g4
+        m >= 16 ? .g8 : .g4
     }
 }
 
@@ -84,20 +84,20 @@ public struct LayoutTransformOpts: Sendable {
 /// Calculate padded dimension for AoSoA layout (round up to multiple of V=16)
 @inline(__always)
 public func paddedDimension(_ d: Int) -> Int {
-    return ((d + V_FLOAT32 - 1) / V_FLOAT32) * V_FLOAT32
+    ((d + V_FLOAT32 - 1) / V_FLOAT32) * V_FLOAT32
 }
 
 /// Calculate buffer size for n vectors with dimension d in AoSoA layout
 /// (Name matches spec; retained as-is.)
 @inline(__always)
 public func asoaBufferSize(n: Int, d: Int) -> Int {
-    return n * paddedDimension(d)
+    n * paddedDimension(d)
 }
 
 /// Optional alias (ergonomic)
 @inline(__always)
 public func aosoaBufferSize(n: Int, d: Int) -> Int {
-    return asoaBufferSize(n: n, d: d)
+    asoaBufferSize(n: n, d: d)
 }
 
 // MARK: - Validation
@@ -133,12 +133,12 @@ public func validateInterleaveParams(n: Int, d: Int, R: Int) throws {
 
 @inline(__always)
 private func isAligned<T>(_ p: UnsafePointer<T>, to alignment: Int) -> Bool {
-    return (Int(bitPattern: p) & (alignment - 1)) == 0
+    (Int(bitPattern: p) & (alignment - 1)) == 0
 }
 
 @inline(__always)
 private func isAligned<T>(_ p: UnsafeMutablePointer<T>, to alignment: Int) -> Bool {
-    return (Int(bitPattern: p) & (alignment - 1)) == 0
+    (Int(bitPattern: p) & (alignment - 1)) == 0
 }
 
 // MARK: - Telemetry
@@ -163,7 +163,7 @@ public struct LayoutTransformTelemetry {
 
 // Optional hook the host app can implement.
 public enum GlobalTelemetryRecorder {
-    public nonisolated(unsafe) static var record: ((LayoutTransformTelemetry) -> Void)? = nil
+    public nonisolated(unsafe) static var record: ((LayoutTransformTelemetry) -> Void)?
 }
 
 // MARK: - Core: Vector Interleaving (AoS -> AoSoA)
@@ -868,7 +868,7 @@ public extension LayoutTransform {
         d: Int,
         opts: LayoutTransformOpts
     ) -> [[Float]] {
-        return deinterleave(interleaved: interleaved, n: n, d: d, rowBlockSize: opts.rowBlockSize)
+        deinterleave(interleaved: interleaved, n: n, d: d, rowBlockSize: opts.rowBlockSize)
     }
 }
 
@@ -1006,6 +1006,6 @@ public func vecsDeinterleave_f32_parallel(
 #if DEBUG
 @inline(__always)
 private func almostEqual(_ a: Float, _ b: Float, eps: Float = 1e-5) -> Bool {
-    return abs(a - b) <= eps
+    abs(a - b) <= eps
 }
 #endif

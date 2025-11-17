@@ -5,7 +5,7 @@ final class IVFListMaintenanceTests: XCTestCase {
     func testReplaceMovesBetweenLists() async throws {
         let cfg = IVFIndex.Configuration(nlist: 2, nprobe: 1)
         let ivf = IVFIndex(dimension: 2, metric: .euclidean, config: cfg)
-        try await ivf.batchInsert([("p", [0,0], nil), ("q", [1,0], nil)])
+        try await ivf.batchInsert([("p", [0, 0], nil), ("q", [1, 0], nil)])
         try await ivf.optimize()
         // Query near [0,0] should return p
         var res = try await ivf.search(query: [0.01, 0], k: 1, filter: nil)
@@ -19,7 +19,7 @@ final class IVFListMaintenanceTests: XCTestCase {
 
     func testRemoveUpdatesLists() async throws {
         let ivf = IVFIndex(dimension: 2, metric: .euclidean, config: .init(nlist: 2, nprobe: 2))
-        try await ivf.batchInsert([("p", [0,0], nil), ("q", [1,0], nil)])
+        try await ivf.batchInsert([("p", [0, 0], nil), ("q", [1, 0], nil)])
         try await ivf.optimize()
         try await ivf.remove(id: "q")
         let res = try await ivf.search(query: [0.9, 0], k: 1, filter: nil)

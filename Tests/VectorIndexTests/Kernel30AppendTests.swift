@@ -51,8 +51,8 @@ final class Kernel30AppendTests: XCTestCase {
         var unpacked = [UInt8](repeating: 0, count: 2*m)
         for i in 0..<(2*m) { unpacked[i] = UInt8(i & 0x0F) }
         // Append unpacked
-        var listIDs: [Int32] = [0,0]
-        var extIDs: [UInt64] = [1,2]
+        var listIDs: [Int32] = [0, 0]
+        var extIDs: [UInt64] = [1, 2]
         var localOpts = h.opts; localOpts.pack4_unpacked = true
         try ivf_append(list_ids: listIDs, external_ids: extIDs, codes: unpacked, n: 2, m: m, index: h, opts: localOpts, internalIDsOut: nil)
         // Repack locally to compare
@@ -79,24 +79,24 @@ final class Kernel30AppendTests: XCTestCase {
         opts.reserve_min = 2
         let d = 4
         let h = try IVFListHandle(k_c: 1, m: 0, d: d, opts: opts)
-        let listIDs: [Int32] = [0,0]
-        let extIDs: [UInt64] = [10,11]
-        let xb: [Float] = [1,2,3,4,   5,6,7,8]
+        let listIDs: [Int32] = [0, 0]
+        let extIDs: [UInt64] = [10, 11]
+        let xb: [Float] = [1, 2, 3, 4, 5, 6, 7, 8]
         try ivf_append_flat(list_ids: listIDs, external_ids: extIDs, xb: xb, n: 2, d: d, index: h, opts: h.opts, internalIDsOut: nil)
         let stats = try h.getListStats(listID: 0)
         XCTAssertEqual(stats.length, 2)
         // Insert at position 1
         let insIDs: [UInt64] = [99]
-        let insXB: [Float] = [9,9,9,9]
+        let insXB: [Float] = [9, 9, 9, 9]
         try ivf_insert_at_flat(list_id: 0, pos: 1, external_ids: insIDs, xb: insXB, n: 1, index: h)
         let stats2 = try h.getListStats(listID: 0)
         XCTAssertEqual(stats2.length, 3)
         // Check ordering: [1..4], [9..9], [5..8]
         let (_, _, _, _, xbPtr) = try h.readList(listID: 0)
         let values = Array(UnsafeBufferPointer<Float>(start: xbPtr, count: 3*d))
-        XCTAssertEqual(Array(values[0..<4]), [1,2,3,4])
-        XCTAssertEqual(Array(values[4..<8]), [9,9,9,9])
-        XCTAssertEqual(Array(values[8..<12]), [5,6,7,8])
+        XCTAssertEqual(Array(values[0..<4]), [1, 2, 3, 4])
+        XCTAssertEqual(Array(values[4..<8]), [9, 9, 9, 9])
+        XCTAssertEqual(Array(values[8..<12]), [5, 6, 7, 8])
     }
 
     func testDurablePQ8AppendWithRemap() throws {

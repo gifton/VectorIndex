@@ -221,7 +221,7 @@ public extension IndexOps.Rerank {
         if enabled {
             v.sort { (a, b) -> Bool in
                 if a.seg != b.seg { return a.seg < b.seg }
-                if a.id  != b.id  { return a.id  < b.id }
+                if a.id  != b.id { return a.id  < b.id }
                 return a.idx < b.idx
             }
         }
@@ -301,8 +301,8 @@ public extension IndexOps.Rerank {
         let workers = opts.maxConcurrency > 0 ? opts.maxConcurrency : max(1, min(tiles, ProcessInfo.processInfo.activeProcessorCount))
 
         // Wrap non-Sendable references safely for capture
-        struct _SendableBox<T>: @unchecked Sendable { let value: T }
-        let readerBox = _SendableBox(value: reader)
+        struct SendableBox<T>: @unchecked Sendable { let value: T }
+        let readerBox = SendableBox(value: reader)
         let qAddr = UInt(bitPattern: q)
         let outAddr = UInt(bitPattern: scoresOut)
         let maskAddr = presentMaskOut.map { UInt(bitPattern: $0) } ?? 0
@@ -642,7 +642,7 @@ public extension IndexOps.Rerank {
         scoresOut: UnsafeMutablePointer<Float>
     ) {
         #if VINDEX_TELEM
-        let _ = TELEM_TIMER_GUARD(.t_rerank)
+        _ = TELEM_TIMER_GUARD(.t_rerank)
         TELEM_FLAG(.used_prefetch) // advisory; locality reorder acts as prefetch surrogate
         if metric == .cosine { TELEM_FLAG(.used_cosine) }
         TELEM_INC(.vecs_scored, UInt64(C))

@@ -14,12 +14,12 @@ final class JournalFilterAdvancedTests: XCTestCase {
         let f = JournalFilter().dateBetween(start, end).build()
 
         // Fractional seconds
-        XCTAssertTrue(f(["date":"2025-01-01T12:34:56.789Z"]))
+        XCTAssertTrue(f(["date": "2025-01-01T12:34:56.789Z"]))
         // Timezone offset (+05:00), should parse and compare in absolute time
-        XCTAssertTrue(f(["date":"2025-01-01T05:00:00+05:00"]))
+        XCTAssertTrue(f(["date": "2025-01-01T05:00:00+05:00"]))
         // Outside range
-        XCTAssertFalse(f(["date":"2024-12-31T23:59:59Z"]))
-        XCTAssertFalse(f(["date":"2025-01-02T00:00:01Z"]))
+        XCTAssertFalse(f(["date": "2024-12-31T23:59:59Z"]))
+        XCTAssertFalse(f(["date": "2025-01-02T00:00:01Z"]))
     }
 
     func testDateBoundaryInclusive() {
@@ -27,8 +27,8 @@ final class JournalFilterAdvancedTests: XCTestCase {
         let start = fmt.date(from: "2025-01-01T00:00:00Z")!
         let end   = fmt.date(from: "2025-01-31T23:59:59Z")!
         let f = JournalFilter().dateBetween(start, end).build()
-        XCTAssertTrue(f(["date":"2025-01-01T00:00:00Z"]))
-        XCTAssertTrue(f(["date":"2025-01-31T23:59:59Z"]))
+        XCTAssertTrue(f(["date": "2025-01-01T00:00:00Z"]))
+        XCTAssertTrue(f(["date": "2025-01-31T23:59:59Z"]))
     }
 
     func testInvalidDateStringHandling() {
@@ -37,21 +37,21 @@ final class JournalFilterAdvancedTests: XCTestCase {
         let end   = fmt.date(from: "2025-01-31T23:59:59Z")!
         let jf = JournalFilter().dateBetween(start, end)
         // Invalid string → should be treated as not in range (false), even if allowMissingKeys = true
-        XCTAssertFalse(jf.build()(["date":"not-a-date"]))
-        XCTAssertFalse(jf.allowMissingKeys(true).build()(["date":"not-a-date"]))
+        XCTAssertFalse(jf.build()(["date": "not-a-date"]))
+        XCTAssertFalse(jf.allowMissingKeys(true).build()(["date": "not-a-date"]))
     }
 
     // MARK: - Tags & Delimiters
 
     func testTagsSemicolonDelimiter() {
-        let meta = ["tags":"work; journal ; mood "]
+        let meta = ["tags": "work; journal ; mood "]
         let jf = JournalFilter().setKeys(tagsKey: "tags", delimiter: ";").includingTags(["journal"]) // any
         XCTAssertTrue(jf.build()(meta))
         XCTAssertFalse(jf.includingTags(["sleep"]).build()(meta))
     }
 
     func testTagsWhitespaceAndCase() {
-        let meta = ["tags":"Work, Journal, Mood "]
+        let meta = ["tags": "Work, Journal, Mood "]
         // Case-sensitive match (current behavior):
         XCTAssertTrue(JournalFilter().includingTags(["Work"]).build()(meta))
         XCTAssertFalse(JournalFilter().includingTags(["work"]).build()(meta))
@@ -59,20 +59,20 @@ final class JournalFilterAdvancedTests: XCTestCase {
 
     func testIncludeTagsEmptyArrayBehavior() {
         // Including empty set results in a filter that rejects all (current semantics)
-        let meta = ["tags":"x,y"]
+        let meta = ["tags": "x,y"]
         let jf = JournalFilter().includingTags([])
         XCTAssertFalse(jf.build()(meta))
     }
 
     func testExcludingTagsEmptyArrayBehavior() {
         // Excluding empty set does nothing
-        let meta = ["tags":"x,y"]
+        let meta = ["tags": "x,y"]
         let jf = JournalFilter().excludingTags([])
         XCTAssertTrue(jf.build()(meta))
     }
 
     func testIncludeExcludeCombined() {
-        let meta = ["tags":"journal, public"]
+        let meta = ["tags": "journal, public"]
         let jf = JournalFilter()
             .includingTags(["journal"]) // must include
             .excludingTags(["private"]) // must not include
@@ -97,7 +97,7 @@ final class JournalFilterAdvancedTests: XCTestCase {
     // MARK: - Custom Predicates
 
     func testCustomPredicateOrderAndRejection() {
-        let meta = ["tags":"journal", "title":""]
+        let meta = ["tags": "journal", "title": ""]
         let jf = JournalFilter()
             .includingTags(["journal"]) // passes
             .and { m in !(m["title"]?.isEmpty ?? true) } // rejects
@@ -110,8 +110,8 @@ final class JournalFilterAdvancedTests: XCTestCase {
         let fmt = ISO8601DateFormatter(); fmt.formatOptions = [.withInternetDateTime]
         let start = fmt.date(from: "2025-01-01T00:00:00Z")!
         let end   = fmt.date(from: "2025-01-31T23:59:59Z")!
-        let metaA = ["date":"2025-01-05T00:00:00Z", "tags":"x,y"]
-        let metaB = ["date":"2024-12-31T23:59:59Z", "tags":"x,y"]
+        let metaA = ["date": "2025-01-05T00:00:00Z", "tags": "x,y"]
+        let metaB = ["date": "2024-12-31T23:59:59Z", "tags": "x,y"]
 
         let f1 = JournalFilter()
             .dateBetween(start, end)
@@ -129,7 +129,7 @@ final class JournalFilterAdvancedTests: XCTestCase {
 
     func testConcurrentInvoke() async {
         let f = JournalFilter().includingTags(["a"]).build()
-        let metas: [[String:String]] = (0..<100).map { i in
+        let metas: [[String: String]] = (0..<100).map { i in
             ["tags": (i % 2 == 0) ? "a,b" : "b,c"]
         }
         await withTaskGroup(of: Bool.self) { group in
@@ -140,4 +140,3 @@ final class JournalFilterAdvancedTests: XCTestCase {
         }
     }
 }
-

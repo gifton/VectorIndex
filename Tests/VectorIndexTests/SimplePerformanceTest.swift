@@ -1,8 +1,8 @@
-//import XCTest
-//import VectorCore
-//@testable import VectorIndex
+// import XCTest
+// import VectorCore
+// @testable import VectorIndex
 //
-//final class SimplePerformanceTest: XCTestCase {
+// final class SimplePerformanceTest: XCTestCase {
 //    
 //    func testHNSWvsFlat() async throws {
 //        print("\n=== VectorIndex Performance Evaluation ===\n")
@@ -142,4 +142,4 @@
 //        print("\nGPU Acceleration: NOT IMPLEMENTED")
 //        print("Current implementation is CPU-only")
 //    }
-//}
+// }

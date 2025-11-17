@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //  ResidualKernel.swift
 //  VectorIndex
 //
@@ -36,7 +36,7 @@
 //
 //  Spec: kernel-specs/23_residuals.md
 //  Status: Production Ready
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import Foundation
 import Accelerate
@@ -321,7 +321,7 @@ public func residuals_f32_inplace(
                 j += 8
             }
             while j < d {
-                vec[j] = vec[j] - cen[j]
+                vec[j] -= cen[j]
                 j += 1
             }
         }
@@ -350,7 +350,7 @@ internal func _residuals_grouped(
     }
 
     // 1) counts per centroid
-    var counts = Array<Int>(repeating: 0, count: kc)
+    var counts = [Int](repeating: 0, count: kc)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
@@ -367,12 +367,12 @@ internal func _residuals_grouped(
     }
 
     // 2) offsets (prefix sum)
-    var offsets = Array<Int>(repeating: 0, count: kc + 1)
+    var offsets = [Int](repeating: 0, count: kc + 1)
     for c in 0..<kc { offsets[c + 1] = offsets[c] + counts[c] }
 
     // 3) grouped indices
-    var cursor = Array<Int>(repeating: 0, count: kc)
-    var grouped = Array<Int>(repeating: 0, count: nInt)
+    var cursor = [Int](repeating: 0, count: kc)
+    var grouped = [Int](repeating: 0, count: nInt)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         let pos = offsets[a] + cursor[a]
@@ -435,7 +435,7 @@ internal func _residuals_grouped_inplace(
             .build()
     }
 
-    var counts = Array<Int>(repeating: 0, count: kc)
+    var counts = [Int](repeating: 0, count: kc)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
@@ -450,11 +450,11 @@ internal func _residuals_grouped_inplace(
         }
         counts[a] += 1  // ✅ Fixed: regular += instead of &+=
     }
-    var offsets = Array<Int>(repeating: 0, count: kc + 1)
+    var offsets = [Int](repeating: 0, count: kc + 1)
     for c in 0..<kc { offsets[c + 1] = offsets[c] + counts[c] }
 
-    var cursor = Array<Int>(repeating: 0, count: kc)
-    var grouped = Array<Int>(repeating: 0, count: nInt)
+    var cursor = [Int](repeating: 0, count: kc)
+    var grouped = [Int](repeating: 0, count: nInt)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         let pos = offsets[a] + cursor[a]
@@ -489,7 +489,7 @@ internal func _residuals_grouped_inplace(
                     j += 8
                 }
                 while j < d {
-                    vec[j] = vec[j] - cen[j]
+                    vec[j] -= cen[j]
                     j += 1
                 }
             }

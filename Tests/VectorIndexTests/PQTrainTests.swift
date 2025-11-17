@@ -98,7 +98,7 @@ final class PQTrainTests: XCTestCase {
 
     func testDeterministicReproducibility() throws {
         // Same seed → same codebooks (bit-exact)
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         let n: Int64 = 2000
         let d = 128
         let m = 4
@@ -146,7 +146,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testNumericalStability() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test with large dataset to expose accumulation errors
         let n: Int64 = 10_000
         let d = 1024
@@ -179,7 +179,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testDistortionDecreases() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Distortion should decrease (or stay same) each iteration
         let n: Int64 = 3000
         let d = 128
@@ -214,7 +214,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Residual PQ Tests
 
     func testResidualPQ() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test residual PQ mode (IVF-PQ)
         let n: Int64 = 2000
         let d = 256
@@ -262,7 +262,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testResidualVsDirectPQ() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Residual PQ should achieve lower distortion on clustered data
         let n: Int64 = 3000
         let d = 128
@@ -350,7 +350,7 @@ final class PQTrainTests: XCTestCase {
         seedCfg.verbose = false
 
         var seedCodebooks = [Float]()
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         let seedStats = try pq_train_f32(
             x: x, n: n, d: d, m: m, ks: ks,
             cfg: seedCfg,
@@ -402,7 +402,7 @@ final class PQTrainTests: XCTestCase {
         seedCfg.verbose = false
 
         var seedCodebooks = [Float]()
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         _ = try pq_train_f32(
             x: x, n: n, d: d, m: m, ks: ks,
             cfg: seedCfg,
@@ -454,7 +454,7 @@ final class PQTrainTests: XCTestCase {
         seedCfg.verbose = false
 
         var initCodebooks = [Float]()
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         _ = try pq_train_f32(
             x: x, n: n, d: d, m: m, ks: ks,
             cfg: seedCfg,
@@ -497,7 +497,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Edge Case Tests
 
     func testEmptyClusterRepair() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test empty cluster repair with pathological data
         let n: Int64 = 500
         let d = 64
@@ -530,7 +530,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testMinimumData() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test with n == ks (minimum viable data)
         let n: Int64 = 64
         let d = 128
@@ -556,7 +556,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testInsufficientData() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Should throw error when n < ks
         let n: Int64 = 50
         let ks = 100
@@ -583,7 +583,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testInvalidDimension() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Should throw error when d not divisible by m
         var x = [Float](repeating: 0, count: 1000 * 100)
         var codebooks = [Float]()
@@ -610,7 +610,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Streaming API Tests
 
     func testStreamingPQTraining() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test streaming API with chunked data
         let n: Int64 = 5000
         let d = 256
@@ -658,7 +658,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Performance Validation Tests
 
     func testLargeScaleTraining() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test with realistic production scale
         let n: Int64 = 50_000
         let d = 768
@@ -696,7 +696,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testParallelExecution() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Verify parallel execution works correctly
         let n: Int64 = 10_000
         let d = 512
@@ -750,7 +750,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Compression Quality Tests
 
     func testCompressionQuality() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Verify PQ achieves reasonable compression vs quality trade-off
         let n: Int64 = 5000
         let d = 1024

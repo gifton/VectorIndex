@@ -47,7 +47,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         self.rng35 = HNSWXoroRNGState.from(seed: self.config.rngSeed, stream: self.config.rngStream)
     }
 
-    public func insert(id: VectorID, vector: [Float], metadata: [String : String]?) async throws {
+    public func insert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
         try checkVector(vector)
         try await internalInsert(id: id, vector: vector, metadata: metadata)
     }
@@ -69,7 +69,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String : String]?)]) async throws {
+    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?)]) async throws {
         for item in items { try await insert(id: item.id, vector: item.vector, metadata: item.metadata) }
     }
 
@@ -77,7 +77,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         // Minimal: no-op; future: rebuild/prune
     }
 
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
         guard k > 0 else { return [] }
         try checkVector(query)
         guard let ep = entryPoint else { return [] }
@@ -155,7 +155,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
         var out: [[SearchResult]] = []
         out.reserveCapacity(queries.count)
         for q in queries { out.append(try await search(query: q, k: k, filter: filter)) }
@@ -181,7 +181,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         return false
     }
 
-    public func update(id: VectorID, vector: [Float]?, metadata: [String : String]?) async throws -> Bool {
+    public func update(id: VectorID, vector: [Float]?, metadata: [String: String]?) async throws -> Bool {
         guard let idx = idToIndex[id] else { return false }
         var newVec = nodes[idx].vector
         var newMeta = nodes[idx].metadata
@@ -230,14 +230,14 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     private struct Node {
         let id: VectorID
         var vector: [Float]
-        var metadata: [String:String]?
+        var metadata: [String: String]?
         let level: Int
         var neighbors: [[Int]] // per level neighbor indices
         var isDeleted: Bool
     }
 
     private var nodes: [Node] = []
-    private var idToIndex: [VectorID:Int] = [:]
+    private var idToIndex: [VectorID: Int] = [:]
     private var entryPoint: Int?
     private var maxLevel: Int = 0
     private var activeCount: Int = 0
@@ -248,14 +248,14 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     private var csrOffsetsCache: [[Int32]] = []      // per-layer CSR offsets [N+1]
     private var csrNeighborsCache: [[Int32]] = []    // per-layer neighbor lists (flat)
     private var xbFlatCache: [Float] = []            // [N * d] row-major vectors
-    private var invNormsCache: [Float]? = nil        // optional: inverse L2 norms for cosine
+    private var invNormsCache: [Float]?        // optional: inverse L2 norms for cosine
 
     private var csrDirty: Bool = true
     private var xbDirty: Bool = true
     private var invNormsDirty: Bool = true
 
     // MARK: - Insertion
-    private func internalInsert(id: VectorID, vector: [Float], metadata: [String:String]?) async throws {
+    private func internalInsert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
         if idToIndex[id] != nil { // replace existing vector: simple remove then reinsert
             try await remove(id: id)
         }
@@ -637,7 +637,7 @@ extension HNSWIndex {
         // Remove deleted nodes and reindex neighbor lists by remapping indices
         var newNodes: [Node] = []
         newNodes.reserveCapacity(activeCount)
-        var remap: [Int:Int] = [:] // old -> new
+        var remap: [Int: Int] = [:] // old -> new
         for (oldIdx, n) in nodes.enumerated() {
             if !n.isDeleted { remap[oldIdx] = newNodes.count; newNodes.append(n) }
         }

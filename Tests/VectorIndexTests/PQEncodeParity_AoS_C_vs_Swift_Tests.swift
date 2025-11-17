@@ -102,4 +102,3 @@ final class PQEncodeParity_AoS_C_vs_Swift_Tests: XCTestCase {
         XCTAssertEqual(swiftCodes, cCodes)
     }
 }
-

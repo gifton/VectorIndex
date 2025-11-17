@@ -14,7 +14,7 @@ struct PersistedIndex: Codable {
 struct PersistedRecord: Codable {
     let id: String
     let vector: [Float]
-    let metadata: [String:String]?
+    let metadata: [String: String]?
 }
 
 extension SupportedDistanceMetric {
@@ -22,4 +22,3 @@ extension SupportedDistanceMetric {
         SupportedDistanceMetric(rawValue: raw) ?? .euclidean
     }
 }
-

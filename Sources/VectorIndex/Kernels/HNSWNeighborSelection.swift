@@ -32,7 +32,7 @@ public struct HNSWNeighborSelectionTelemetry {
 }
 
 public enum HNSWNeighborSelectionRecorder {
-    public nonisolated(unsafe) static var record: ((HNSWNeighborSelectionTelemetry) -> Void)? = nil
+    public nonisolated(unsafe) static var record: ((HNSWNeighborSelectionTelemetry) -> Void)?
 }
 
 // MARK: - Distance kernels (fallback; replaceable by ScoreBlock)

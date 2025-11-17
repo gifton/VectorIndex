@@ -89,7 +89,7 @@ public struct S2Xoroshiro128 {
     /// - Returns: Uniformly distributed UInt32 (upper 32 bits of nextU64)
     @inlinable
     public mutating func nextU32() -> UInt32 {
-        return UInt32(truncatingIfNeeded: nextU64() >> 32)
+        UInt32(truncatingIfNeeded: nextU64() >> 32)
     }
 
     /// Generate random float in [0, 1).
@@ -115,7 +115,7 @@ public struct S2Xoroshiro128 {
     @inline(__always)
     @usableFromInline
     internal func rotl(_ x: UInt64, _ k: Int) -> UInt64 {
-        return (x << k) | (x >> (64 - k))
+        (x << k) | (x >> (64 - k))
     }
 
     /// Create a new independent RNG by jumping ahead 2^64 steps.
@@ -610,7 +610,7 @@ public func dequantizeAffine(
 /// - Returns: Packed byte
 @inline(__always)
 public func packPair(_ lo: UInt8, _ hi: UInt8) -> UInt8 {
-    return (lo & 0x0F) | ((hi & 0x0F) << 4)
+    (lo & 0x0F) | ((hi & 0x0F) << 4)
 }
 
 /// Unpack byte into two 4-bit values.
@@ -620,7 +620,7 @@ public func packPair(_ lo: UInt8, _ hi: UInt8) -> UInt8 {
 /// - Returns: Tuple of (low nibble, high nibble)
 @inline(__always)
 public func unpackPair(_ packed: UInt8) -> (lo: UInt8, hi: UInt8) {
-    return (packed & 0x0F, packed >> 4)
+    (packed & 0x0F, packed >> 4)
 }
 
 /// Pack array of 4-bit indices into packed u4 format.
@@ -667,19 +667,19 @@ public func unpackNibblesU4(
 /// Load 16-bit little-endian value from memory.
 @inline(__always)
 public func load16LE(_ p: UnsafeRawPointer) -> UInt16 {
-    return p.load(as: UInt16.self).littleEndian
+    p.load(as: UInt16.self).littleEndian
 }
 
 /// Load 32-bit little-endian value from memory.
 @inline(__always)
 public func load32LE(_ p: UnsafeRawPointer) -> UInt32 {
-    return p.load(as: UInt32.self).littleEndian
+    p.load(as: UInt32.self).littleEndian
 }
 
 /// Load 64-bit little-endian value from memory.
 @inline(__always)
 public func load64LE(_ p: UnsafeRawPointer) -> UInt64 {
-    return p.load(as: UInt64.self).littleEndian
+    p.load(as: UInt64.self).littleEndian
 }
 
 /// Store 16-bit value as little-endian.
@@ -737,5 +737,5 @@ public func isAligned(_ ptr: UnsafeRawPointer, to alignment: Int) -> Bool {
 /// - Returns: Padded length
 @inline(__always)
 public func padTo(_ length: Int, multiple: Int) -> Int {
-    return ((length + multiple - 1) / multiple) * multiple
+    ((length + multiple - 1) / multiple) * multiple
 }

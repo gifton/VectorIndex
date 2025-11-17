@@ -98,4 +98,3 @@ final class PQEncodeParity_SwiftOnly_Tests: XCTestCase {
         XCTAssertEqual(codes1, codes2)
     }
 }
-

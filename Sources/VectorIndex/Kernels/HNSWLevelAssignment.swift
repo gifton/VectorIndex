@@ -44,7 +44,7 @@ public struct HNSWXoroRNGState {
     }
 
     @inline(__always) private mutating func rotl(_ x: UInt64, _ k: UInt64) -> UInt64 {
-        return (x << k) | (x >> (64 &- k))
+        (x << k) | (x >> (64 &- k))
     }
 
     /// Next 64 random bits.

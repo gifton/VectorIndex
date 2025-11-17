@@ -772,7 +772,7 @@ func rangeScanL2_earlyExit(
 @usableFromInline
 @inline(__always)
 internal func estimateTypicalL2Distance(dimension d: Int) -> Float {
-    return sqrt(Float(max(1, d)))
+    sqrt(Float(max(1, d)))
 }
 
 // =======================================================================

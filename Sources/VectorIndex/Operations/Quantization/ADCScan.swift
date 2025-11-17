@@ -308,14 +308,14 @@ private func scanU8Interleaved(
 
             // Initialize sums for vectors in this block
             // g is typically <= 8; we allocate a small stack-like array
-            var sums = Array<Float>(repeating: 0, count: blockSize)
+            var sums = [Float](repeating: 0, count: blockSize)
 
             let blockCodes = codesBase + block * blockSpan
 
             if doKahan {
                 // Kahan per vector
-                var sum = Array<Float>(repeating: 0, count: blockSize)
-                var comp = Array<Float>(repeating: 0, count: blockSize)
+                var sum = [Float](repeating: 0, count: blockSize)
+                var comp = [Float](repeating: 0, count: blockSize)
 
                 var j = 0
                 while j < m {
@@ -474,8 +474,8 @@ private func scanU4Interleaved(
             let blockCodes = codesBase + block * blockSpanBytes
 
             if doKahan {
-                var sum = Array<Float>(repeating: 0, count: blockSize)
-                var comp = Array<Float>(repeating: 0, count: blockSize)
+                var sum = [Float](repeating: 0, count: blockSize)
+                var comp = [Float](repeating: 0, count: blockSize)
 
                 var jp = 0
                 while jp < pairs {
@@ -511,7 +511,7 @@ private func scanU4Interleaved(
                     outBase[baseIndex + v] = sum[v] + bias
                 }
             } else {
-                var sums = Array<Float>(repeating: 0, count: blockSize)
+                var sums = [Float](repeating: 0, count: blockSize)
                 var jp = 0
                 while jp < pairs {
                     let j0 = 2 * jp

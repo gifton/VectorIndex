@@ -53,4 +53,3 @@ public extension IndexOps.Batch {
         return (ids2D, scores2D)
     }
 }
-

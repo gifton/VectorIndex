@@ -1,10 +1,10 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //  IDFilter.swift
 //  VectorIndex
 //
 //  High-performance allow/deny bitset filtering over dense internal IDs.
 //  CPU-only, no allocations in hot paths; stable compaction for (ids,scores).
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import Foundation
 
@@ -67,7 +67,11 @@ public struct IDFilterBitset {
     /// Set the given ID bit to the specified value (build/update-time only).
     @inlinable
     public mutating func set(id: Int64, value: Bool) {
-        value ? set(id: id) : clear(id: id)
+        if value {
+            set(id: id)
+        } else {
+            clear(id: id)
+        }
     }
 
     // MARK: Allocation helpers (for tests/tools)
@@ -229,7 +233,7 @@ public func idFilterMaskN(
 
     // Map to at most 4 allows + optional deny.
     var allowPtrs: [UnsafePointer<UInt64>?] = [nil, nil, nil, nil]
-    var denyPtr: UnsafePointer<UInt64>? = nil
+    var denyPtr: UnsafePointer<UInt64>?
 
     var aIdx = 0
     for f in 0..<F {
@@ -437,7 +441,6 @@ public struct IDFilterTelemetry {
 }
 // Spec: lightweight telemetry fields for profiling.  [oai_citation:11‡08_id_filter.md](file-service://file-TWS7TvB6rB2nnbH7j3o5hw)
 
-
 // MARK: - Convenience Extensions
 
 extension IDFilterBitset {
@@ -451,7 +454,7 @@ extension IDFilterBitset {
         idsOut: UnsafeMutablePointer<Int64>,
         scoresOut: UnsafeMutablePointer<Float>?
     ) -> Int {
-        return idFilterCompact(
+        idFilterCompact(
             bitset: readOnly,
             idsIn: ids,
             scoresIn: scores,
@@ -466,6 +469,6 @@ extension IDFilterBitset {
     /// Convenience: test ID with mode using instance method.
     @inline(__always)
     public func passes(id: Int64, mode: FilterMode) -> Bool {
-        return idFilterPass(bitset: readOnly, id: id, capacity: capacity, mode: mode)
+        idFilterPass(bitset: readOnly, id: id, capacity: capacity, mode: mode)
     }
 }

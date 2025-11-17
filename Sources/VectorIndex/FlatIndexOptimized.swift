@@ -30,8 +30,8 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
     private var freeOffsets: Set<Int> = []
 
     // Optional fused-cosine norms cache (lifetime-bound to this index)
-    private var cosineNormCache: IndexOps.Support.Norms.NormCache? = nil
-    private var cosineNormsHandle: IndexOps.Scoring.ScoreBlock.CosineNormsHandle? = nil
+    private var cosineNormCache: IndexOps.Support.Norms.NormCache?
+    private var cosineNormsHandle: IndexOps.Scoring.ScoreBlock.CosineNormsHandle?
     
     public var count: Int { idToOffset.count }
     
@@ -42,7 +42,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         self.vectorStorage.reserveCapacity(1000 * dimension) // Initial capacity
     }
     
-    public func insert(id: VectorID, vector: [Float], metadata: [String : String]?) async throws {
+    public func insert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
         guard vector.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: vector.count)
         }
@@ -78,7 +78,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         }
     }
     
-    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String : String]?)]) async throws {
+    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?)]) async throws {
         // Pre-allocate space for efficiency
         let newItemCount = items.count - items.compactMap { idToOffset[$0.id] }.count
         vectorStorage.reserveCapacity(vectorStorage.count + newItemCount * dimension)
@@ -113,7 +113,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         cosineNormsHandle = nil
     }
     
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
@@ -171,7 +171,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         return results.prefix(k).map { SearchResult(id: $0.0, score: $0.1) }
     }
     
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
         var output: [[SearchResult]] = []
         output.reserveCapacity(queries.count)
         for query in queries {
@@ -207,7 +207,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         idToOffset[id] != nil
     }
     
-    public func update(id: VectorID, vector: [Float]?, metadata: [String : String]?) async throws -> Bool {
+    public func update(id: VectorID, vector: [Float]?, metadata: [String: String]?) async throws -> Bool {
         guard let offset = idToOffset[id] else { return false }
         
         if let vector = vector {
@@ -286,7 +286,7 @@ extension FlatIndexOptimized {
     /// Falls back by throwing if layout isn't suitable.
     fileprivate func fastSearchWithMicrokernels(query: [Float], k: Int) -> [SearchResult]? {
         // Storage must be fully compact: no holes and contiguous offsets
-        guard freeOffsets.isEmpty, idToOffset.count > 0 else { return nil }
+        guard freeOffsets.isEmpty, !idToOffset.isEmpty else { return nil }
         guard vectorStorage.count == idToOffset.count * dimension else { return nil }
 
         // Only support metrics that map directly to kernels for now
@@ -324,7 +324,7 @@ extension FlatIndexOptimized {
         let ordering = IndexOps.Selection.ordering(for: metric)
         let heap = idsIdx.withUnsafeBufferPointer { ip -> IndexOps.Selection.TopKHeap in
             distances.withUnsafeBufferPointer { sp in
-                return IndexOps.Selection.selectTopK(
+                IndexOps.Selection.selectTopK(
                     scores: sp.baseAddress!,
                     ids: ip.baseAddress!,
                     count: sorted.count,
@@ -372,7 +372,7 @@ extension FlatIndexOptimized {
     public func enableCosineFusedNormCache(dtype: IndexOps.Support.Norms.NormDType = .float16) async throws {
         guard metric == .cosine else { return }
         // Require compact contiguous storage
-        guard freeOffsets.isEmpty, idToOffset.count > 0 else { return }
+        guard freeOffsets.isEmpty, !idToOffset.isEmpty else { return }
         guard vectorStorage.count == idToOffset.count * dimension else { return }
 
         var nc = IndexOps.Support.Norms.NormCache(count: idToOffset.count, dimension: dimension, mode: .inv, invDType: dtype, epsilon: 1e-12)
@@ -400,7 +400,7 @@ extension FlatIndexOptimized {
                 mode: IndexOps.Support.Norms.NormMode.inv,
                 epsilon: eps,
                 invOut: invOut,
-                sqOut: UnsafeMutablePointer<Float>? (nil),
+                sqOut: UnsafeMutablePointer<Float>?(nil),
                 invDType: dt
             )
         }
@@ -471,7 +471,7 @@ extension FlatIndexOptimized {
     }
     
     public func getIndexStructure() async -> IndexStructure {
-        return .flat
+        .flat
     }
     
     public func finalizeResults(

@@ -318,7 +318,7 @@ final class IVFSelectTests: XCTestCase {
 
         var ids1 = [Int32](repeating: -1, count: nprobe)
         var ids2 = [Int32](repeating: -1, count: nprobe)
-        var nilScores: [Float]? = nil
+        var nilScores: [Float]?
 
         // Run twice
         ivf_select_nprobe_f32(
@@ -507,7 +507,7 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVectors(n: kc, d: d)
 
         var ids = [Int32](repeating: -1, count: nprobe)
-        var nilScores: [Float]? = nil
+        var nilScores: [Float]?
 
         ivf_select_nprobe_f32(
             q: q, d: d, centroids: centroids, kc: kc,
@@ -562,7 +562,7 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVector(d: d)
 
         var ids = [Int32](repeating: -1, count: nprobe)
-        var nilScores: [Float]? = nil
+        var nilScores: [Float]?
 
         ivf_select_nprobe_f32(
             q: q, d: d, centroids: centroids, kc: kc,

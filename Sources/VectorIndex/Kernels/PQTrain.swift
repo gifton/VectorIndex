@@ -74,7 +74,7 @@ struct SubspaceResults {
     var emptiesFixed: Int = 0
     var bytesRead: Int64 = 0
     var codebook: [Float] = []
-    var norms: [Float]? = nil
+    var norms: [Float]?
     var didWarmStart: Bool = false
 }
 
@@ -135,7 +135,7 @@ public func pq_train_f32(
     }
 
     if codebooksOut.count != m * ks * dsub { codebooksOut = .init(repeating: 0, count: m * ks * dsub) }
-    if let _ = centroidNormsOut {
+    if centroidNormsOut != nil {
         if centroidNormsOut!.count != m * ks { centroidNormsOut = .init(repeating: 0, count: m * ks) }
     }
 
@@ -166,7 +166,7 @@ public func pq_train_f32(
 
     let cfgLocal = cfg  // capture immutable copy for tasks
 
-    func runOneSubspace(_ j: Int) {
+    @Sendable func runOneSubspace(_ j: Int) {
         if cfgLocal.verbose { print("[PQTrain] subspace \(j): begin") }
         var rng = Xoroshiro128(splitFrom: cfgLocal.seed, streamID: UInt64(cfgLocal.streamID), taskID: UInt64(j))
         let (idx, ns) = buildSampleIndex(n: n, sampleN: cfgLocal.sampleN, rng: &rng)
@@ -271,7 +271,7 @@ public func pq_train_f32(
         if cfgLocal.verbose { print("[PQTrain] subspace \(j): train done dt=\(tTrainE - tTrainS)s iters=\(iters) emptiesFixed=\(emptiesFixed) distortion=\(distortion)") }
 
         // Compute norms if needed
-        var normsJ: [Float]? = nil
+        var normsJ: [Float]?
         if cfgLocal.computeCentroidNorms {
             var norms = [Float](repeating: 0, count: ks)
             for k in 0..<ks {
@@ -302,7 +302,7 @@ public func pq_train_f32(
 
     if cfg.numThreads <= 1 {
         if cfg.verbose { print("[PQTrain] execution mode: serial (threads<=1)") }
-        var warmStartCount = 0
+//        var warmStartCount = 0
     for j in 0..<m { runOneSubspace(j) }
     } else {
         if cfg.verbose { print("[PQTrain] execution mode: parallel (threads=\(cfg.numThreads))") }
@@ -416,7 +416,7 @@ public func pq_train_streaming_f32(
 
     let dsub = d / m
     if codebooksOut.count != m * ks * dsub { codebooksOut = .init(repeating: 0, count: m * ks * dsub) }
-    if let _ = centroidNormsOut {
+    if centroidNormsOut != nil {
         if centroidNormsOut!.count != m * ks { centroidNormsOut = .init(repeating: 0, count: m * ks) }
     }
 
@@ -458,10 +458,10 @@ public func pq_train_streaming_f32(
                 for (t, gi32) in picks.enumerated() {
                     let g = Int64(gi32)
                     let (c, i) = mapIndex(g)
-                    var xc = xChunks[c]
+                    let xc = xChunks[c]
                     let base = i * d + j * dsub
                     if let coarse = coarseCentroids, let aChunks = assignChunks {
-                        var coarse = coarse
+                        let coarse = coarse
                         let gid = Int(aChunks[c][i])
                         let gbase = gid * d + j * dsub
                         for u in 0..<dsub { tmp[t*dsub + u] = xc[base + u] - coarse[gbase + u] }
@@ -476,10 +476,10 @@ public func pq_train_streaming_f32(
                 var t = 0
                 while t < sampleN && g < totalN {
                     let (c, i) = mapIndex(g)
-                    var xc = xChunks[c]
+                    let xc = xChunks[c]
                     let base = i * d + j * dsub
                     if let coarse = coarseCentroids, let aChunks = assignChunks {
-                        var coarse = coarse
+                        let coarse = coarse
                         let gid = Int(aChunks[c][i])
                         let gbase = gid * d + j * dsub
                         for u in 0..<dsub { tmp[t*dsub + u] = xc[base + u] - coarse[gbase + u] }
@@ -522,7 +522,7 @@ public func pq_train_streaming_f32(
             }
             // Pass-level empty repair for streaming
             var emptyKs: [Int] = []
-            for k in 0..<ks { if globalCounts[k] == 0 { emptyKs.append(k) } }
+            for k in 0..<ks where globalCounts[k] == 0 { emptyKs.append(k) }
             if !emptyKs.isEmpty {
                 // Build a sampled set of global indices across chunks
                 let evalN = Int(min(totalN, Int64(cfg.streamingRepairEvalN)))
@@ -538,7 +538,7 @@ public func pq_train_streaming_f32(
                     }
                     // Precompute min distance per sampled point
                     var mins = [Float](repeating: 0, count: evalN)
-                    var pts: [(c: Int, i: Int)] = Array(repeating: (0,0), count: evalN)
+                    var pts: [(c: Int, i: Int)] = Array(repeating: (0, 0), count: evalN)
                     for t in 0..<evalN {
                         let g = Int64(rng.uniformF64() * Double(totalN))
                         let (c, i) = mapIndex(g)
@@ -892,7 +892,7 @@ private func lloydKMeansSubspace(
     var prevDist = Double.infinity
     var it = 0
 
-    var qnorms: [Float]? = nil
+    var qnorms: [Float]?
     let useDot = (cfg.precomputeXNorm2 && coarse == nil)
     if useDot {
         qnorms = [Float](repeating: 0, count: nI)
@@ -1146,8 +1146,8 @@ private func minibatchKMeansSubspace(
 
         // Pass-level empty repair: operate only on clusters that never received assignments overall
         var emptyKs: [Int] = []
-        for k in 0..<ks {
-            if globalCounts[k] == 0 { emptyKs.append(k) }
+        for k in 0..<ks where globalCounts[k] == 0 {
+            emptyKs.append(k)
         }
         if !emptyKs.isEmpty {
             let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : cfg.distEvalN))
@@ -1179,7 +1179,7 @@ private func minibatchKMeansSubspace(
                     mins[t] = minD
                 }
                 // Select top-|emptyKs| farthest points (largest min distance)
-                let ecount = emptyKs.count
+//                let ecount = emptyKs.count
                 let order = (0..<evalLim).sorted { mins[$0] > mins[$1] }
                 for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
                     let pickIdx = order[rank]

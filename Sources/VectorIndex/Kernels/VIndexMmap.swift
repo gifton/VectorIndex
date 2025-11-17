@@ -327,8 +327,8 @@ internal final class IndexMmap {
         self.fileEndian = fileEndian
         self.tocCount = tocCount
         self.kc = Int(toHost(header.kc, fileEndian: fileEndian))
-        self.d  = Int(toHost(header.d,  fileEndian: fileEndian))
-        self.m  = Int(toHost(header.m,  fileEndian: fileEndian))
+        self.d  = Int(toHost(header.d, fileEndian: fileEndian))
+        self.m  = Int(toHost(header.m, fileEndian: fileEndian))
         self.ks = Int(toHost(header.ks, fileEndian: fileEndian))
         self.N_total = Int(toHost(header.N_total, fileEndian: fileEndian))
         self.codeGroupG = Int(header.code_group_g)
@@ -443,9 +443,9 @@ internal final class IndexMmap {
                 let idsStride = UInt64(readLE32(rec.advanced(by: 40)))
                 let codesStride = UInt64(readLE32(rec.advanced(by: 44)))
                 let vecsStride = UInt64(readLE32(rec.advanced(by: 48)))
-                idsMax   = max(idsMax,   idsOff   &+ cap &* idsStride)
+                idsMax   = max(idsMax, idsOff   &+ cap &* idsStride)
                 codesMax = max(codesMax, codesOff &+ cap &* codesStride)
-                vecsMax  = max(vecsMax,  vecsOff  &+ cap &* vecsStride)
+                vecsMax  = max(vecsMax, vecsOff  &+ cap &* vecsStride)
             }
             tailIDs = idsMax; tailCodes = codesMax; tailVecs = vecsMax
         }
@@ -476,7 +476,7 @@ internal final class IndexMmap {
     }
     // Legacy API retained for compatibility (returns nil; use getListDescriptor instead)
     public func mmapLists() -> (ptr: UnsafeMutablePointer<ListDesc>, kc: Int)? {
-        return nil
+        nil
     }
     public func idsBase() -> UnsafeMutableRawPointer? { secIDs }
     public func codesBase() -> UnsafeMutableRawPointer? { secCodes }
@@ -553,7 +553,7 @@ internal final class IndexMmap {
         // Find packed TOC entry by type
         let tocOff = Int(toHost(header.toc_offset, fileEndian: fileEndian))
         let DISK_TOC_ENTRY_SIZE = 36
-        var idxFound: Int? = nil
+        var idxFound: Int?
         for i in 0..<tocCount {
             let te = UnsafeRawPointer(base).advanced(by: tocOff + i * DISK_TOC_ENTRY_SIZE)
             let tyRaw = readLE32(te.advanced(by: 0))
@@ -980,9 +980,9 @@ internal final class IndexMmap {
                     let idsStride = UInt64(readLE32(rec.advanced(by: 40)))
                     let codesStride = UInt64(readLE32(rec.advanced(by: 44)))
                     let vecsStride = UInt64(readLE32(rec.advanced(by: 48)))
-                    idsMax   = max(idsMax,   idsOff   &+ cap &* idsStride)
+                    idsMax   = max(idsMax, idsOff   &+ cap &* idsStride)
                     codesMax = max(codesMax, codesOff &+ cap &* codesStride)
-                    vecsMax  = max(vecsMax,  vecsOff  &+ cap &* vecsStride)
+                    vecsMax  = max(vecsMax, vecsOff  &+ cap &* vecsStride)
                 }
                 tailIDs = idsMax; tailCodes = codesMax; tailVecs = vecsMax
             }
@@ -995,7 +995,7 @@ internal final class IndexMmap {
         withUnsafeBytes(of: rec.tag) { tmp.replaceSubrange(0..<4, with: $0) }
         withUnsafeBytes(of: rec.listID) { tmp.replaceSubrange(4..<8, with: $0) }
         withUnsafeBytes(of: rec.oldLen) { tmp.replaceSubrange(8..<12, with: $0) }
-        withUnsafeBytes(of: rec.delta)  { tmp.replaceSubrange(12..<16, with: $0) }
+        withUnsafeBytes(of: rec.delta) { tmp.replaceSubrange(12..<16, with: $0) }
         withUnsafeBytes(of: rec.idsOff) { tmp.replaceSubrange(16..<24, with: $0) }
         withUnsafeBytes(of: rec.codesOff) { tmp.replaceSubrange(24..<32, with: $0) }
         withUnsafeBytes(of: rec.vecsOff) { tmp.replaceSubrange(32..<40, with: $0) }
@@ -1050,7 +1050,6 @@ internal final class IndexMmap {
     memcpy(&v, p, 4)
     return UInt32(littleEndian: v)
 }
-
 
 @inline(__always) private func readLE64(_ p: UnsafeRawPointer) -> UInt64 {
     var v: UInt64 = 0

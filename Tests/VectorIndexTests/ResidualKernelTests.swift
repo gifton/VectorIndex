@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //  ResidualKernelTests.swift
 //  VectorIndexTests
 //
@@ -11,7 +11,7 @@
 //  4. testFusedLUTParity - fused vs non-fused LUT
 //  5. testGroupedParity - grouped vs ungrouped processing
 //  6. testResidualThroughput - performance benchmark (>30M vec/s)
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import XCTest
 @testable import VectorIndex
@@ -460,7 +460,7 @@ final class ResidualKernelTests: XCTestCase {
     }
 
     private func generateRandomVector(d: Int) -> [Float] {
-        return generateRandomVectors(n: 1, d: d)
+        generateRandomVectors(n: 1, d: d)
     }
 
     private func generateRandomAssignments(n: Int, kc: Int) -> [Int32] {

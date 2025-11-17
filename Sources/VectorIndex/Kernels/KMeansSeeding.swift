@@ -130,7 +130,7 @@ public struct KMeansSeedStats: Sendable {
     /// Average distance to nearest centroid
     @inlinable
     public var averageDistanceSquared: Double {
-        return totalCost / Double(n)
+        totalCost / Double(n)
     }
 }
 

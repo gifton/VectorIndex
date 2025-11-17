@@ -12,7 +12,6 @@ import Glibc
 // Access S1 mmap API
 // (IndexMmap is defined in VIndexMmap.swift in this target)
 
-
 // The implementation is adapted for integration: durable mode is guarded and
 // requires S1 mmap handle. For now, durable writes are not enabled from this path.
 
@@ -22,7 +21,7 @@ import Glibc
 
 @inline(__always) private func alignedAlloc(_ size: Int, alignment: Int = 64) -> UnsafeMutableRawPointer? {
     precondition(isPowerOfTwo(alignment))
-    var p: UnsafeMutableRawPointer? = nil
+    var p: UnsafeMutableRawPointer?
     let err = posix_memalign(&p, alignment, size)
     return err == 0 ? p : nil
 }
@@ -41,7 +40,7 @@ public struct IVFAppendOpts {
     public var timestamps: Bool = false
     public var concurrency: IVFConcurrencyMode = .perListMultiWriter
     public var durable: Bool = false
-    public var allocator: IVFAllocator? = nil
+    public var allocator: IVFAllocator?
     public static var `default`: IVFAppendOpts { IVFAppendOpts() }
 }
 
@@ -129,7 +128,7 @@ private protocol ListLock { func lock(); func unlock() }
 #if canImport(Darwin)
 private final class UnfairLock: ListLock {
     private var _l = os_unfair_lock()
-    @inline(__always) func lock()   { os_unfair_lock_lock(&_l) }
+    @inline(__always) func lock() { os_unfair_lock_lock(&_l) }
     @inline(__always) func unlock() { os_unfair_lock_unlock(&_l) }
 }
 #else
@@ -142,7 +141,7 @@ private final class MutexLock: ListLock {
         pthread_mutexattr_destroy(&a)
     }
     deinit { pthread_mutex_destroy(&m) }
-    @inline(__always) func lock()   { pthread_mutex_lock(&m) }
+    @inline(__always) func lock() { pthread_mutex_lock(&m) }
     @inline(__always) func unlock() { pthread_mutex_unlock(&m) }
 }
 #endif
@@ -166,7 +165,7 @@ private final class IVFList {
     var ids: IDStorage
     var codes: UnsafeMutablePointer<UInt8>?
     var xb: UnsafeMutablePointer<Float>?
-    var ts: UnsafeMutablePointer<UInt64>? = nil
+    var ts: UnsafeMutablePointer<UInt64>?
     var idsRaw: UnsafeMutableRawPointer?
     var codesRaw: UnsafeMutableRawPointer?
     var xbRaw: UnsafeMutableRawPointer?
@@ -183,8 +182,7 @@ private final class IVFList {
                 .build()
         }
         self.idsRaw = idsBuf
-        if opts.id_bits == 32 { self.ids = .u32(ptr: idsBuf.bindMemory(to: UInt32.self, capacity: capacity)) }
-        else { self.ids = .u64(ptr: idsBuf.bindMemory(to: UInt64.self, capacity: capacity)) }
+        if opts.id_bits == 32 { self.ids = .u32(ptr: idsBuf.bindMemory(to: UInt32.self, capacity: capacity)) } else { self.ids = .u64(ptr: idsBuf.bindMemory(to: UInt64.self, capacity: capacity)) }
         switch index.format {
         case .pq8, .pq4:
             let bytes = capacity * codeBytesPerVector
@@ -227,7 +225,7 @@ public final class IVFListHandle {
     public var opts: IVFAppendOpts
     fileprivate var storage: StorageBackend
     // Optional mmap handle when durable mode is used (internal - low-level persistence)
-    internal var mmapHandle: IndexMmap? = nil
+    internal var mmapHandle: IndexMmap?
     fileprivate var lists: [IVFList] = []
     private var nextInternalID: Int64 = 0
     fileprivate let globalLock: any ListLock = makeLock()
@@ -555,7 +553,7 @@ private func growList(_ list: IVFList, codeBytesPerVec: Int, dFlat: Int, opts: I
             .build()
     }
     let newIDs: IDStorage = (opts.id_bits == 32) ? .u32(ptr: newIDsRaw.bindMemory(to: UInt32.self, capacity: newCap)) : .u64(ptr: newIDsRaw.bindMemory(to: UInt64.self, capacity: newCap))
-    var newCodesRaw: UnsafeMutableRawPointer? = nil; var newCodes: UnsafeMutablePointer<UInt8>? = nil; var newXBRaw: UnsafeMutableRawPointer? = nil; var newXB: UnsafeMutablePointer<Float>? = nil
+    var newCodesRaw: UnsafeMutableRawPointer?; var newCodes: UnsafeMutablePointer<UInt8>?; var newXBRaw: UnsafeMutableRawPointer?; var newXB: UnsafeMutablePointer<Float>?
     switch index.format {
     case .pq8, .pq4:
         let bytes = newCap * codeBytesPerVec
@@ -580,7 +578,7 @@ private func growList(_ list: IVFList, codeBytesPerVec: Int, dFlat: Int, opts: I
         }
         newXBRaw = xraw; newXB = xraw.bindMemory(to: Float.self, capacity: elems)
     }
-    var newTSRaw: UnsafeMutableRawPointer? = nil; var newTS: UnsafeMutablePointer<UInt64>? = nil
+    var newTSRaw: UnsafeMutableRawPointer?; var newTS: UnsafeMutablePointer<UInt64>?
     if opts.timestamps {
         let bytes = newCap * MemoryLayout<UInt64>.stride
         guard let t = (opts.allocator?.alloc(bytes, 64) ?? alignedAlloc(bytes, alignment: 64)) else {
@@ -665,7 +663,7 @@ private func groupByListIDs(listIDs: UnsafePointer<Int32>, n: Int, k_c: Int) -> 
 }
 
 public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePointer<UInt64>, codes: UnsafePointer<UInt8>, n: Int, m: Int, index: IVFListHandle, opts inOpts: IVFAppendOpts?, internalIDsOut: UnsafeMutablePointer<Int64>?) throws {
-    guard n >= 0, m == index.m, (index.format == .pq8 || index.format == .pq4) else {
+    guard n >= 0, m == index.m, index.format == .pq8 || index.format == .pq4 else {
         throw ErrorBuilder(.unsupportedLayout, operation: "ivf_append")
             .message("ivf_append requires PQ format with matching m parameter")
             .info("format", "\(index.format)")
@@ -675,7 +673,7 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
             .build()
     }
     let opts = inOpts ?? index.opts
-    guard (opts.group == 4 || opts.group == 8), m % opts.group == 0 else {
+    guard opts.group == 4 || opts.group == 8, m % opts.group == 0 else {
         throw ErrorBuilder(.invalidParameter, operation: "ivf_append")
             .message("Invalid group size or m not divisible by group")
             .info("group", "\(opts.group)")
@@ -821,7 +819,7 @@ public func ivf_append(list_ids: UnsafePointer<Int32>, external_ids: UnsafePoint
 }
 
 public func ivf_append_one_list(list_id: Int32, external_ids: UnsafePointer<UInt64>, codes: UnsafePointer<UInt8>, n: Int, m: Int, index: IVFListHandle, opts inOpts: IVFAppendOpts?, internalIDsOut: UnsafeMutablePointer<Int64>?) throws {
-    guard n >= 0, m == index.m, (index.format == .pq8 || index.format == .pq4) else {
+    guard n >= 0, m == index.m, index.format == .pq8 || index.format == .pq4 else {
         throw ErrorBuilder(.unsupportedLayout, operation: "ivf_append_one_list")
             .message("ivf_append_one_list requires PQ format with matching m parameter")
             .info("format", "\(index.format)")

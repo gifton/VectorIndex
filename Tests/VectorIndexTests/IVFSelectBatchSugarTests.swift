@@ -66,7 +66,7 @@ final class IVFSelectBatchSugarTests: XCTestCase {
         for i in 0..<b {
             let q = Array(Q[(i*d)..<((i+1)*d)])
             var singleIDs = [Int32](repeating: -1, count: nprobe)
-            var nilScores: [Float]? = nil
+            var nilScores: [Float]?
             ivf_select_nprobe_f32(
                 q: q, d: d, centroids: centroids, kc: kc,
                 metric: .cosine, nprobe: nprobe,
@@ -78,4 +78,3 @@ final class IVFSelectBatchSugarTests: XCTestCase {
         }
     }
 }
-

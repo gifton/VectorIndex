@@ -24,7 +24,7 @@ public struct JournalFilter: Sendable {
     public var includeTags: Set<String>?
     public var excludeTags: Set<String>?
     /// Additional custom predicates AND-ed with built-ins
-    public var custom: [@Sendable ([String:String]) -> Bool] = []
+    public var custom: [@Sendable ([String: String]) -> Bool] = []
 
     public init() {}
 
@@ -62,7 +62,7 @@ public struct JournalFilter: Sendable {
         return copy
     }
 
-    public func and(_ predicate: @escaping @Sendable ([String:String]) -> Bool) -> JournalFilter {
+    public func and(_ predicate: @escaping @Sendable ([String: String]) -> Bool) -> JournalFilter {
         var copy = self
         copy.custom.append(predicate)
         return copy
@@ -71,7 +71,7 @@ public struct JournalFilter: Sendable {
     // MARK: - Build Filter Closure
     /// Compile the DSL to a Sendable metadata predicate for index search.
     /// - Returns: `@Sendable` closure suitable for `search(..., filter:)`.
-    public func build() -> @Sendable ([String:String]?) -> Bool {
+    public func build() -> @Sendable ([String: String]?) -> Bool {
         // Capture immutable config in locals for Sendable closure
         let dateKey = self.dateKey
         let tagsKey = self.tagsKey
@@ -109,11 +109,11 @@ public struct JournalFilter: Sendable {
                     if requireAll {
                         if !inc.isSubset(of: tagSet) { return false }
                     } else {
-                        if inc.intersection(tagSet).isEmpty { return false }
+                        if inc.isDisjoint(with: tagSet) { return false }
                     }
                 }
                 if let exc = excludeTags {
-                    if !exc.intersection(tagSet).isEmpty { return false }
+                    if !exc.isDisjoint(with: tagSet) { return false }
                 }
             }
 
@@ -134,8 +134,8 @@ public struct JournalFilter: Sendable {
         excludeTags: [String]? = nil,
         requireAllIncludedTags: Bool = false,
         includeIfMissingKeys: Bool = false,
-        custom: [@Sendable ([String:String]) -> Bool] = []
-    ) -> @Sendable ([String:String]?) -> Bool {
+        custom: [@Sendable ([String: String]) -> Bool] = []
+    ) -> @Sendable ([String: String]?) -> Bool {
         var jf = JournalFilter()
         jf.dateKey = dateKey
         jf.tagsKey = tagsKey
@@ -149,4 +149,3 @@ public struct JournalFilter: Sendable {
         return jf.build()
     }
 }
-

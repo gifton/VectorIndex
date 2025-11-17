@@ -758,7 +758,7 @@ private final class PartitionAccumulator: @unchecked Sendable {
         storage[index] = value
     }
     func toArray() -> [PartitionResult] {
-        return storage.map { $0 ?? PartitionResult(ids: [], scores: []) }
+        storage.map { $0 ?? PartitionResult(ids: [], scores: []) }
     }
 }
 

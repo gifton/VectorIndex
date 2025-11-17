@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 // VectorIndex – Kernel #39: Candidate Reservoir Buffer
 // Path: Sources/VectorIndex/Operations/Reservoir/CandidateReservoir.swift
 //
@@ -7,7 +7,7 @@
 // Integrates with a VisitedSet (kernel #32) via `VisitedSet` protocol.
 // Deterministic tie-breaking by id.
 // Thread-safety: Single-writer (per-query instance). Not thread-safe for mutation.
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import Foundation
 
@@ -135,8 +135,8 @@ public final class CandidateReservoir: @unchecked Sendable {
     self.bufferCapacity = (self.currentMode == .heap) ? capacity : capacity &+ headroom
 
     // Pre-allocate SoA buffers (no hot-path allocations).
-    self.scores = Array<Float>(repeating: 0, count: self.bufferCapacity)
-    self.ids = Array<Int64>(repeating: 0, count: self.bufferCapacity)
+    self.scores = [Float](repeating: 0, count: self.bufferCapacity)
+    self.ids = [Int64](repeating: 0, count: self.bufferCapacity)
 
     // Initial tau sentinel (only meaningful when we have ≥ C items).
     self.tau = worstSentinel(for: metric)
@@ -154,8 +154,8 @@ public final class CandidateReservoir: @unchecked Sendable {
       let headroom = max(1, Int(ceil(Float(capacityC) * max(0, opts.reserveExtra))))
       let newBufferCapacity = (currentMode == .heap) ? capacityC : capacityC &+ headroom
       if newBufferCapacity > bufferCapacity {
-        scores = Array<Float>(repeating: 0, count: newBufferCapacity)
-        ids = Array<Int64>(repeating: 0, count: newBufferCapacity)
+        scores = [Float](repeating: 0, count: newBufferCapacity)
+        ids = [Int64](repeating: 0, count: newBufferCapacity)
         bufferCapacity = newBufferCapacity
       }
     }
@@ -179,7 +179,7 @@ public final class CandidateReservoir: @unchecked Sendable {
   public func withSnapshot<R>(
     _ body: (UnsafePointer<Float>, UnsafePointer<Int64>, Int) throws -> R
   ) rethrows -> R {
-    return try scores.withUnsafeBufferPointer { sp in
+    try scores.withUnsafeBufferPointer { sp in
       try ids.withUnsafeBufferPointer { ip in
         try body(sp.baseAddress!, ip.baseAddress!, size)
       }
@@ -558,7 +558,7 @@ public final class CandidateReservoir: @unchecked Sendable {
   /// Returns true if (scoreA, idA) is **worse** than (scoreB, idB).
   @usableFromInline
   internal func isWorse(scoreA: Float, idA: Int64, scoreB: Float, idB: Int64) -> Bool {
-    return isBetter(scoreA: scoreB, idA: idB, scoreB: scoreA, idB: idA)
+    isBetter(scoreA: scoreB, idA: idB, scoreB: scoreA, idB: idA)
   }
 
   /// Worst sentinel used for initial `tau`.
