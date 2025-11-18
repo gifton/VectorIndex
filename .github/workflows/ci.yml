@@ -91,16 +91,16 @@ jobs:
         run: |
           case "${{ matrix.group }}" in
             core)
-              echo "filter=^(AccelerableIndexTests|FlatIndexTests|FlatIndexEdgeCasesTests|ErrorInfrastructureTests|RNGStateTests|RNGDeterminismTests|DTypeConversionTests|TypedOverloadsTests|APIPolishTests|StatsTests|JournalFilterTests|JournalFilterAdvancedTests|PointerSafetyTests|S2EdgeCaseTests|S2RNGDtypeTests|VectorIndexTests)\." >> $GITHUB_OUTPUT
+              echo "filter=^VectorIndexTests\.(AccelerableIndexTests|FlatIndexTests|FlatIndexEdgeCasesTests|ErrorInfrastructureTests|RNGStateTests|RNGDeterminismTests|DTypeConversionTests|TypedOverloadsTests|APIPolishTests|StatsTests|JournalFilterTests|JournalFilterAdvancedTests|PointerSafetyTests|S2EdgeCaseTests|S2RNGDtypeTests|VectorIndexTests)" >> $GITHUB_OUTPUT
               ;;
             hnsw)
-              echo "filter=^(HNSWTests|HNSWAlignmentTest|HNSWBatchAndErrorsTests|HNSWNeighborSelectionTests|HNSWParamSweepTests|HNSWRecallTests|HNSWTraversalKernelTests|HNSWLevelAssignmentTests|HNSWMoreTests)\." >> $GITHUB_OUTPUT
+              echo "filter=^VectorIndexTests\.(HNSWTests|HNSWAlignmentTest|HNSWBatchAndErrorsTests|HNSWNeighborSelectionTests|HNSWParamSweepTests|HNSWRecallTests|HNSWTraversalKernelTests|HNSWLevelAssignmentTests|HNSWMoreTests)" >> $GITHUB_OUTPUT
               ;;
             ivf)
-              echo "filter=^(IVFTests|IVFSelectTests|IVFSelectBatchSugarTests|IVFSelectBenchmarks|IVFFlatRerankTests|IVFProbeMonotonicTests|IVFRecallTests|IVFMoreTests|IVFListMaintenanceTests|IVFListVecsReaderRerankTests|IVFKMeansPlusPlusTests)\." >> $GITHUB_OUTPUT
+              echo "filter=^VectorIndexTests\.(IVFTests|IVFSelectTests|IVFSelectBatchSugarTests|IVFSelectBenchmarks|IVFFlatRerankTests|IVFProbeMonotonicTests|IVFRecallTests|IVFMoreTests|IVFListMaintenanceTests|IVFListVecsReaderRerankTests|IVFKMeansPlusPlusTests)" >> $GITHUB_OUTPUT
               ;;
             kernels)
-              echo "filter=^(CosineKernelTests|CosineFusedCacheIntegrationTests|MicrokernelIntegrationTests|ResidualKernelTests|LayoutTransformsTests|KMeansMiniBatchTests|KMeansPPSeedingTests|PQEncodeParity_SwiftOnly_Tests|PQEncodeParity_AoS_C_vs_Swift_Tests|VIndexMmapErrorTests|Kernel30AppendTests|IDMapPersistenceTests|PersistenceTests|PersistenceEdgeTests|FlatIndexEdgeCasesTests)\." >> $GITHUB_OUTPUT
+              echo "filter=^VectorIndexTests\.(CosineKernelTests|CosineFusedCacheIntegrationTests|MicrokernelIntegrationTests|ResidualKernelTests|LayoutTransformsTests|KMeansMiniBatchTests|KMeansPPSeedingTests|PQEncodeParity_SwiftOnly_Tests|PQEncodeParity_AoS_C_vs_Swift_Tests|VIndexMmapErrorTests|Kernel30AppendTests|IDMapPersistenceTests|PersistenceTests|PersistenceEdgeTests|FlatIndexEdgeCasesTests)" >> $GITHUB_OUTPUT
               ;;
           esac
 
