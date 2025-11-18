@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //  ResidualKernel.swift
 //  VectorIndex
 //
@@ -36,15 +36,15 @@
 //
 //  Spec: kernel-specs/23_residuals.md
 //  Status: Production Ready
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import Foundation
 import Accelerate
 
 // MARK: - Error Handling
 
-// ResidualError removed - migrated to VectorIndexError
-// All throw sites now use ErrorBuilder with appropriate IndexErrorKind
+// Back-compat error type for tests expecting ResidualError
+public enum ResidualError: Error, Equatable { case invalidCoarseID }
 
 // MARK: - Options & Telemetry
 
@@ -201,12 +201,7 @@ public func residuals_f32(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {
-                throw ErrorBuilder(.invalidRange, operation: "residuals_compute")
-                    .message("Coarse assignment ID out of valid range")
-                    .info("coarse_id", "\(a)")
-                    .info("valid_range", "0..<\(opts.kc)")
-                    .info("vector_index", "\(i)")
-                    .build()
+                throw ResidualError.invalidCoarseID
             }
         }
 
@@ -326,7 +321,7 @@ public func residuals_f32_inplace(
                 j += 8
             }
             while j < d {
-                vec[j] = vec[j] - cen[j]
+                vec[j] -= cen[j]
                 j += 1
             }
         }
@@ -355,7 +350,7 @@ internal func _residuals_grouped(
     }
 
     // 1) counts per centroid
-    var counts = Array<Int>(repeating: 0, count: kc)
+    var counts = [Int](repeating: 0, count: kc)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
@@ -372,12 +367,12 @@ internal func _residuals_grouped(
     }
 
     // 2) offsets (prefix sum)
-    var offsets = Array<Int>(repeating: 0, count: kc + 1)
+    var offsets = [Int](repeating: 0, count: kc + 1)
     for c in 0..<kc { offsets[c + 1] = offsets[c] + counts[c] }
 
     // 3) grouped indices
-    var cursor = Array<Int>(repeating: 0, count: kc)
-    var grouped = Array<Int>(repeating: 0, count: nInt)
+    var cursor = [Int](repeating: 0, count: kc)
+    var grouped = [Int](repeating: 0, count: nInt)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         let pos = offsets[a] + cursor[a]
@@ -440,7 +435,7 @@ internal func _residuals_grouped_inplace(
             .build()
     }
 
-    var counts = Array<Int>(repeating: 0, count: kc)
+    var counts = [Int](repeating: 0, count: kc)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
@@ -455,11 +450,11 @@ internal func _residuals_grouped_inplace(
         }
         counts[a] += 1  // ✅ Fixed: regular += instead of &+=
     }
-    var offsets = Array<Int>(repeating: 0, count: kc + 1)
+    var offsets = [Int](repeating: 0, count: kc + 1)
     for c in 0..<kc { offsets[c + 1] = offsets[c] + counts[c] }
 
-    var cursor = Array<Int>(repeating: 0, count: kc)
-    var grouped = Array<Int>(repeating: 0, count: nInt)
+    var cursor = [Int](repeating: 0, count: kc)
+    var grouped = [Int](repeating: 0, count: nInt)
     for i in 0..<nInt {
         let a = Int(coarseIDs[i])
         let pos = offsets[a] + cursor[a]
@@ -494,7 +489,7 @@ internal func _residuals_grouped_inplace(
                     j += 8
                 }
                 while j < d {
-                    vec[j] = vec[j] - cen[j]
+                    vec[j] -= cen[j]
                     j += 1
                 }
             }

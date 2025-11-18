@@ -43,7 +43,6 @@ internal enum TelemetryTimerId: Int, CaseIterable {
 /// Optimization flags tracking which code paths were used
 internal struct TelemetryFlags: OptionSet, Sendable {
   let rawValue: UInt64
-  init(rawValue: UInt64) { self.rawValue = rawValue }
   static let used_dot_trick         = TelemetryFlags(rawValue: 1 << 0)
   static let used_cosine            = TelemetryFlags(rawValue: 1 << 1)
   static let used_interleaved_codes = TelemetryFlags(rawValue: 1 << 2)
@@ -56,7 +55,7 @@ internal struct TelemetryFlags: OptionSet, Sendable {
 internal struct QueryStats {
   // Identity / configuration
   var metric: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0) // 16 bytes
+                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0) // 16 bytes
   var d: Int32 = 0
   var m: Int32 = 0
   var ks: Int32 = 0
@@ -106,7 +105,7 @@ internal struct QueryStats {
 
 /// Query context (passed at begin_query)
 public struct QueryCtx {
-  var metric: String? = nil
+  var metric: String?
   var d: Int32 = 0
   var m: Int32 = 0
   var ks: Int32 = 0
@@ -175,7 +174,7 @@ public struct TelemetryGlobal {
 /// Light query stats for ring buffer (compact representation)
 internal struct QueryStatsLight {
   var metric: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0)
+                      UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
   var d: Int32 = 0
   var m: Int32 = 0
   var ks: Int32 = 0
@@ -438,8 +437,8 @@ internal enum Telemetry {
       if let name = qctx?.metric, !name.isEmpty {
         var bytes = Array(name.utf8.prefix(16))
         if bytes.count < 16 { bytes += Array(repeating: 0, count: 16 - bytes.count) }
-        T.qs.metric = (bytes[0],bytes[1],bytes[2],bytes[3],bytes[4],bytes[5],bytes[6],bytes[7],
-                       bytes[8],bytes[9],bytes[10],bytes[11],bytes[12],bytes[13],bytes[14],bytes[15])
+        T.qs.metric = (bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7],
+                       bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15])
       }
       if let q = qctx {
         T.qs.d = q.d; T.qs.m = q.m; T.qs.ks = q.ks
@@ -497,12 +496,12 @@ internal enum Telemetry {
       g.time_ns[TelemetryTimerId.t_total.rawValue]      &+= T.qs.t_total
 
       // flags (count queries that used each flag)
-      if T.qs.flags.contains(.used_dot_trick)         { g.flag_used_dot_trick &+= 1 }
-      if T.qs.flags.contains(.used_cosine)            { g.flag_used_cosine &+= 1 }
+      if T.qs.flags.contains(.used_dot_trick) { g.flag_used_dot_trick &+= 1 }
+      if T.qs.flags.contains(.used_cosine) { g.flag_used_cosine &+= 1 }
       if T.qs.flags.contains(.used_interleaved_codes) { g.flag_used_interleaved_codes &+= 1 }
-      if T.qs.flags.contains(.used_u4)                { g.flag_used_u4 &+= 1 }
-      if T.qs.flags.contains(.used_prefetch)          { g.flag_used_prefetch &+= 1 }
-      if T.qs.flags.contains(.used_heap_merge)        { g.flag_used_heap_merge &+= 1 }
+      if T.qs.flags.contains(.used_u4) { g.flag_used_u4 &+= 1 }
+      if T.qs.flags.contains(.used_prefetch) { g.flag_used_prefetch &+= 1 }
+      if T.qs.flags.contains(.used_heap_merge) { g.flag_used_heap_merge &+= 1 }
 
       // histograms
       histLatency.add(T.qs.t_total)
@@ -684,8 +683,8 @@ internal enum Telemetry {
       let rec = ring[Int((wrote - 1 - UInt64(k)) % UInt64(RECENT_RING))]
       if k > 0 { recent += "," }
       // metric as string (trim zeros)
-      let nameBytes: [UInt8] = [rec.metric.0,rec.metric.1,rec.metric.2,rec.metric.3,rec.metric.4,rec.metric.5,rec.metric.6,rec.metric.7,
-                                 rec.metric.8,rec.metric.9,rec.metric.10,rec.metric.11,rec.metric.12,rec.metric.13,rec.metric.14,rec.metric.15]
+      let nameBytes: [UInt8] = [rec.metric.0, rec.metric.1, rec.metric.2, rec.metric.3, rec.metric.4, rec.metric.5, rec.metric.6, rec.metric.7,
+                                 rec.metric.8, rec.metric.9, rec.metric.10, rec.metric.11, rec.metric.12, rec.metric.13, rec.metric.14, rec.metric.15]
       let name = String(bytes: nameBytes.prefix { $0 != 0 }, encoding: .utf8) ?? ""
       recent += "{\"metric\":\"\(name)\",\"d\":\(rec.d),\"m\":\(rec.m),\"ks\":\(rec.ks),"
       recent += "\"nprobe\":\(rec.nprobe),\"C\":\(rec.C),\"K\":\(rec.K),"

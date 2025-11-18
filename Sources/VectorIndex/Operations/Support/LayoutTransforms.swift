@@ -24,7 +24,7 @@ public enum RowBlockSize: Int, Sendable {
     /// Recommended block size based on dimension
     public static func recommended(dimension d: Int) -> RowBlockSize {
         // Larger dimensions benefit from smaller blocks (better L1 fit)
-        return d >= 1024 ? .r4 : .r8
+        d >= 1024 ? .r4 : .r8
     }
 }
 
@@ -34,7 +34,7 @@ public enum PQGroupSize: Int, Sendable {
     case g8 = 8   // better vectorization per group
 
     public static func recommended(subquantizers m: Int) -> PQGroupSize {
-        return m >= 16 ? .g8 : .g4
+        m >= 16 ? .g8 : .g4
     }
 }
 
@@ -84,20 +84,20 @@ public struct LayoutTransformOpts: Sendable {
 /// Calculate padded dimension for AoSoA layout (round up to multiple of V=16)
 @inline(__always)
 public func paddedDimension(_ d: Int) -> Int {
-    return ((d + V_FLOAT32 - 1) / V_FLOAT32) * V_FLOAT32
+    ((d + V_FLOAT32 - 1) / V_FLOAT32) * V_FLOAT32
 }
 
 /// Calculate buffer size for n vectors with dimension d in AoSoA layout
 /// (Name matches spec; retained as-is.)
 @inline(__always)
 public func asoaBufferSize(n: Int, d: Int) -> Int {
-    return n * paddedDimension(d)
+    n * paddedDimension(d)
 }
 
 /// Optional alias (ergonomic)
 @inline(__always)
 public func aosoaBufferSize(n: Int, d: Int) -> Int {
-    return asoaBufferSize(n: n, d: d)
+    asoaBufferSize(n: n, d: d)
 }
 
 // MARK: - Validation
@@ -133,12 +133,12 @@ public func validateInterleaveParams(n: Int, d: Int, R: Int) throws {
 
 @inline(__always)
 private func isAligned<T>(_ p: UnsafePointer<T>, to alignment: Int) -> Bool {
-    return (Int(bitPattern: p) & (alignment - 1)) == 0
+    (Int(bitPattern: p) & (alignment - 1)) == 0
 }
 
 @inline(__always)
 private func isAligned<T>(_ p: UnsafeMutablePointer<T>, to alignment: Int) -> Bool {
-    return (Int(bitPattern: p) & (alignment - 1)) == 0
+    (Int(bitPattern: p) & (alignment - 1)) == 0
 }
 
 // MARK: - Telemetry
@@ -163,7 +163,7 @@ public struct LayoutTransformTelemetry {
 
 // Optional hook the host app can implement.
 public enum GlobalTelemetryRecorder {
-    public nonisolated(unsafe) static var record: ((LayoutTransformTelemetry) -> Void)? = nil
+    public nonisolated(unsafe) static var record: ((LayoutTransformTelemetry) -> Void)?
 }
 
 // MARK: - Core: Vector Interleaving (AoS -> AoSoA)
@@ -204,54 +204,39 @@ public func vecsInterleave_f32(
             let dimEnd = min(dimStart + V, d)
             let chunkDims = max(0, dimEnd - dimStart)
 
-            // Output offset (contiguous R×V tile)
-            let outOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            // Output offset for this block and dim-chunk, compact (no row padding beyond n)
+            // Layout per block contributes `blockRows * V` elements per chunk.
+            let outOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
-            // Transpose R rows × V dims into output
-            // First, write actual dims for available rows
+            // Transpose blockRows × V dims into output
             for row in 0..<blockRows {
                 let gRow = rowStart + row
                 let inRowOffset = gRow &* d
 
-                // Write real dimensions
-                var outBase = outOffset &+ row  // stride R across dims
+                // Stride across dims by blockRows (compact last block)
+                var outBase = outOffset &+ row
                 var inBase = inRowOffset &+ dimStart
                 var dim = 0
 
-                // Fast path: full chunk
                 if chunkDims == V {
-                    // Unrolled for unit-stride across dims (store as interleaved)
-                    // Each iteration stores dim i at outBase + i*R
-                    outBase = outOffset &+ row
                     for _ in 0..<V {
                         aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        outBase &+= blockRows
                         inBase &+= 1
                     }
                 } else {
-                    // Partial tail
+                    // Partial tail: copy real dims
                     while dim < chunkDims {
                         aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        outBase &+= blockRows
                         inBase &+= 1
                         dim &+= 1
                     }
-                    // Pad remaining dims with zeros
+                    // Pad remaining dims with zeros for this row
                     while dim < V {
                         aosoa[outBase] = 0.0
-                        outBase &+= R
+                        outBase &+= blockRows
                         dim &+= 1
-                    }
-                }
-            }
-
-            // Pad remaining rows in this block to zeros for all V dims
-            if blockRows < R {
-                for row in blockRows..<R {
-                    var outBase = outOffset &+ row
-                    for _ in 0..<V {
-                        aosoa[outBase] = 0.0
-                        outBase &+= R
                     }
                 }
             }
@@ -324,7 +309,8 @@ public func vecsDeinterleave_f32(
             let dimEnd   = min(dimStart + V, d)
             let realDims = max(0, dimEnd - dimStart)
 
-            let inOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            // Mirror compact layout used in interleave
+            let inOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
             for row in 0..<blockRows {
                 let gRow = rowStart + row
@@ -336,7 +322,7 @@ public func vecsDeinterleave_f32(
                 // Copy only real dimensions (skip padded tail)
                 for _ in 0..<realDims {
                     aos[outBase] = aosoa[inBase]
-                    inBase &+= R
+                    inBase &+= blockRows
                     outBase &+= 1
                 }
             }
@@ -882,7 +868,7 @@ public extension LayoutTransform {
         d: Int,
         opts: LayoutTransformOpts
     ) -> [[Float]] {
-        return deinterleave(interleaved: interleaved, n: n, d: d, rowBlockSize: opts.rowBlockSize)
+        deinterleave(interleaved: interleaved, n: n, d: d, rowBlockSize: opts.rowBlockSize)
     }
 }
 
@@ -910,7 +896,16 @@ public func vecsInterleave_f32_parallel(
     }
 
     #if canImport(Darwin)
+    // Sendable wrappers for unsafe pointers
+    struct UnsafeSendablePtr<T>: @unchecked Sendable { let ptr: UnsafePointer<T> }
+    struct UnsafeSendableMutPtr<T>: @unchecked Sendable { let ptr: UnsafeMutablePointer<T> }
+
+    let aosS = UnsafeSendablePtr(ptr: aos)
+    let aosoaS = UnsafeSendableMutPtr(ptr: aosoa)
+
     DispatchQueue.concurrentPerform(iterations: numBlocks) { blockIdx in
+        let aosBase = aosS.ptr
+        let aosoaBase = aosoaS.ptr
         let rowStart = blockIdx * R
         let rowEnd = min(rowStart + R, n)
         let blockRows = rowEnd - rowStart
@@ -919,7 +914,7 @@ public func vecsInterleave_f32_parallel(
             let dimStart = dimChunk * V
             let dimEnd = min(dimStart + V, d)
             let chunkDims = max(0, dimEnd - dimStart)
-            let outOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            let outOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
             for row in 0..<blockRows {
                 let gRow = rowStart + row
@@ -931,31 +926,21 @@ public func vecsInterleave_f32_parallel(
 
                 if chunkDims == V {
                     for _ in 0..<V {
-                        aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        aosoaBase[outBase] = aosBase[inBase]
+                        outBase &+= blockRows
                         inBase &+= 1
                     }
                 } else {
                     while dim < chunkDims {
-                        aosoa[outBase] = aos[inBase]
-                        outBase &+= R
+                        aosoaBase[outBase] = aosBase[inBase]
+                        outBase &+= blockRows
                         inBase &+= 1
                         dim &+= 1
                     }
                     while dim < V {
-                        aosoa[outBase] = 0.0
-                        outBase &+= R
+                        aosoaBase[outBase] = 0.0
+                        outBase &+= blockRows
                         dim &+= 1
-                    }
-                }
-            }
-
-            if blockRows < R {
-                for row in blockRows..<R {
-                    var outBase = outOffset &+ row
-                    for _ in 0..<V {
-                        aosoa[outBase] = 0.0
-                        outBase &+= R
                     }
                 }
             }
@@ -991,7 +976,16 @@ public func vecsDeinterleave_f32_parallel(
     }
 
     #if canImport(Darwin)
+    // Sendable wrappers for unsafe pointers
+    struct UnsafeSendablePtr<T>: @unchecked Sendable { let ptr: UnsafePointer<T> }
+    struct UnsafeSendableMutPtr<T>: @unchecked Sendable { let ptr: UnsafeMutablePointer<T> }
+
+    let aosoaS = UnsafeSendablePtr(ptr: aosoa)
+    let aosS = UnsafeSendableMutPtr(ptr: aos)
+
     DispatchQueue.concurrentPerform(iterations: numBlocks) { blockIdx in
+        let aosoaBase = aosoaS.ptr
+        let aosBase = aosS.ptr
         let rowStart = blockIdx * R
         let rowEnd   = min(rowStart + R, n)
         let blockRows = rowEnd - rowStart
@@ -1001,7 +995,7 @@ public func vecsDeinterleave_f32_parallel(
             let dimEnd   = min(dimStart + V, d)
             let realDims = max(0, dimEnd - dimStart)
 
-            let inOffset = (blockIdx * numDimChunks * R * V) + (dimChunk * R * V)
+            let inOffset = (rowStart &* dP) &+ (dimChunk &* blockRows &* V)
 
             for row in 0..<blockRows {
                 let gRow = rowStart + row
@@ -1012,8 +1006,8 @@ public func vecsDeinterleave_f32_parallel(
 
                 // Copy only real dimensions (skip padded tail)
                 for _ in 0..<realDims {
-                    aos[outBase] = aosoa[inBase]
-                    inBase &+= R
+                    aosBase[outBase] = aosoaBase[inBase]
+                    inBase &+= blockRows
                     outBase &+= 1
                 }
             }
@@ -1030,6 +1024,6 @@ public func vecsDeinterleave_f32_parallel(
 #if DEBUG
 @inline(__always)
 private func almostEqual(_ a: Float, _ b: Float, eps: Float = 1e-5) -> Bool {
-    return abs(a - b) <= eps
+    abs(a - b) <= eps
 }
 #endif

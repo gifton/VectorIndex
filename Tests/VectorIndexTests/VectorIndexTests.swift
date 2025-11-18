@@ -16,11 +16,11 @@ final class VectorIndexTests: XCTestCase {
     func testHNSWSkeletonCompiles() async throws {
         let hnsw = HNSWIndex(dimension: 3)
         try await hnsw.batchInsert([
-            ("a", [0,0,1], nil),
-            ("b", [0,1,0], nil),
-            ("c", [1,0,0], nil)
+            ("a", [0, 0, 1], nil),
+            ("b", [0, 1, 0], nil),
+            ("c", [1, 0, 0], nil)
         ])
-        let results = try await hnsw.search(query: [1,0,0], k: 1, filter: nil)
+        let results = try await hnsw.search(query: [1, 0, 0], k: 1, filter: nil)
         XCTAssertEqual(results.count, 1)
     }
 

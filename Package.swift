@@ -44,9 +44,8 @@ let package = Package(
                 .product(name: "VectorCore", package: "VectorCore")
             ],
             exclude: [
-                // Exclude docs and scratch files relative to Sources/VectorIndex
-                "Kernels/ResidualKernel_FINAL_EVALUATION.md",
-                "Kernels/ResidualKernel_INTEGRATION_NOTES.md",
+                // Exclude scratch files relative to Sources/VectorIndex
+                // Note: residual kernel docs moved to /docs; no longer under Sources.
                 "Kernels/PQTrain.swift.new"
             ],
             swiftSettings: [

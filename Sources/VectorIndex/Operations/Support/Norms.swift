@@ -15,7 +15,7 @@ public extension IndexOps.Support {
             case sq   = 2
             case both = 3
             @inlinable public var needsInv: Bool { self == .inv || self == .both }
-            @inlinable public var needsSq:  Bool { self == .sq  || self == .both }
+            @inlinable public var needsSq: Bool { self == .sq  || self == .both }
         }
 
         // MARK: - Data Type
@@ -41,7 +41,7 @@ public extension IndexOps.Support {
             public var epsilon: Float
 
             public private(set) var invNorms: UnsafeMutablePointer<Float>? // when invDType == .float32
-            public private(set) var sqNorms:  UnsafeMutablePointer<Float>?
+            public private(set) var sqNorms: UnsafeMutablePointer<Float>?
 
             public private(set) var invRaw: UnsafeMutableRawPointer?
             private var mmapBase: UnsafeMutableRawPointer?
@@ -80,7 +80,7 @@ public extension IndexOps.Support {
                     if let base = mmapBase { munmap(base, mmapSize) }
                 } else {
                     if mode.needsInv, let p = invRaw { free(p) }
-                    if mode.needsSq,  let p = sqNorms { free(p) }
+                    if mode.needsSq, let p = sqNorms { free(p) }
                 }
             }
 
@@ -295,7 +295,7 @@ public extension IndexOps.Support {
 
             let dataOffset = NormCacheHeader.size
             let fileSize = off_t(dataOffset + dataBytes)
-            let map = mmap(nil, dataBytes, PROT_READ, MAP_FILE | MAP_SHARED, fd, off_t(dataOffset))
+            let map = mmap(nil, dataBytes, PROT_READ, MAP_SHARED, fd, off_t(dataOffset))
             guard map != MAP_FAILED else { throw NSError(domain: "NormCache.save", code: 4, userInfo: [NSLocalizedDescriptionKey: "mmap for checksum failed"]) }
             let crc = crc64_ecma(buffer: map!, length: dataBytes)
             munmap(map, dataBytes)
@@ -315,7 +315,7 @@ public extension IndexOps.Support {
             let fileSize = Int(st.st_size)
             guard fileSize >= NormCacheHeader.size else { throw NSError(domain: "NormCache.load", code: 12, userInfo: [NSLocalizedDescriptionKey: "file too small"]) }
 
-            let base = mmap(nil, fileSize, PROT_READ, MAP_FILE | MAP_SHARED, fd, 0)
+            let base = mmap(nil, fileSize, PROT_READ, MAP_SHARED, fd, 0)
             guard base != MAP_FAILED else { throw NSError(domain: "NormCache.load", code: 13, userInfo: [NSLocalizedDescriptionKey: "mmap failed"]) }
 
             let hdrPtr = base!.assumingMemoryBound(to: NormCacheHeader.self)
@@ -341,10 +341,10 @@ public extension IndexOps.Support {
             guard crc == hdr.checksum else { munmap(base, fileSize); throw NSError(domain: "NormCache.load", code: 16, userInfo: [NSLocalizedDescriptionKey: "checksum mismatch"]) }
 
             var cache = NormCache(count: n, dimension: d, mode: mode, invDType: invDT, epsilon: eps)
-            var invPtr: UnsafeMutableRawPointer? = nil
-            var sqPtr: UnsafeMutablePointer<Float>? = nil
+            var invPtr: UnsafeMutableRawPointer?
+            var sqPtr: UnsafeMutablePointer<Float>?
             if mode.needsInv { invPtr = dataPtr }
-            if mode.needsSq  { sqPtr = dataPtr.advanced(by: invBytes).assumingMemoryBound(to: Float.self) }
+            if mode.needsSq { sqPtr = dataPtr.advanced(by: invBytes).assumingMemoryBound(to: Float.self) }
             cache.setMapped(base: UnsafeMutableRawPointer(mutating: base!), size: fileSize, invPtr: invPtr, sqPtr: sqPtr)
             return cache
         }

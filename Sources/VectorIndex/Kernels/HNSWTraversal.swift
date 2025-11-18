@@ -93,8 +93,7 @@ private struct MinHeap {
         let dm = dists[mid]
         if dist < dm || (dist == dm && id < ids[mid]) { hi = mid } else { lo = mid + 1 }
     }
-    if count < ef { ids.insert(id, at: lo); dists.insert(dist, at: lo); count &+= 1 }
-    else { ids.removeLast(); dists.removeLast(); ids.insert(id, at: lo); dists.insert(dist, at: lo) }
+    if count < ef { ids.insert(id, at: lo); dists.insert(dist, at: lo); count &+= 1 } else { ids.removeLast(); dists.removeLast(); ids.insert(id, at: lo); dists.insert(dist, at: lo) }
 }
 
 @inline(__always) private func selectBatchSize(_ d: Int) -> Int { if d <= 256 { return 64 }; if d <= 1024 { return 32 }; return 16 }
@@ -110,7 +109,7 @@ private func scoreNeighborsBatch_f32(
     let t0 = DispatchTime.now().uptimeNanoseconds
     #endif
     let count = ids.count
-    if count == 0 { return }
+    if ids.isEmpty { return }
     // Gather neighbors contiguously into a scratch buffer
     var gathered = [Float](repeating: 0, count: count * d)
     gathered.withUnsafeMutableBufferPointer { gbuf in
@@ -167,7 +166,7 @@ private func scoreNeighborsBatch_f32(
     #endif
 }
 #if ENABLE_TELEMETRY
-fileprivate var scoringAccum_ns: UInt64 = 0
+private var scoringAccum_ns: UInt64 = 0
 #endif
 
 @inline(__always) private func layerNeighbors(offsets: UnsafePointer<Int32>, neighbors: UnsafePointer<Int32>, u: Int, N: Int) -> UnsafeBufferPointer<Int32> {
@@ -191,7 +190,7 @@ private func greedyDescent_core(q: UnsafePointer<Float>, d: Int, entryPoint: Int
             while improved {
                 improved = false
                 let nbrs = layerNeighbors(offsets: offsets, neighbors: neigh, u: bestID, N: N)
-                if nbrs.count == 0 { break }
+                if nbrs.isEmpty { break }
                 var tmpIDs = [Int32](repeating: 0, count: nbrs.count)
                 tmpIDs.withUnsafeMutableBufferPointer { buf in for i in 0..<nbrs.count { buf[i] = nbrs[i] } }
                 var tmpD = [Float](repeating: 0, count: nbrs.count)
@@ -211,12 +210,12 @@ private func greedyDescent_core(q: UnsafePointer<Float>, d: Int, entryPoint: Int
     return Int32(current)
 }
 #if ENABLE_TELEMETRY
-fileprivate var greedy_ns_accum: UInt64 = 0
-fileprivate var efsearch_ns_accum: UInt64 = 0
-fileprivate var earlyExitCount: Int = 0
-fileprivate var edgesVisitedCount: Int = 0
-fileprivate var neighborBatchesCount: Int = 0
-fileprivate var candidatesPushedCount: Int = 0
+private var greedy_ns_accum: UInt64 = 0
+private var efsearch_ns_accum: UInt64 = 0
+private var earlyExitCount: Int = 0
+private var edgesVisitedCount: Int = 0
+private var neighborBatchesCount: Int = 0
+private var candidatesPushedCount: Int = 0
 #endif
 
 private func efSearch_core(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offsetsL0: UnsafePointer<Int32>, neighborsL0: UnsafePointer<Int32>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
@@ -249,7 +248,7 @@ private func efSearch_core(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offs
             break }
         let node = cand.popMin(); let u = Int(node.id)
         let nbrs = layerNeighbors(offsets: offsetsL0, neighbors: neighborsL0, u: u, N: N)
-        if nbrs.count == 0 { continue }
+        if nbrs.isEmpty { continue }
         var toScoreIDs = [Int32](); toScoreIDs.reserveCapacity(nbrs.count)
         for v32 in nbrs {
             guard let v = clampID(v32, N: N) else { continue }

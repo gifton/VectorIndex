@@ -58,7 +58,7 @@ public struct AccelerationCandidates: Sendable {
     ) -> AccelerationCandidates {
         // This constructor assumes the storage is already properly formatted
         // and will be retained for the lifetime of the candidates
-        return AccelerationCandidates(
+        AccelerationCandidates(
             ids: ids,
             vectorStorage: existingStorage,
             vectorCount: vectorCount,

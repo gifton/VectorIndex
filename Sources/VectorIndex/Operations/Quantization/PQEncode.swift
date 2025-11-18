@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //  PQEncode.swift
 //  VectorIndex
 //
@@ -12,7 +12,7 @@
 //  - Deterministic tie-breaking: (distance, index)
 //  - Dot trick: ||x - c||^2 = ||x||^2 + ||c||^2 - 2<x,c>
 //  - Inner product & L2^2 microkernels (hooks/mocks below)
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import Foundation
 #if canImport(CPQEncode)
@@ -42,7 +42,7 @@ public struct PQEncodeOpts {
 
     /// Optional pointer to precomputed centroid squared norms, layout [m][ks].
     /// If nil, they are computed once per call.
-    public var centroidSqNorms: UnsafePointer<Float>? = nil
+    public var centroidSqNorms: UnsafePointer<Float>?
 
     /// Reserved for future (prefetch distance, etc.)
     public var reserved0: Int32 = 0
@@ -443,13 +443,13 @@ public func pq_encode_residual_u4_f32(
 /// Pack two 4-bit codes into one byte: low nibble = q1, high = q2.
 @inlinable
 public func pq_pack_u4_pair(_ qLow: UInt8, _ qHigh: UInt8) -> UInt8 {
-    return (qLow & 0x0F) | ((qHigh & 0x0F) << 4)
+    (qLow & 0x0F) | ((qHigh & 0x0F) << 4)
 }
 
 /// Unpack two 4-bit codes from byte.
 @inlinable
 public func pq_unpack_u4_pair(_ byte: UInt8) -> (low: UInt8, high: UInt8) {
-    return (byte & 0x0F, (byte >> 4) & 0x0F)
+    (byte & 0x0F, (byte >> 4) & 0x0F)
 }
 
 // MARK: - Core argmin (per-subspace)
@@ -637,7 +637,7 @@ internal func sqnorm(_ a: UnsafePointer<Float>, _ d: Int) -> Float {
 @inline(__always)
 @usableFromInline
 internal func load4(_ base: UnsafePointer<Float>, _ off: Int) -> SIMD4<Float> {
-    return (base + off).withMemoryRebound(to: SIMD4<Float>.self, capacity: 1) { $0.pointee }
+    (base + off).withMemoryRebound(to: SIMD4<Float>.self, capacity: 1) { $0.pointee }
 }
 
 @inline(__always)

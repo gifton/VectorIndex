@@ -23,15 +23,19 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: &data,
-                count: n,
-                dimension: d,
-                k: k,
-                config: KMeansSeedConfig(k: k, rngSeed: 42),
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: &data,
+                    count: n,
+                    dimension: d,
+                    k: k,
+                    config: KMeansSeedConfig(k: k, rngSeed: 42),
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
 
         let bytesProcessed = n * d * MemoryLayout<Float>.stride
@@ -50,15 +54,19 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: &data,
-                count: n,
-                dimension: d,
-                k: k,
-                config: KMeansSeedConfig(k: k, rngSeed: 42),
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: &data,
+                    count: n,
+                    dimension: d,
+                    k: k,
+                    config: KMeansSeedConfig(k: k, rngSeed: 42),
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
 
         let bytesProcessed = n * d * MemoryLayout<Float>.stride
@@ -76,15 +84,19 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: &data,
-                count: n,
-                dimension: d,
-                k: k,
-                config: KMeansSeedConfig(k: k, rngSeed: 42),
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: &data,
+                    count: n,
+                    dimension: d,
+                    k: k,
+                    config: KMeansSeedConfig(k: k, rngSeed: 42),
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
 
         let bytesProcessed = n * d * MemoryLayout<Float>.stride
@@ -102,15 +114,19 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: &data,
-                count: n,
-                dimension: d,
-                k: k,
-                config: KMeansSeedConfig(k: k, rngSeed: 42),
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: &data,
+                    count: n,
+                    dimension: d,
+                    k: k,
+                    config: KMeansSeedConfig(k: k, rngSeed: 42),
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
 
         let bytesProcessed = n * d * MemoryLayout<Float>.stride
@@ -128,15 +144,19 @@ final class KMeansKernelBenchmarks: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: &data,
-                count: n,
-                dimension: d,
-                k: k,
-                config: KMeansSeedConfig(k: k, rngSeed: 42),
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: &data,
+                    count: n,
+                    dimension: d,
+                    k: k,
+                    config: KMeansSeedConfig(k: k, rngSeed: 42),
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
 
         print("  → Centroids: \(k), Data: \(n) vectors")
@@ -421,15 +441,20 @@ final class KMeansKernelBenchmarks: XCTestCase {
         measure {
             // Phase 1: K-means++ seeding
             var initCentroids = [Float](repeating: 0, count: k * d)
-            _ = try! kmeansPlusPlusSeed(
-                data: &data,
-                count: n,
-                dimension: d,
-                k: k,
-                config: KMeansSeedConfig(k: k, rngSeed: 42),
-                centroidsOut: &initCentroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: &data,
+                    count: n,
+                    dimension: d,
+                    k: k,
+                    config: KMeansSeedConfig(k: k, rngSeed: 42),
+                    centroidsOut: &initCentroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+                return
+            }
 
             // Phase 2: Mini-batch k-means training
             var finalCentroids = initCentroids

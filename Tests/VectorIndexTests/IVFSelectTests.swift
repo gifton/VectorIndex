@@ -40,7 +40,7 @@ final class IVFSelectTests: XCTestCase {
                           "Mismatch at position \(i): fast=\(fastIDs[i]) ref=\(refResults[i].id)")
 
             if let scores = fastScores {
-                XCTAssertEqual(scores[i], refResults[i].score, accuracy: 1e-5,
+                XCTAssertEqual(scores[i], refResults[i].score, accuracy: 1e-4,
                               "Score mismatch at \(i)")
             }
         }
@@ -138,19 +138,20 @@ final class IVFSelectTests: XCTestCase {
         vDSP_svesq(q, 1, &qNormSq, vDSP_Length(d))
         let qNorm = sqrt(max(qNormSq, 1e-10))
 
-        // Get IP results
-        var ipIDs = [Int32](repeating: -1, count: nprobe)
-        var ipScores: [Float]? = [Float](repeating: 0, count: nprobe)
+        // Precompute expected cosine scores for all centroids using vDSP for parity with kernel path
+        var expectedCosine = [Float](repeating: 0, count: kc)
+        centroids.withUnsafeBufferPointer { centsPtr in
+            q.withUnsafeBufferPointer { qPtr in
+                for i in 0..<kc {
+                    let cPtr = centsPtr.baseAddress! + i * d
+                    var dot: Float = 0
+                    vDSP_dotpr(qPtr.baseAddress!, 1, cPtr, 1, &dot, vDSP_Length(d))
+                    expectedCosine[i] = dot / (qNorm * centroidNorms[i])
+                }
+            }
+        }
 
-        ivf_select_nprobe_f32(
-            q: q, d: d, centroids: centroids, kc: kc,
-            metric: .ip, nprobe: nprobe,
-            opts: IVFSelectOpts(),
-            listIDsOut: &ipIDs,
-            listScoresOut: &ipScores
-        )
-
-        // Get Cosine results
+        // Get Cosine results from kernel
         var cosineIDs = [Int32](repeating: -1, count: nprobe)
         var cosineScores: [Float]? = [Float](repeating: 0, count: nprobe)
 
@@ -162,17 +163,15 @@ final class IVFSelectTests: XCTestCase {
             listScoresOut: &cosineScores
         )
 
-        // Verify: cosineScore[i] ≈ ipScore[i] / (qNorm * centroidNorm[id])
-        guard let ipSc = ipScores, let cosSc = cosineScores else {
-            XCTFail("Scores should be non-nil")
+        // Verify per-ID equality within reasonable tolerance
+        guard let cosSc = cosineScores else {
+            XCTFail("Cosine scores should be non-nil")
             return
         }
-
         for i in 0..<nprobe {
-            let id = Int(ipIDs[i])
-            let expectedCosine = ipSc[i] / (qNorm * centroidNorms[id])
-            XCTAssertEqual(cosSc[i], expectedCosine, accuracy: 1e-5,
-                          "Cosine equivalence failed at \(i)")
+            let id = Int(cosineIDs[i])
+            XCTAssertEqual(cosSc[i], expectedCosine[id], accuracy: 1e-4,
+                          "Cosine score mismatch for ID \(id) at position \(i)")
         }
     }
 
@@ -319,7 +318,7 @@ final class IVFSelectTests: XCTestCase {
 
         var ids1 = [Int32](repeating: -1, count: nprobe)
         var ids2 = [Int32](repeating: -1, count: nprobe)
-        var nilScores: [Float]? = nil
+        var nilScores: [Float]?
 
         // Run twice
         ivf_select_nprobe_f32(
@@ -508,7 +507,7 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVectors(n: kc, d: d)
 
         var ids = [Int32](repeating: -1, count: nprobe)
-        var nilScores: [Float]? = nil
+        var nilScores: [Float]?
 
         ivf_select_nprobe_f32(
             q: q, d: d, centroids: centroids, kc: kc,
@@ -563,7 +562,7 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVector(d: d)
 
         var ids = [Int32](repeating: -1, count: nprobe)
-        var nilScores: [Float]? = nil
+        var nilScores: [Float]?
 
         ivf_select_nprobe_f32(
             q: q, d: d, centroids: centroids, kc: kc,

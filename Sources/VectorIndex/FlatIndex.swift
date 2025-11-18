@@ -21,7 +21,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         self.metric = metric
     }
 
-    public func insert(id: VectorID, vector: [Float], metadata: [String : String]?) async throws {
+    public func insert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
         guard vector.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: vector.count)
         }
@@ -32,7 +32,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         vectors.removeValue(forKey: id)
     }
 
-    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String : String]?)]) async throws {
+    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?)]) async throws {
         for item in items {
             guard item.vector.count == dimension else {
                 throw VectorError.dimensionMismatch(expected: dimension, actual: item.vector.count)
@@ -45,7 +45,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         // No-op for flat index
     }
 
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
         guard k > 0 else { return [] }
         var results: [SearchResult] = []
         results.reserveCapacity(min(k, vectors.count))
@@ -65,7 +65,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         return results
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
         var out: [[SearchResult]] = []
         out.reserveCapacity(queries.count)
         for q in queries {
@@ -120,7 +120,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         vectors[id] != nil
     }
 
-    public func update(id: VectorID, vector: [Float]?, metadata: [String : String]?) async throws -> Bool {
+    public func update(id: VectorID, vector: [Float]?, metadata: [String: String]?) async throws -> Bool {
         guard var entry = vectors[id] else { return false }
         if let v = vector {
             guard v.count == dimension else { throw VectorError.dimensionMismatch(expected: dimension, actual: v.count) }
@@ -192,7 +192,7 @@ extension FlatIndex {
     }
     
     public func getIndexStructure() async -> IndexStructure {
-        return .flat
+        .flat
     }
     
     public func finalizeResults(
@@ -217,4 +217,3 @@ extension FlatIndex {
         return finalResults
     }
 }
-

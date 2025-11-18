@@ -17,7 +17,7 @@ final class DTypeConversionTests: XCTestCase {
             5.96046e-8,                    // f16 subnormal
             .infinity, -.infinity,         // Infinities
             .nan,                          // NaN (payload test separate)
-            123.456, -789.012,             // Typical values
+            123.456, -789.012             // Typical values
         ]
 
         var f16Buffer = [UInt16](repeating: 0, count: testVectors.count)
@@ -93,7 +93,7 @@ final class DTypeConversionTests: XCTestCase {
             1.0, -1.0,
             3.14159, -2.71828,
             .infinity, -.infinity,
-            .nan,
+            .nan
         ]
 
         var bf16Buffer = [UInt16](repeating: 0, count: testVectors.count)
@@ -162,8 +162,8 @@ final class DTypeConversionTests: XCTestCase {
 
         XCTAssertEqual(i8Buffer[0], -128, "Should saturate to min")
         XCTAssertEqual(i8Buffer[1], -128, "Should saturate to min")
-        XCTAssertEqual(i8Buffer[2], 127,  "Max value should fit")
-        XCTAssertEqual(i8Buffer[3], 127,  "Should saturate to max")
+        XCTAssertEqual(i8Buffer[2], 127, "Max value should fit")
+        XCTAssertEqual(i8Buffer[3], 127, "Should saturate to max")
     }
 
     func testAffineQuantizationWithZeroPoint() {

@@ -264,23 +264,18 @@ public func ivf_select_nprobe_batch_f32(
         listScoresOut = [Float](repeating: .nan, count: b * nprobe)
     }
 
-   
+    // Stage per-query results during parallel compute to avoid concurrent writes
+    let accumulator = BatchAccumulator(count: b)
+    let wantScores = (listScoresOut != nil)
 
     DispatchQueue.concurrentPerform(iterations: b) { i in
-        
-        // Prepare local output buffers to avoid mutating inout outputs inside concurrent closures.
-        var idsAll = listIDsOut // size b * nprobe (ensured above)
-        var scoresAll = listScoresOut // optional scores
         let qOffset = i * d
-        let outOffset = i * nprobe
-
         Q.withUnsafeBufferPointer { QPtr in
             centroids.withUnsafeBufferPointer { centsPtr in
-                // Direct pointer slicing - no allocation
                 let qSlice = UnsafeBufferPointer(start: QPtr.baseAddress! + qOffset, count: d)
 
                 var localIDs = [Int32](repeating: -1, count: nprobe)
-                var localScores: [Float]? = (scoresAll != nil) ? [Float](repeating: .nan, count: nprobe) : nil
+                var localScores: [Float]? = wantScores ? [Float](repeating: .nan, count: nprobe) : nil
 
                 selectNprobeSingleThread(
                     q: qSlice,
@@ -294,19 +289,44 @@ public func ivf_select_nprobe_batch_f32(
                     listScoresOut: &localScores
                 )
 
-                // Write to local batch output (thread-safe: disjoint ranges per i)
-                for j in 0..<nprobe {
-                    idsAll[outOffset + j] = localIDs[j]
-                }
-                if let localSc = localScores, scoresAll != nil {
-                    for j in 0..<nprobe { scoresAll![outOffset + j] = localSc[j] }
-                }
+                accumulator.set(i, QueryResult(ids: localIDs, scores: localScores))
             }
         }
-        
-        // Copy back to inout outputs
-        listIDsOut = idsAll
-        if listScoresOut != nil { listScoresOut = scoresAll }
+    }
+
+    // Serial copy from accumulator into output buffers
+    if var scoresOut = listScoresOut {
+        for i in 0..<b {
+            let outOffset = i * nprobe
+            let res = accumulator.get(i)
+            let ids = res.ids
+            let scs = res.scores!
+            for j in 0..<nprobe { listIDsOut[outOffset + j] = ids[j] }
+            for j in 0..<nprobe { scoresOut[outOffset + j] = scs[j] }
+        }
+        listScoresOut = scoresOut
+    } else {
+        for i in 0..<b {
+            let outOffset = i * nprobe
+            let ids = accumulator.get(i).ids
+            for j in 0..<nprobe { listIDsOut[outOffset + j] = ids[j] }
+        }
+    }
+}
+
+// Per-query staging for batch mode to avoid concurrent writes to output arrays
+private struct QueryResult { let ids: [Int32]; let scores: [Float]? }
+private final class BatchAccumulator: @unchecked Sendable {
+    private var storage: [QueryResult?]
+    private let lock = NSLock()
+    init(count: Int) { storage = Array(repeating: nil, count: count) }
+    func set(_ index: Int, _ value: QueryResult) {
+        lock.lock(); defer { lock.unlock() }
+        storage[index] = value
+    }
+    func get(_ index: Int) -> QueryResult {
+        lock.lock(); defer { lock.unlock() }
+        return storage[index] ?? QueryResult(ids: [], scores: nil)
     }
 }
 
@@ -738,7 +758,7 @@ private final class PartitionAccumulator: @unchecked Sendable {
         storage[index] = value
     }
     func toArray() -> [PartitionResult] {
-        return storage.map { $0 ?? PartitionResult(ids: [], scores: []) }
+        storage.map { $0 ?? PartitionResult(ids: [], scores: []) }
     }
 }
 

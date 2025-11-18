@@ -157,10 +157,20 @@ private func effectiveThreads(_ requested: Int) -> Int {
     return max(1, ProcessInfo.processInfo.activeProcessorCount)
 }
 
+// MARK: - Sendable wrappers for unsafe pointers
+
+struct UnsafeSendablePtr<T>: @unchecked Sendable {
+    let ptr: UnsafePointer<T>
+}
+
+struct UnsafeSendableMutPtr<T>: @unchecked Sendable {
+    let ptr: UnsafeMutablePointer<T>
+}
+
 private func parallelRangeDispatch(
     total: Int,
     numWorkers: Int,
-    _ body: @escaping (_ start: Int, _ endExclusive: Int) -> Void
+    _ body: @escaping @Sendable (_ start: Int, _ endExclusive: Int) -> Void
 ) {
     if numWorkers <= 1 || total < 1024 {
         body(0, total)
@@ -191,11 +201,16 @@ private func scanU8AoS(
     let bias = opts.addBias
     let doKahan = opts.strictFP && m >= 64
 
+    // Create Sendable wrappers for pointers to ensure safe concurrent access
+    let codesS = UnsafeSendablePtr(ptr: codes.baseAddress!)
+    let lutS = UnsafeSendablePtr(ptr: lut.baseAddress!)
+    let outS = UnsafeSendableMutPtr(ptr: out.baseAddress!)
+
     parallelRangeDispatch(total: n, numWorkers: effectiveThreads(opts.numThreads)) { a, b in
-        // Raw base pointers
-        let codesBase = codes.baseAddress!
-        let lutBase = lut.baseAddress!
-        let outBase = out.baseAddress!
+        // Recover base pointers from Sendable wrappers
+        let codesBase = codesS.ptr
+        let lutBase = lutS.ptr
+        let outBase = outS.ptr
 
         for i in a..<b {
             // Prefetch future code row
@@ -285,14 +300,19 @@ private func scanU8Interleaved(
     let doKahan = opts.strictFP && m >= 64
     let prefetchD = max(0, opts.prefetchDistance)
 
-    let codesBase = codes.baseAddress!
-    let lutBase = lut.baseAddress!
-    let outBase = out.baseAddress!
+    // Create Sendable wrappers for pointers to ensure safe concurrent access
+    let codesS = UnsafeSendablePtr(ptr: codes.baseAddress!)
+    let lutS = UnsafeSendablePtr(ptr: lut.baseAddress!)
+    let outS = UnsafeSendableMutPtr(ptr: out.baseAddress!)
 
     let numBlocks = (n + g - 1) / g
     let blockSpan = m * g // bytes per block for u8
 
     parallelRangeDispatch(total: numBlocks, numWorkers: effectiveThreads(opts.numThreads)) { a, b in
+        // Recover base pointers from Sendable wrappers
+        let codesBase = codesS.ptr
+        let lutBase = lutS.ptr
+        let outBase = outS.ptr
         for block in a..<b {
             let baseIndex = block * g
             let blockSize = min(g, n - baseIndex)
@@ -308,14 +328,14 @@ private func scanU8Interleaved(
 
             // Initialize sums for vectors in this block
             // g is typically <= 8; we allocate a small stack-like array
-            var sums = Array<Float>(repeating: 0, count: blockSize)
+            var sums = [Float](repeating: 0, count: blockSize)
 
             let blockCodes = codesBase + block * blockSpan
 
             if doKahan {
                 // Kahan per vector
-                var sum = Array<Float>(repeating: 0, count: blockSize)
-                var comp = Array<Float>(repeating: 0, count: blockSize)
+                var sum = [Float](repeating: 0, count: blockSize)
+                var comp = [Float](repeating: 0, count: blockSize)
 
                 var j = 0
                 while j < m {
@@ -376,10 +396,16 @@ private func scanU4AoS(
     let bias = opts.addBias
     let doKahan = opts.strictFP && m >= 64
 
+    // Create Sendable wrappers for pointers to ensure safe concurrent access
+    let codesS = UnsafeSendablePtr(ptr: codes.baseAddress!)
+    let lutS = UnsafeSendablePtr(ptr: lut.baseAddress!)
+    let outS = UnsafeSendableMutPtr(ptr: out.baseAddress!)
+
     parallelRangeDispatch(total: n, numWorkers: effectiveThreads(opts.numThreads)) { a, b in
-        let codesBase = codes.baseAddress!
-        let lutBase = lut.baseAddress!
-        let outBase = out.baseAddress!
+        // Recover base pointers from Sendable wrappers
+        let codesBase = codesS.ptr
+        let lutBase = lutS.ptr
+        let outBase = outS.ptr
 
         for i in a..<b {
             if prefetchD > 0 {
@@ -451,15 +477,20 @@ private func scanU4Interleaved(
     let doKahan = opts.strictFP && m >= 64
     let prefetchD = max(0, opts.prefetchDistance)
 
-    let codesBase = codes.baseAddress!
-    let lutBase = lut.baseAddress!
-    let outBase = out.baseAddress!
+    // Create Sendable wrappers for pointers to ensure safe concurrent access
+    let codesS = UnsafeSendablePtr(ptr: codes.baseAddress!)
+    let lutS = UnsafeSendablePtr(ptr: lut.baseAddress!)
+    let outS = UnsafeSendableMutPtr(ptr: out.baseAddress!)
 
     let pairs = m / 2
     let blockSpanBytes = pairs * g   // bytes per block
     let numBlocks = (n + g - 1) / g
 
     parallelRangeDispatch(total: numBlocks, numWorkers: effectiveThreads(opts.numThreads)) { a, b in
+        // Recover base pointers from Sendable wrappers
+        let codesBase = codesS.ptr
+        let lutBase = lutS.ptr
+        let outBase = outS.ptr
         for block in a..<b {
             let baseIndex = block * g
             let blockSize = min(g, n - baseIndex)
@@ -474,8 +505,8 @@ private func scanU4Interleaved(
             let blockCodes = codesBase + block * blockSpanBytes
 
             if doKahan {
-                var sum = Array<Float>(repeating: 0, count: blockSize)
-                var comp = Array<Float>(repeating: 0, count: blockSize)
+                var sum = [Float](repeating: 0, count: blockSize)
+                var comp = [Float](repeating: 0, count: blockSize)
 
                 var jp = 0
                 while jp < pairs {
@@ -511,7 +542,7 @@ private func scanU4Interleaved(
                     outBase[baseIndex + v] = sum[v] + bias
                 }
             } else {
-                var sums = Array<Float>(repeating: 0, count: blockSize)
+                var sums = [Float](repeating: 0, count: blockSize)
                 var jp = 0
                 while jp < pairs {
                     let j0 = 2 * jp

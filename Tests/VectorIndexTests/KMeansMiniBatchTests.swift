@@ -28,17 +28,14 @@ final class KMeansMiniBatchTests: XCTestCase {
             data += [Float.random(in: -0.5..<0.5), Float.random(in: 4.5..<5.5)]
         }
 
-        // Random initialization
+        // Deterministic seeding and stronger training settings for stability
         var centroids = [Float](repeating: 0, count: k * d)
-        for i in 0..<(k * d) {
-            centroids[i] = Float.random(in: -1..<6)
-        }
-
         let cfg = KMeansMBConfig(
             algo: .lloydMiniBatch,
-            batchSize: 50,
-            epochs: 20,
-            tol: 1e-3
+            batchSize: 64,
+            epochs: 80,
+            tol: 1e-3,
+            seed: 12345
         )
 
         var stats = KMeansMBStats(
@@ -48,7 +45,8 @@ final class KMeansMiniBatchTests: XCTestCase {
         )
         let status = kmeans_minibatch_f32(
             x: data, n: Int64(n), d: d, kc: k,
-            initCentroids: centroids,
+            // Use KMeans++ seeding for robust initialization
+            initCentroids: nil,
             cfg: cfg,
             centroidsOut: &centroids,
             assignOut: nil,
@@ -167,7 +165,8 @@ final class KMeansMiniBatchTests: XCTestCase {
         let cfgFull = KMeansMBConfig(
             algo: .lloydMiniBatch,
             batchSize: n,
-            epochs: 20
+            epochs: 20,
+            seed: 12345
         )
         _ = kmeans_minibatch_f32(
             x: data, n: Int64(n), d: d, kc: k,
@@ -181,7 +180,8 @@ final class KMeansMiniBatchTests: XCTestCase {
         let cfgMini = KMeansMBConfig(
             algo: .lloydMiniBatch,
             batchSize: 50,
-            epochs: 50
+            epochs: 80,
+            seed: 12345
         )
         _ = kmeans_minibatch_f32(
             x: data, n: Int64(n), d: d, kc: k,

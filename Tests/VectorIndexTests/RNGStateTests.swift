@@ -220,7 +220,7 @@ final class RNGStateTests: XCTestCase {
         let expected: [UInt64] = [
             rng.next(), // We don't hardcode expected values as LCG is platform-independent
             rng.next(), // but this test documents that the sequence is stable
-            rng.next(),
+            rng.next()
         ]
 
         // Reset and verify

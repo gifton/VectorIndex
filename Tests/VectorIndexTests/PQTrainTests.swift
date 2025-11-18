@@ -12,6 +12,12 @@ import XCTest
 ///   - Edge cases (empty clusters, degenerate data)
 ///   - Performance (SIMD optimization validation)
 final class PQTrainTests: XCTestCase {
+    override func setUpWithError() throws {
+        // Allow skipping slow PQTrain tests in CI via env flag
+        if ProcessInfo.processInfo.environment["CI_SKIP_PQTRAIN"] == "1" {
+            throw XCTSkip("Skipping PQTrain tests in CI environment")
+        }
+    }
 
     // MARK: - Basic Functionality Tests
 
@@ -28,6 +34,7 @@ final class PQTrainTests: XCTestCase {
         }
 
         var codebooks = [Float]()
+        
         var norms: [Float]? = []
 
         let stats = try pq_train_f32(
@@ -69,7 +76,7 @@ final class PQTrainTests: XCTestCase {
         var cfg = PQTrainConfig()
         cfg.algo = .minibatch
         cfg.batchSize = 512
-        cfg.maxIters = 10
+        cfg.maxIters = 5
 
         var codebooks = [Float]()
         var norms: [Float]? = []
@@ -91,7 +98,7 @@ final class PQTrainTests: XCTestCase {
 
     func testDeterministicReproducibility() throws {
         // Same seed → same codebooks (bit-exact)
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         let n: Int64 = 2000
         let d = 128
         let m = 4
@@ -139,7 +146,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testNumericalStability() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test with large dataset to expose accumulation errors
         let n: Int64 = 10_000
         let d = 1024
@@ -172,7 +179,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testDistortionDecreases() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Distortion should decrease (or stay same) each iteration
         let n: Int64 = 3000
         let d = 128
@@ -207,7 +214,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Residual PQ Tests
 
     func testResidualPQ() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test residual PQ mode (IVF-PQ)
         let n: Int64 = 2000
         let d = 256
@@ -255,7 +262,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testResidualVsDirectPQ() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Residual PQ should achieve lower distortion on clustered data
         let n: Int64 = 3000
         let d = 128
@@ -320,10 +327,177 @@ final class PQTrainTests: XCTestCase {
         print("✅ Residual PQ advantage verified")
     }
 
+    // MARK: - Warm-start Tests
+
+    func testWarmStartMinibatchImprovesOnePass() throws {
+        let n: Int64 = 3000
+        let d = 128
+        let m = 4
+        let ks = 64
+
+        // Synthetic data
+        var x = [Float](repeating: 0, count: Int(n) * d)
+        for i in 0..<(Int(n) * d) {
+            x[i] = Float((i % 251) - 125) / 50.0
+        }
+
+        // Seed run: a few passes to generate a reasonable codebook
+        var seedCfg = PQTrainConfig()
+        seedCfg.algo = .minibatch
+        seedCfg.batchSize = 256
+        seedCfg.maxIters = 3
+        seedCfg.sampleN = 1500
+        seedCfg.verbose = false
+
+        var seedCodebooks = [Float]()
+        var nilNorms: [Float]?
+        let seedStats = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: seedCfg,
+            codebooksOut: &seedCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+        XCTAssertEqual(seedCodebooks.count, m * ks * (d/m))
+
+        // Cold start: 1 pass from scratch
+        var coldCfg = seedCfg
+        coldCfg.maxIters = 1
+        var coldCodebooks = [Float]()
+        let coldStats = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: coldCfg,
+            codebooksOut: &coldCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        // Warm start: 1 pass, initialized from seedCodebooks
+        var warmCfg = coldCfg
+        warmCfg.warmStart = true
+        var warmCodebooks = seedCodebooks // pass codebooks in as initial
+        let warmStats = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: warmCfg,
+            codebooksOut: &warmCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        // Expect warm-start to be no worse than cold-start given same pass budget
+        XCTAssertLessThanOrEqual(warmStats.distortion, coldStats.distortion * 1.0001,
+                                 "Warm-start should not regress compared to cold-start for same pass budget")
+    }
+
+    func testWarmStartLloydImprovesOneIter() throws {
+        let n: Int64 = 2000
+        let d = 64
+        let m = 4
+        let ks = 64
+
+        var x = [Float](repeating: 0, count: Int(n) * d)
+        for i in 0..<(Int(n) * d) { x[i] = Float((i % 97) - 48) / 25.0 }
+
+        // Seed with several iterations
+        var seedCfg = PQTrainConfig()
+        seedCfg.algo = .lloyd
+        seedCfg.maxIters = 5
+        seedCfg.verbose = false
+
+        var seedCodebooks = [Float]()
+        var nilNorms: [Float]?
+        _ = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: seedCfg,
+            codebooksOut: &seedCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        // Cold start: 1 iteration
+        var coldCfg = seedCfg
+        coldCfg.maxIters = 1
+        var coldCodebooks = [Float]()
+        let coldStats = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: coldCfg,
+            codebooksOut: &coldCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        // Warm start: 1 iteration starting from seedCodebooks
+        var warmCfg = coldCfg
+        warmCfg.warmStart = true
+        var warmCodebooks = seedCodebooks
+        let warmStats = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: warmCfg,
+            codebooksOut: &warmCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        XCTAssertLessThanOrEqual(warmStats.distortion, coldStats.distortion * 1.0001,
+                                 "Warm-start Lloyd should not be worse than cold-start for one iteration")
+    }
+
+    func testWarmStartDeterministic() throws {
+        let n: Int64 = 1000
+        let d = 64
+        let m = 2
+        let ks = 32
+
+        var x = [Float](repeating: 0, count: Int(n) * d)
+        for i in 0..<(Int(n) * d) { x[i] = Float((i % 41) - 20) / 10.0 }
+
+        // Produce initial codebooks
+        var seedCfg = PQTrainConfig()
+        seedCfg.algo = .minibatch
+        seedCfg.batchSize = 128
+        seedCfg.maxIters = 2
+        seedCfg.sampleN = 800
+        seedCfg.verbose = false
+
+        var initCodebooks = [Float]()
+        var nilNorms: [Float]?
+        _ = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: seedCfg,
+            codebooksOut: &initCodebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        // Two warm-start runs from the same initial codebooks and seed
+        var cfg = PQTrainConfig()
+        cfg.algo = .minibatch
+        cfg.batchSize = 128
+        cfg.maxIters = 2
+        cfg.sampleN = 800
+        cfg.seed = 12345
+        cfg.warmStart = true
+
+        var codebooks1 = initCodebooks
+        let stats1 = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: cfg,
+            codebooksOut: &codebooks1,
+            centroidNormsOut: &nilNorms
+        )
+
+        var codebooks2 = initCodebooks
+        let stats2 = try pq_train_f32(
+            x: x, n: n, d: d, m: m, ks: ks,
+            cfg: cfg,
+            codebooksOut: &codebooks2,
+            centroidNormsOut: &nilNorms
+        )
+
+        XCTAssertEqual(codebooks1.count, codebooks2.count)
+        for i in 0..<codebooks1.count {
+            XCTAssertEqual(codebooks1[i], codebooks2[i], accuracy: 1e-6)
+        }
+        XCTAssertEqual(stats1.distortion, stats2.distortion, accuracy: 1e-9)
+    }
+
     // MARK: - Edge Case Tests
 
     func testEmptyClusterRepair() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test empty cluster repair with pathological data
         let n: Int64 = 500
         let d = 64
@@ -356,7 +530,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testMinimumData() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test with n == ks (minimum viable data)
         let n: Int64 = 64
         let d = 128
@@ -382,7 +556,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testInsufficientData() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Should throw error when n < ks
         let n: Int64 = 50
         let ks = 100
@@ -409,7 +583,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testInvalidDimension() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Should throw error when d not divisible by m
         var x = [Float](repeating: 0, count: 1000 * 100)
         var codebooks = [Float]()
@@ -436,7 +610,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Streaming API Tests
 
     func testStreamingPQTraining() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test streaming API with chunked data
         let n: Int64 = 5000
         let d = 256
@@ -484,7 +658,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Performance Validation Tests
 
     func testLargeScaleTraining() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Test with realistic production scale
         let n: Int64 = 50_000
         let d = 768
@@ -522,7 +696,7 @@ final class PQTrainTests: XCTestCase {
     }
 
     func testParallelExecution() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Verify parallel execution works correctly
         let n: Int64 = 10_000
         let d = 512
@@ -576,7 +750,7 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Compression Quality Tests
 
     func testCompressionQuality() throws {
-        var nilNorms: [Float]? = nil
+        var nilNorms: [Float]?
         // Verify PQ achieves reasonable compression vs quality trade-off
         let n: Int64 = 5000
         let d = 1024

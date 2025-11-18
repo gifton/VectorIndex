@@ -32,4 +32,3 @@ public final class ExternalIDRegistry {
         return out
     }
 }
-

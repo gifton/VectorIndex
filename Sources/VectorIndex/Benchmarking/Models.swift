@@ -85,7 +85,7 @@ public struct BenchMetadata: Codable, Sendable {
 
 public struct BenchCase: Codable, Sendable {
     public var name: String               // e.g. Flat/HNSW/IVF
-    public var params: [String:String]
+    public var params: [String: String]
     public var metric: String             // distance metric
     public var n: Int
     public var q: Int
@@ -104,7 +104,7 @@ public struct BenchCase: Codable, Sendable {
 
     public init(
         name: String,
-        params: [String : String],
+        params: [String: String],
         metric: String,
         n: Int,
         q: Int,
@@ -134,7 +134,7 @@ public struct BenchCase: Codable, Sendable {
 
     // Minimal chart datapoint mapping that VectorBench can consume.
     public var chartDataPoints: [ChartDataPoint] {
-        return [
+        [
             ChartDataPoint(label: "avg_ms", x: 0, y: searchAvgMs),
             ChartDataPoint(label: "p95_ms", x: 0, y: searchP95Ms),
             ChartDataPoint(label: "qps", x: 0, y: throughputQps),
@@ -193,4 +193,3 @@ public func emitProgress(_ format: ProgressFormat?, event: ProgressEvent) {
         fflush(stdout)
     }
 }
-

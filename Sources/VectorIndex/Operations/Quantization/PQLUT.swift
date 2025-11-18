@@ -1,4 +1,4 @@
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 //  PQLUT.swift
 //  VectorIndex
 //
@@ -14,7 +14,7 @@
 //    - q:         [d], dsub = d/m
 //
 //  References: Spec #21 (API, options, algorithms, SIMD pattern)
-//===----------------------------------------------------------------------===//
+// ===----------------------------------------------------------------------===//
 
 import Foundation
 import simd
@@ -502,7 +502,7 @@ extension Array where Element == Float {
         centroidNorms: [Float]? = nil,
         opts: PQLutOpts = .default
     ) -> [Float] {
-        precondition(self.count > 0)
+        precondition(!self.isEmpty)
         let d = self.count
         precondition(d % m == 0, "d must be divisible by m")
         precondition(codebooks.count == m * ks * (d / m))

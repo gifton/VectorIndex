@@ -24,7 +24,7 @@ final class PersistenceEdgeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let ivf = IVFIndex(dimension: 2, metric: .euclidean, config: .init(nlist: 4, nprobe: 2))
-        try await ivf.batchInsert([("a", [0,0], nil), ("b", [1,0], nil), ("c", [0,1], nil)])
+        try await ivf.batchInsert([("a", [0, 0], nil), ("b", [1, 0], nil), ("c", [0, 1], nil)])
         // Save without calling optimize
         try await ivf.save(to: url)
         let loaded = try await IVFIndex.load(from: url)
@@ -39,7 +39,7 @@ final class PersistenceEdgeTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: url) }
 
         let flat = FlatIndex(dimension: 3)
-        try await flat.batchInsert([("x", [0,0,1], nil)])
+        try await flat.batchInsert([("x", [0, 0, 1], nil)])
         try await flat.save(to: url)
 
         do {
@@ -65,13 +65,13 @@ final class PersistenceEdgeTests: XCTestCase {
 
     func testHNSWCompactReducesDeleted() async throws {
         let idx = HNSWIndex(dimension: 2)
-        try await idx.batchInsert([("a", [0,0], nil), ("b", [1,0], nil), ("c", [0,1], nil)])
+        try await idx.batchInsert([("a", [0, 0], nil), ("b", [1, 0], nil), ("c", [0, 1], nil)])
         try await idx.remove(id: "b")
         try await idx.compact()
         let stats = await idx.statistics()
         XCTAssertEqual(stats.vectorCount, 2)
         // Search should not return deleted id
         let res = try await idx.search(query: [0.9, 0], k: 3, filter: nil)
-        XCTAssertFalse(res.map{ $0.id }.contains("b"))
+        XCTAssertFalse(res.map { $0.id }.contains("b"))
     }
 }

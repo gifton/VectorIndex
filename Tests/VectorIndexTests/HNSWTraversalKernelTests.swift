@@ -43,4 +43,3 @@ final class HNSWTraversalKernelTests: XCTestCase {
         XCTAssertEqual(distsOut[1], 0, accuracy: 1e-6)
     }
 }
-

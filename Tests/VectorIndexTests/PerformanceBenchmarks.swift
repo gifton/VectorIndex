@@ -1,8 +1,8 @@
-//import XCTest
-//import VectorCore
-//@testable import VectorIndex
+// import XCTest
+// import VectorCore
+// @testable import VectorIndex
 //
-//final class PerformanceBenchmarks: XCTestCase {
+// final class PerformanceBenchmarks: XCTestCase {
 //    private let enableBenchmarks: Bool = ProcessInfo.processInfo.environment["RUN_BENCHMARKS"] == "1"
 //
 //    override func setUpWithError() throws {
@@ -201,4 +201,4 @@
 //        XCTAssertLessThan(elapsed, 10.0, "Should build 100K vectors in < 10 seconds")
 //    }
 //    */
-//}
+// }

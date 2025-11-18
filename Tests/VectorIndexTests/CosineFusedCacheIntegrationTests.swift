@@ -26,11 +26,11 @@ final class CosineFusedCacheIntegrationTests: XCTestCase {
 
         XCTAssertEqual(baseline.map { $0.id }, fused.map { $0.id }, "Top-k IDs should match between two-pass and fused paths")
         zip(baseline, fused).forEach { (a, b) in
-            XCTAssertLessThan(abs(a.score - b.score), 1e-4, "Scores should match within tolerance")
+            // Float16 has reduced precision, so we need a slightly larger tolerance
+            XCTAssertLessThan(abs(a.score - b.score), 2e-4, "Scores should match within tolerance (accounting for float16 precision)")
         }
 
         // Cleanup: disable cache to avoid affecting other tests
         await idx.disableCosineFusedNormCache()
     }
 }
-

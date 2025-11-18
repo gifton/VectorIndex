@@ -31,14 +31,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     private var idToListIndex: [VectorID: Int] = [:]
 
     // Local storage for now (CPU baseline)
-    private var store: [VectorID: ([Float], [String:String]?)] = [:]
+    private var store: [VectorID: ([Float], [String: String]?)] = [:]
 
     // Kernel #30 integration (optional)
-    private var kernel30: IVFListHandle? = nil
-    private var kernel30Mmap: IndexMmap? = nil
+    private var kernel30: IVFListHandle?
+    private var kernel30Mmap: IndexMmap?
     // Kernel #50 integration (ID remap + registry)
-    private var idMap50: IDMap? = nil
-    private var idRegistry: ExternalIDRegistry? = nil
+    private var idMap50: IDMap?
+    private var idRegistry: ExternalIDRegistry?
     // Kernel #30 helpers for IVF-Flat rerank (#40):
     // Mapping arrays (internalID -> list, offset). Kept in sync during ingestion.
     private var id2List30: [Int32] = []
@@ -63,12 +63,12 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         self.config = .init()
     }
 
-    public func insert(id: VectorID, vector: [Float], metadata: [String : String]?) async throws {
+    public func insert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
         guard vector.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: vector.count)
         }
         // If replacing existing, detach from previous list mapping
-        if let _ = store[id], let oldList = idToListIndex[id] {
+        if store[id] != nil, let oldList = idToListIndex[id] {
             _ = removeID(id, fromList: oldList)
             idToListIndex.removeValue(forKey: id)
         }
@@ -90,7 +90,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String : String]?)]) async throws {
+    public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?)]) async throws {
         for item in items {
             try await insert(id: item.id, vector: item.vector, metadata: item.metadata)
         }
@@ -110,7 +110,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             self.kernel30Mmap = mmap
             self.kernel30 = try ivf_create_mmap(k_c: k_c, m: m, d: (format == .flat ? dimension : 0), mmap: mmap, opts: opts)
             // Attempt to load IDMap from durable container if present
-            if let blob = mmap.readIDMapBlob(), blob.count > 0 {
+            if let blob = mmap.readIDMapBlob(), !blob.isEmpty {
                 if let loaded = try? deserializeIDMap(blob) {
                     self.idMap50 = loaded
                 }
@@ -270,7 +270,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
         let k = max(1, min(config.nlist, store.count))
         // Initialize centroids using deterministic k‑means++ (farthest‑point) seeding
-        let initialCentroids = kmeansPlusPlusInitRandom(k: k, seed: 42)
+        let initialCentroids = try kmeansPlusPlusInitRandom(k: k, seed: 42)
         centroids = try await kmeans(centroids: initialCentroids, maxIterations: 20)
         // Build inverted lists
         lists = Array(repeating: [], count: centroids.count)
@@ -287,7 +287,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     public func optimizeKMeans(maxIterations: Int = 15) async throws {
         guard !store.isEmpty else { centroids.removeAll(); lists.removeAll(); return }
         let k = max(1, min(config.nlist, store.count))
-        let initC = kmeansPlusPlusInitRandom(k: k, seed: 42)
+        let initC = try kmeansPlusPlusInitRandom(k: k, seed: 42)
         centroids = try await kmeans(centroids: initC, maxIterations: maxIterations)
         lists = Array(repeating: [], count: centroids.count)
         for (id, (vec, _)) in store {
@@ -364,7 +364,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     // Seeded k-means++ (D²) sampling using Kernel #11
-    private func kmeansPlusPlusInitRandom(k: Int, seed: UInt64) -> [[Float]] {
+    private func kmeansPlusPlusInitRandom(k: Int, seed: UInt64) throws -> [[Float]] {
         precondition(!store.isEmpty)
         let d = dimension
         let items: [[Float]] = store.map { $0.value.0 }
@@ -386,9 +386,9 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             rounds: 5
         )
 
-        // Safe to force-try: store.isEmpty precondition ensures n >= 1,
+        // store.isEmpty precondition ensures n >= 1,
         // and k is validated by caller to be reasonable
-        _ = try! kmeansPlusPlusSeed(
+        _ = try kmeansPlusPlusSeed(
             data: flatData,
             count: items.count,
             dimension: d,
@@ -410,14 +410,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         return cents
     }
 
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
         }
         // Kernel #30 IVF-Flat accelerated path with exact rerank (#40).
         if let h = kernel30, h.format == .flat, mappingComplete30,
-           (metric == .euclidean || metric == .dotProduct || metric == .cosine) {
+           metric == .euclidean || metric == .dotProduct || metric == .cosine {
             return try await searchKernel30Flat(query: query, k: k, filter: filter)
         }
         // If we have centroids/lists, probe; else linear scan
@@ -461,7 +461,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
         var out: [[SearchResult]] = []
         out.reserveCapacity(queries.count)
         for q in queries {
@@ -484,7 +484,11 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             dimension: dimension,
             metric: metric,
             details: [
-                "nlist": String(centroids.count),
+                // Report configured nlist for consistency, even if training
+                // used fewer centroids due to small dataset size.
+                "nlist": String(config.nlist),
+                // Also report how many centroids are currently trained/built.
+                "trained_nlist": String(centroids.count),
                 "nprobe": String(config.nprobe),
                 "assigned": String(idToListIndex.count)
             ]
@@ -540,12 +544,11 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-
     public func contains(id: VectorID) async -> Bool {
         store[id] != nil
     }
 
-    public func update(id: VectorID, vector: [Float]?, metadata: [String : String]?) async throws -> Bool {
+    public func update(id: VectorID, vector: [Float]?, metadata: [String: String]?) async throws -> Bool {
         guard var entry = store[id] else { return false }
         if let v = vector {
             guard v.count == dimension else { throw VectorError.dimensionMismatch(expected: dimension, actual: v.count) }
@@ -724,14 +727,14 @@ extension IVFIndex {
         return (list, off)
     }
 
-    private func searchKernel30Flat(query: [Float], k: Int, filter: (@Sendable ([String : String]?) -> Bool)?) async throws -> [SearchResult] {
+    private func searchKernel30Flat(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
         guard let h = kernel30, h.format == .flat else { return [] }
         // 1) Select lists to probe
         let kc = h.k_c
         var probeLists: [Int32] = []
         if !centroids.isEmpty && (centroids.count == kc) && (centroids.first?.count == dimension) {
             var ids: [Int32] = []
-            var scores: [Float]? = nil
+            var scores: [Float]?
             let metricSel: IVFMetric = (metric == .euclidean) ? .l2 : (metric == .dotProduct ? .ip : .cosine)
             // Flatten centroids [[Float]] -> [Float]
             let flatC = centroids.flatMap { $0 }

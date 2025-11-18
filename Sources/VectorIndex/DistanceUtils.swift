@@ -65,4 +65,3 @@ func distance(_ a: [Float], _ b: [Float], metric: SupportedDistanceMetric) -> Fl
         }
     }
 }
-

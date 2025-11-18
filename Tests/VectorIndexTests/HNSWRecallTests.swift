@@ -82,4 +82,3 @@ final class HNSWRecallTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(avgRecall, 0.6, "Avg recall too low: \(avgRecall)")
     }
 }
-

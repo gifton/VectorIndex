@@ -27,9 +27,9 @@ final class HNSWTests: XCTestCase {
 
     func testHNSWRemove() async throws {
         let idx = HNSWIndex(dimension: 2)
-        try await idx.insert(id: "a", vector: [0,0], metadata: nil)
-        try await idx.insert(id: "b", vector: [1,0], metadata: nil)
-        try await idx.insert(id: "c", vector: [0,1], metadata: nil)
+        try await idx.insert(id: "a", vector: [0, 0], metadata: nil)
+        try await idx.insert(id: "b", vector: [1, 0], metadata: nil)
+        try await idx.insert(id: "c", vector: [0, 1], metadata: nil)
 
         var res = try await idx.search(query: [0.9, 0.1], k: 1, filter: nil)
         XCTAssertEqual(res.first?.id, "b")
@@ -39,4 +39,3 @@ final class HNSWTests: XCTestCase {
         XCTAssertNotEqual(res.first?.id, "b")
     }
 }
-

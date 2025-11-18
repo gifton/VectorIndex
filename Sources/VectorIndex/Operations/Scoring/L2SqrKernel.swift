@@ -230,9 +230,9 @@ func _l2sqr_single_direct(
 
     var j = 0
     while j + 15 < d {
-        let q0 = SIMD4<Float>(q + j + 0),  x0 = SIMD4<Float>(x + j + 0)
-        let q1 = SIMD4<Float>(q + j + 4),  x1 = SIMD4<Float>(x + j + 4)
-        let q2 = SIMD4<Float>(q + j + 8),  x2 = SIMD4<Float>(x + j + 8)
+        let q0 = SIMD4<Float>(q + j + 0), x0 = SIMD4<Float>(x + j + 0)
+        let q1 = SIMD4<Float>(q + j + 4), x1 = SIMD4<Float>(x + j + 4)
+        let q2 = SIMD4<Float>(q + j + 8), x2 = SIMD4<Float>(x + j + 8)
         let q3 = SIMD4<Float>(q + j + 12), x3 = SIMD4<Float>(x + j + 12)
         let d0 = q0 - x0
         let d1 = q1 - x1
@@ -296,9 +296,9 @@ func _l2sqr_direct_d512(
         let x = xb + i * d
         var a0 = SIMD4<Float>.zero, a1 = SIMD4<Float>.zero, a2 = SIMD4<Float>.zero, a3 = SIMD4<Float>.zero
         for j in stride(from: 0, to: d, by: 16) {
-            let q0 = SIMD4<Float>(q + j + 0),  x0 = SIMD4<Float>(x + j + 0)
-            let q1 = SIMD4<Float>(q + j + 4),  x1 = SIMD4<Float>(x + j + 4)
-            let q2 = SIMD4<Float>(q + j + 8),  x2 = SIMD4<Float>(x + j + 8)
+            let q0 = SIMD4<Float>(q + j + 0), x0 = SIMD4<Float>(x + j + 0)
+            let q1 = SIMD4<Float>(q + j + 4), x1 = SIMD4<Float>(x + j + 4)
+            let q2 = SIMD4<Float>(q + j + 8), x2 = SIMD4<Float>(x + j + 8)
             let q3 = SIMD4<Float>(q + j + 12), x3 = SIMD4<Float>(x + j + 12)
             let d0 = q0 - x0; a0 += d0 * d0
             let d1 = q1 - x1; a1 += d1 * d1
@@ -320,9 +320,9 @@ func _l2sqr_direct_d768(
         let x = xb + i * d
         var a0 = SIMD4<Float>.zero, a1 = SIMD4<Float>.zero, a2 = SIMD4<Float>.zero, a3 = SIMD4<Float>.zero
         for j in stride(from: 0, to: d, by: 16) {
-            let q0 = SIMD4<Float>(q + j + 0),  x0 = SIMD4<Float>(x + j + 0)
-            let q1 = SIMD4<Float>(q + j + 4),  x1 = SIMD4<Float>(x + j + 4)
-            let q2 = SIMD4<Float>(q + j + 8),  x2 = SIMD4<Float>(x + j + 8)
+            let q0 = SIMD4<Float>(q + j + 0), x0 = SIMD4<Float>(x + j + 0)
+            let q1 = SIMD4<Float>(q + j + 4), x1 = SIMD4<Float>(x + j + 4)
+            let q2 = SIMD4<Float>(q + j + 8), x2 = SIMD4<Float>(x + j + 8)
             let q3 = SIMD4<Float>(q + j + 12), x3 = SIMD4<Float>(x + j + 12)
             let d0 = q0 - x0; a0 += d0 * d0
             let d1 = q1 - x1; a1 += d1 * d1
@@ -344,9 +344,9 @@ func _l2sqr_direct_d1024(
         let x = xb + i * d
         var a0 = SIMD4<Float>.zero, a1 = SIMD4<Float>.zero, a2 = SIMD4<Float>.zero, a3 = SIMD4<Float>.zero
         for j in stride(from: 0, to: d, by: 16) {
-            let q0 = SIMD4<Float>(q + j + 0),  x0 = SIMD4<Float>(x + j + 0)
-            let q1 = SIMD4<Float>(q + j + 4),  x1 = SIMD4<Float>(x + j + 4)
-            let q2 = SIMD4<Float>(q + j + 8),  x2 = SIMD4<Float>(x + j + 8)
+            let q0 = SIMD4<Float>(q + j + 0), x0 = SIMD4<Float>(x + j + 0)
+            let q1 = SIMD4<Float>(q + j + 4), x1 = SIMD4<Float>(x + j + 4)
+            let q2 = SIMD4<Float>(q + j + 8), x2 = SIMD4<Float>(x + j + 8)
             let q3 = SIMD4<Float>(q + j + 12), x3 = SIMD4<Float>(x + j + 12)
             let d0 = q0 - x0; a0 += d0 * d0
             let d1 = q1 - x1; a1 += d1 * d1
@@ -368,9 +368,9 @@ func _l2sqr_direct_d1536(
         let x = xb + i * d
         var a0 = SIMD4<Float>.zero, a1 = SIMD4<Float>.zero, a2 = SIMD4<Float>.zero, a3 = SIMD4<Float>.zero
         for j in stride(from: 0, to: d, by: 16) {
-            let q0 = SIMD4<Float>(q + j + 0),  x0 = SIMD4<Float>(x + j + 0)
-            let q1 = SIMD4<Float>(q + j + 4),  x1 = SIMD4<Float>(x + j + 4)
-            let q2 = SIMD4<Float>(q + j + 8),  x2 = SIMD4<Float>(x + j + 8)
+            let q0 = SIMD4<Float>(q + j + 0), x0 = SIMD4<Float>(x + j + 0)
+            let q1 = SIMD4<Float>(q + j + 4), x1 = SIMD4<Float>(x + j + 4)
+            let q2 = SIMD4<Float>(q + j + 8), x2 = SIMD4<Float>(x + j + 8)
             let q3 = SIMD4<Float>(q + j + 12), x3 = SIMD4<Float>(x + j + 12)
             let d0 = q0 - x0; a0 += d0 * d0
             let d1 = q1 - x1; a1 += d1 * d1
@@ -459,9 +459,9 @@ private func _l2sqr_block_dot_fused_serial(
 
         var j = 0
         while j + 15 < dBlocked {
-            let q0 = SIMD4<Float>(q + j + 0),  x0 = SIMD4<Float>(row + j + 0)
-            let q1 = SIMD4<Float>(q + j + 4),  x1 = SIMD4<Float>(row + j + 4)
-            let q2 = SIMD4<Float>(q + j + 8),  x2 = SIMD4<Float>(row + j + 8)
+            let q0 = SIMD4<Float>(q + j + 0), x0 = SIMD4<Float>(row + j + 0)
+            let q1 = SIMD4<Float>(q + j + 4), x1 = SIMD4<Float>(row + j + 4)
+            let q2 = SIMD4<Float>(q + j + 8), x2 = SIMD4<Float>(row + j + 8)
             let q3 = SIMD4<Float>(q + j + 12), x3 = SIMD4<Float>(row + j + 12)
             acc0 += q0 * x0
             acc1 += q1 * x1

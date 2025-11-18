@@ -130,7 +130,7 @@ public struct KMeansSeedStats: Sendable {
     /// Average distance to nearest centroid
     @inlinable
     public var averageDistanceSquared: Double {
-        return totalCost / Double(n)
+        totalCost / Double(n)
     }
 }
 
@@ -313,7 +313,8 @@ internal func _vi_km11_updateSquaredDistances(
         // Compute ‖x_i - c_new‖² using SIMD
         var distSquared: Float = 0
 
-        // Vectorized computation (8-wide with dual SIMD4)
+        // Vectorized computation (8-wide with dual SIMD4) using safe element loads
+        // Avoid unaligned SIMD loads by constructing vectors from scalar elements.
         let d8 = (d / 8) * 8
         var j = 0
 
@@ -321,17 +322,23 @@ internal func _vi_km11_updateSquaredDistances(
         var acc1 = SIMD4<Float>.zero
 
         while j < d8 {
-            let v0Raw = UnsafeRawPointer(vecPtr.advanced(by: j))
-            let c0Raw = UnsafeRawPointer(newCentroid.advanced(by: j))
-            let v0 = v0Raw.load(as: SIMD4<Float>.self)
-            let c0 = c0Raw.load(as: SIMD4<Float>.self)
+            // First SIMD4 block
+            let v0 = SIMD4<Float>(
+                vecPtr[j + 0], vecPtr[j + 1], vecPtr[j + 2], vecPtr[j + 3]
+            )
+            let c0 = SIMD4<Float>(
+                newCentroid[j + 0], newCentroid[j + 1], newCentroid[j + 2], newCentroid[j + 3]
+            )
             let diff0 = v0 - c0
             acc0 += diff0 * diff0
 
-            let v1Raw = UnsafeRawPointer(vecPtr.advanced(by: j + 4))
-            let c1Raw = UnsafeRawPointer(newCentroid.advanced(by: j + 4))
-            let v1 = v1Raw.load(as: SIMD4<Float>.self)
-            let c1 = c1Raw.load(as: SIMD4<Float>.self)
+            // Second SIMD4 block
+            let v1 = SIMD4<Float>(
+                vecPtr[j + 4], vecPtr[j + 5], vecPtr[j + 6], vecPtr[j + 7]
+            )
+            let c1 = SIMD4<Float>(
+                newCentroid[j + 4], newCentroid[j + 5], newCentroid[j + 6], newCentroid[j + 7]
+            )
             let diff1 = v1 - c1
             acc1 += diff1 * diff1
 

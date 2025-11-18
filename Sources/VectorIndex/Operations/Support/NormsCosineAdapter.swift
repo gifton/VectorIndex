@@ -18,4 +18,3 @@ public extension IndexOps.Support.Norms.NormCache {
         }
     }
 }
-

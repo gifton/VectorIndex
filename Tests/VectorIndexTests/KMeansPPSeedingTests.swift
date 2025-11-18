@@ -8,7 +8,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - Basic Correctness Tests
 
     /// Test that k centroids are selected from the data
-    func testBasicSeeding() {
+    func testBasicSeeding() throws {
         let n = 100
         let d = 4
         let k = 10
@@ -22,7 +22,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data,
             count: n,
             dimension: d,
@@ -57,7 +57,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test determinism: same seed produces same centroids
-    func testDeterministicSeeding() {
+    func testDeterministicSeeding() throws {
         let n = 50
         let d = 3
         let k = 5
@@ -71,7 +71,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         // Run seeding twice with same seed
         var centroids1 = [Float](repeating: 0, count: k * d)
         var indices1 = [Int](repeating: -1, count: k)
-        let stats1 = try! kmeansPlusPlusSeed(
+        let stats1 = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed),
             centroidsOut: &centroids1,
@@ -80,7 +80,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids2 = [Float](repeating: 0, count: k * d)
         var indices2 = [Int](repeating: -1, count: k)
-        let stats2 = try! kmeansPlusPlusSeed(
+        let stats2 = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed),
             centroidsOut: &centroids2,
@@ -95,7 +95,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test different seeds produce different results
-    func testDifferentSeedsDiverge() {
+    func testDifferentSeedsDiverge() throws {
         let n = 50
         let d = 3
         let k = 5
@@ -108,7 +108,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         // Run with different seeds
         var indices1 = [Int](repeating: -1, count: k)
         var centroids1 = [Float](repeating: 0, count: k * d)
-        _ = try! kmeansPlusPlusSeed(
+        _ = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 111),
             centroidsOut: &centroids1,
@@ -117,7 +117,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var indices2 = [Int](repeating: -1, count: k)
         var centroids2 = [Float](repeating: 0, count: k * d)
-        _ = try! kmeansPlusPlusSeed(
+        _ = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 222),
             centroidsOut: &centroids2,
@@ -132,7 +132,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - D² Sampling Correctness
 
     /// Test that D² sampling favors distant points
-    func testDSquaredSamplingBias() {
+    func testDSquaredSamplingBias() throws {
         // Create data with 3 tight clusters and 1 outlier
         // K-means++ should prefer outlier as 2nd centroid
         let d = 2
@@ -157,7 +157,7 @@ final class KMeansPPSeedingTests: XCTestCase {
             var centroids = [Float](repeating: 0, count: k * d)
             var indices = [Int](repeating: -1, count: k)
 
-            _ = try! kmeansPlusPlusSeed(
+            _ = try kmeansPlusPlusSeed(
                 data: data, count: n, dimension: d, k: k,
                 config: KMeansSeedConfig(k: k, rngSeed: seed),
                 centroidsOut: &centroids,
@@ -179,7 +179,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - Edge Cases
 
     /// Test k=1 (single centroid selection)
-    func testKEqualsOne() {
+    func testKEqualsOne() throws {
         let n = 20
         let d = 3
         let k = 1
@@ -192,7 +192,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroid = [Float](repeating: 0, count: d)
         var chosenIndex = [Int](repeating: -1, count: 1)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 999),
             centroidsOut: &centroid,
@@ -206,7 +206,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test k=n (select all points as centroids)
-    func testKEqualsN() {
+    func testKEqualsN() throws {
         let n = 10
         let d = 2
         let k = n
@@ -219,7 +219,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -233,7 +233,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test with high-dimensional data
-    func testHighDimension() {
+    func testHighDimension() throws {
         let n = 50
         let d = 128  // Typical embedding dimension
         let k = 10
@@ -246,7 +246,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -263,7 +263,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test with duplicate data points
-    func testDuplicateData() {
+    func testDuplicateData() throws {
         let d = 3
         let k = 3
 
@@ -280,7 +280,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: 555),
             centroidsOut: &centroids,
@@ -295,7 +295,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - Stream ID Tests
 
     /// Test that different stream IDs produce different results
-    func testStreamIDIndependence() {
+    func testStreamIDIndependence() throws {
         let n = 30
         let d = 4
         let k = 5
@@ -309,7 +309,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         // Run with different stream IDs
         var indices0 = [Int](repeating: -1, count: k)
         var centroids0 = [Float](repeating: 0, count: k * d)
-        _ = try! kmeansPlusPlusSeed(
+        _ = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed, rngStreamID: 0),
             centroidsOut: &centroids0,
@@ -318,7 +318,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var indices1 = [Int](repeating: -1, count: k)
         var centroids1 = [Float](repeating: 0, count: k * d)
-        _ = try! kmeansPlusPlusSeed(
+        _ = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: KMeansSeedConfig(k: k, rngSeed: seed, rngStreamID: 1),
             centroidsOut: &centroids1,
@@ -333,7 +333,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - Statistics Validation
 
     /// Test that average distance squared is computed correctly
-    func testAverageDistanceSquared() {
+    func testAverageDistanceSquared() throws {
         let n = 20
         let d = 2
         let k = 3
@@ -345,7 +345,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids = [Float](repeating: 0, count: k * d)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -362,7 +362,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test execution time is tracked
-    func testExecutionTimeTracking() {
+    func testExecutionTimeTracking() throws {
         let n = 100
         let d = 10
         let k = 10
@@ -374,7 +374,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids = [Float](repeating: 0, count: k * d)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -388,7 +388,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - Numerical Stability Tests
 
     /// Test handling of NaN/Inf in data
-    func testNaNHandling() {
+    func testNaNHandling() throws {
         let n = 10
         let d = 3
         let k = 3
@@ -403,7 +403,7 @@ final class KMeansPPSeedingTests: XCTestCase {
 
         var centroids = [Float](repeating: 0, count: k * d)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -417,7 +417,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     }
 
     /// Test with very small distances (numerical precision)
-    func testSmallDistances() {
+    func testSmallDistances() throws {
         let n = 20
         let d = 4
         let k = 5
@@ -433,7 +433,7 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
         var chosenIndices = [Int](repeating: -1, count: k)
 
-        let stats = try! kmeansPlusPlusSeed(
+        let stats = try kmeansPlusPlusSeed(
             data: data, count: n, dimension: d, k: k,
             config: .default,
             centroidsOut: &centroids,
@@ -448,7 +448,7 @@ final class KMeansPPSeedingTests: XCTestCase {
     // MARK: - Performance Tests
 
     /// Measure seeding performance on moderate dataset
-    func testPerformanceModerate() {
+    func testPerformanceModerate() throws {
         let n = 1000
         let d = 128
         let k = 50
@@ -461,17 +461,21 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: data, count: n, dimension: d, k: k,
-                config: .default,
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: data, count: n, dimension: d, k: k,
+                    config: .default,
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
     }
 
     /// Measure seeding performance on large dataset
-    func testPerformanceLarge() {
+    func testPerformanceLarge() throws {
         let n = 10000
         let d = 64
         let k = 256
@@ -484,12 +488,16 @@ final class KMeansPPSeedingTests: XCTestCase {
         var centroids = [Float](repeating: 0, count: k * d)
 
         measure {
-            _ = try! kmeansPlusPlusSeed(
-                data: data, count: n, dimension: d, k: k,
-                config: .default,
-                centroidsOut: &centroids,
-                chosenIndicesOut: nil
-            )
+            do {
+                _ = try kmeansPlusPlusSeed(
+                    data: data, count: n, dimension: d, k: k,
+                    config: .default,
+                    centroidsOut: &centroids,
+                    chosenIndicesOut: nil
+                )
+            } catch {
+                XCTFail("kmeansPlusPlusSeed failed: \(error)")
+            }
         }
     }
 }

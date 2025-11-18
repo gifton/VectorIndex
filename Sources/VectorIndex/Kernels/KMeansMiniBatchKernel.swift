@@ -176,7 +176,7 @@ public final class KMeansState: @unchecked Sendable {
 
 @usableFromInline
 internal func _vi_km12_nowNanos() -> UInt64 {
-    return DispatchTime.now().uptimeNanoseconds
+    DispatchTime.now().uptimeNanoseconds
 }
 
 @usableFromInline
@@ -222,12 +222,12 @@ public func _vi_km12_l2sq_aos(
         let a0 = _vi_km12_load4(a, j)
         let b0 = _vi_km12_load4(b, j)
         let d0 = a0 - b0  // ✓ Standard arithmetic for math
-        acc0 = acc0 + d0 * d0
+        acc0 += d0 * d0
 
         let a1 = _vi_km12_load4(a, j + 4)
         let b1 = _vi_km12_load4(b, j + 4)
         let d1 = a1 - b1  // ✓ Standard arithmetic
-        acc1 = acc1 + d1 * d1
+        acc1 += d1 * d1
 
         j += 8
     }
@@ -455,11 +455,16 @@ public func kmeans_minibatch_f32(
             sampleSize: 0, rngSeed: cfg.seed, rngStreamID: cfg.streamID,
             strictFP: false, prefetchDistance: 2, oversamplingFactor: 2, rounds: 5
         )
-        // Safe to force-try: parameters already validated on lines 436-437
-        _ = try! kmeansPlusPlusSeed(
-            data: x, count: Int(n), dimension: d, k: kc,
-            config: seedCfg, centroidsOut: centroidsOut, chosenIndicesOut: nil
-        )
+        // Parameters already validated, but handle error gracefully
+        do {
+            _ = try kmeansPlusPlusSeed(
+                data: x, count: Int(n), dimension: d, k: kc,
+                config: seedCfg, centroidsOut: centroidsOut, chosenIndicesOut: nil
+            )
+        } catch {
+            // Seeding failed - likely due to k > n or other constraint violation
+            return .invalidK
+        }
     }
     let tInit1 = _vi_km12_nowNanos()
 
@@ -560,7 +565,7 @@ public func kmeans_minibatch_f32(
                 let gi = xBatchIdx[bi]
 
                 // Assign
-                let (cBest, _) : (Int, Float) = {
+                let (cBest, _): (Int, Float) = {
                     switch cfg.layout {
                     case .aos:
                         let vec = x.advanced(by: Int(gi) * d)
@@ -768,7 +773,7 @@ public func kmeans_state_init(
     initCentroids: UnsafePointer<Float>,
     decay: Float
 ) -> KMeansState {
-    return KMeansState(d: d, kc: kc, initCentroids: initCentroids, decay: decay)
+    KMeansState(d: d, kc: kc, initCentroids: initCentroids, decay: decay)
 }
 
 /// Update state with a chunk of vectors (EWMA). Optionally return centroids.

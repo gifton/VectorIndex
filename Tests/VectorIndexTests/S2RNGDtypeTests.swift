@@ -189,7 +189,7 @@ final class S2RNGDtypeTests: XCTestCase {
             100.0, -100.0,
             Float.pi, -Float.pi,
             0.001, -0.001,  // f16 min normal is ~6e-5, use larger values
-            65504.0,  // Max f16 value
+            65504.0  // Max f16 value
         ]
 
         var f16bits = [UInt16](repeating: 0, count: testValues.count)
@@ -283,7 +283,7 @@ final class S2RNGDtypeTests: XCTestCase {
             100.0, -100.0,
             Float.pi, -Float.pi,
             0.00001, -0.00001,
-            3.38e38,  // Near max bf16 value (~3.4e38)
+            3.38e38  // Near max bf16 value (~3.4e38)
         ]
 
         var bf16bits = [UInt16](repeating: 0, count: testValues.count)

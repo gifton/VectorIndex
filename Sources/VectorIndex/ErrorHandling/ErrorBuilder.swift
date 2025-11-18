@@ -56,7 +56,7 @@ public struct ErrorBuilder {
     @usableFromInline internal var message: String = ""
     @usableFromInline internal var operation: String
     @usableFromInline internal var additionalInfo: [String: String] = [:]
-    @usableFromInline internal var underlying: (any Error)? = nil
+    @usableFromInline internal var underlying: (any Error)?
 
     #if DEBUG
     @usableFromInline internal let file: StaticString

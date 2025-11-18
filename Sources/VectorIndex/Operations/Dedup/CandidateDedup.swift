@@ -131,7 +131,7 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
     @usableFromInline internal var epochWraps: Int = 0
 
     // MARK: DenseEpoch storage
-    @usableFromInline internal var stamps: UnsafeMutablePointer<UInt32>? = nil // [idCapacity]
+    @usableFromInline internal var stamps: UnsafeMutablePointer<UInt32>? // [idCapacity]
     // stamps[i] == queryEpoch means "visited this query"
 
     // MARK: SparsePaged storage
@@ -146,9 +146,9 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
     @usableFromInline internal var touchedPages: [Int64] = []     // pageIDs touched this query
 
     // MARK: FixedBitset storage
-    @usableFromInline internal var bitWords: UnsafeMutablePointer<UInt64>? = nil
+    @usableFromInline internal var bitWords: UnsafeMutablePointer<UInt64>?
     @usableFromInline internal var wordCount: Int = 0
-    @usableFromInline internal var touchedWords: UnsafeMutablePointer<Int>? = nil
+    @usableFromInline internal var touchedWords: UnsafeMutablePointer<Int>?
     @usableFromInline internal var touchedCount: Int = 0
     @usableFromInline internal var touchedCapacity: Int = 0
 
@@ -274,7 +274,7 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
             // Clear only the pages touched in the previous query.
             // Note: touchedPages contains unique pageIDs (due to per-page epoch tagging).
             let count = touchedPages.count
-            if count > 0 {
+            if !touchedPages.isEmpty {
                 for pid in touchedPages {
                     if let page = pageTable[pid] {
                         let ptr = page.bits
