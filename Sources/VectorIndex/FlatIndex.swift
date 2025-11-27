@@ -65,13 +65,63 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         return results
     }
 
+    /// Context for parallel batch search
+    private struct FlatBatchSearchContext: @unchecked Sendable {
+        let vectors: [VectorID: ([Float], [String: String]?)]
+        let dimension: Int
+        let metric: SupportedDistanceMetric
+        let k: Int
+    }
+
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
-        var out: [[SearchResult]] = []
-        out.reserveCapacity(queries.count)
-        for q in queries {
-            out.append(try await search(query: q, k: k, filter: filter))
+        guard k > 0 else { return queries.map { _ in [] } }
+        if queries.isEmpty { return [] }
+
+        // Snapshot data for parallel access
+        let ctx = FlatBatchSearchContext(
+            vectors: vectors,
+            dimension: dimension,
+            metric: metric,
+            k: k
+        )
+
+        return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+            for (queryIndex, query) in queries.enumerated() {
+                group.addTask {
+                    try Self.performFlatSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
+                }
+            }
+
+            var results = [[SearchResult]](repeating: [], count: queries.count)
+            for try await (index, result) in group {
+                results[index] = result
+            }
+            return results
         }
-        return out
+    }
+
+    /// Static helper for parallel flat search
+    private static func performFlatSearch(
+        query: [Float],
+        queryIndex: Int,
+        ctx: FlatBatchSearchContext,
+        filter: (@Sendable ([String: String]?) -> Bool)?
+    ) throws -> (Int, [SearchResult]) {
+        var results: [SearchResult] = []
+        results.reserveCapacity(min(ctx.k, ctx.vectors.count))
+
+        for (id, (vec, meta)) in ctx.vectors {
+            if let filter = filter, !filter(meta) { continue }
+            guard vec.count == query.count else {
+                throw VectorError.dimensionMismatch(expected: query.count, actual: vec.count)
+            }
+            let d = distance(query, vec, metric: ctx.metric)
+            results.append(SearchResult(id: id, score: d))
+        }
+
+        results.sort { $0.score < $1.score }
+        if results.count > ctx.k { results.removeLast(results.count - ctx.k) }
+        return (queryIndex, results)
     }
 
     public func clear() async {

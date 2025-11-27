@@ -3,7 +3,7 @@ import XCTest
 
 final class IVFTests: XCTestCase {
     func testIVFBasicSearch() async throws {
-        let ivf = IVFIndex(dimension: 3, metric: .euclidean, config: .init(nlist: 2, nprobe: 1))
+        let ivf = IVFIndex(dimension: 3, metric: .euclidean, config: .init(nlist: 2, nprobe: 2))
         try await ivf.batchInsert([
             ("a", [0, 0, 1], ["cat": "x"]),
             ("b", [0, 1, 0], ["cat": "y"]),
