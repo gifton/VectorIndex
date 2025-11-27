@@ -1,13 +1,13 @@
 {
-  "originHash" : "ccc1c9b7d0497fcacda27bdb1dc417818149da6e967ff0e59ede87f5ddc46181",
+  "originHash" : "f2f1fb12f73744a281c8de8ec3e03e07ed5385bdda801ffd23f3ff597fb8fbe1",
   "pins" : [
     {
       "identity" : "vectorcore",
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/gifton/VectorCore",
       "state" : {
-        "revision" : "5ab7bc7072b151950d45d8efc71a5fb434e35b3c",
-        "version" : "0.1.2"
+        "revision" : "e9eae35477a6855155ba8389fa7f24f5b25cd5f0",
+        "version" : "0.1.5"
       }
     }
   ],

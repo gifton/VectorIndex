@@ -32,7 +32,26 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     public let config: Configuration
     public var count: Int { activeCount }
 
+    /// Supported metrics for HNSW traversal kernel
+    private static let supportedMetrics: Set<SupportedDistanceMetric> = [.euclidean, .dotProduct, .cosine]
+
+    /// Convert SupportedDistanceMetric to HNSWMetric (validated at init)
+    @inline(__always)
+    private static func toHNSWMetric(_ metric: SupportedDistanceMetric) -> HNSWMetric {
+        switch metric {
+        case .euclidean: return .L2
+        case .dotProduct: return .IP
+        case .cosine: return .COSINE
+        case .manhattan, .chebyshev:
+            // Should never reach here due to init validation
+            preconditionFailure("Unsupported metric '\(metric)' in HNSWIndex")
+        }
+    }
+
     public init(dimension: Int, metric: SupportedDistanceMetric = .euclidean, config: Configuration = .init()) {
+        guard Self.supportedMetrics.contains(metric) else {
+            preconditionFailure("HNSWIndex does not support metric '\(metric)'. Supported metrics: euclidean, dotProduct, cosine. Use FlatIndex for manhattan/chebyshev.")
+        }
         self.dimension = dimension
         self.metric = metric
         self.config = config
@@ -41,6 +60,9 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
     // Protocol-required initializer (delegates to designated one)
     public init(dimension: Int, metric: SupportedDistanceMetric) {
+        guard Self.supportedMetrics.contains(metric) else {
+            preconditionFailure("HNSWIndex does not support metric '\(metric)'. Supported metrics: euclidean, dotProduct, cosine. Use FlatIndex for manhattan/chebyshev.")
+        }
         self.dimension = dimension
         self.metric = metric
         self.config = .init()
@@ -84,7 +106,6 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
         // Ensure cached traversal data is up-to-date
         rebuildCSRIfNeeded()
-        rebuildXBIfNeeded()
         let N = nodes.count
         if N == 0 { return [] }
         // Allow bitset (exclude deleted nodes)
@@ -97,24 +118,17 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
             }
         }
 
-        // Map metric
-        let m33: HNSWMetric = {
-            switch metric {
-            case .euclidean: return .L2
-            case .dotProduct: return .IP
-            case .cosine: return .COSINE
-            default: return .L2
-            }
-        }()
+        // Map metric (validated at init)
+        let m33 = Self.toHNSWMetric(metric)
         let ef = max(config.efSearch, k)
 
         // Prepare output buffers
         var idsOut = [Int32](repeating: -1, count: ef)
         var distsOut = [Float](repeating: .infinity, count: ef)
 
-        // Bridge pointers
+        // Bridge pointers - vectorStorage is the primary contiguous buffer
         return query.withUnsafeBufferPointer { qbp in
-            xbFlatCache.withUnsafeBufferPointer { xbbp in
+            vectorStorage.withUnsafeBufferPointer { xbbp in
                 allowBits.withUnsafeBufferPointer { allowBP in
                     // Build pointer arrays for layers from cached CSR
                     let offPtrsOpt = csrOffsetsCache.map { arr in arr.withUnsafeBufferPointer { Optional($0.baseAddress!) } }
@@ -155,25 +169,179 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
+    /// Context for parallel batch search - bundles all data needed by worker tasks
+    private struct BatchSearchContext: @unchecked Sendable {
+        let vectorStorage: [Float]
+        let csrOffsets: [[Int32]]
+        let csrNeighbors: [[Int32]]
+        let invNorms: [Float]?
+        let allowBits: [UInt64]
+        let nodeInfo: [(id: VectorID, metadata: [String: String]?)]
+        let dim: Int
+        let maxLevel: Int
+        let entryPoint: Int
+        let N: Int
+        let ef: Int
+        let k: Int
+        let metric: HNSWMetric
+        let isEuclidean: Bool
+    }
+
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
-        var out: [[SearchResult]] = []
-        out.reserveCapacity(queries.count)
-        for q in queries { out.append(try await search(query: q, k: k, filter: filter)) }
-        return out
+        guard k > 0 else { return queries.map { _ in [] } }
+        if queries.isEmpty { return [] }
+
+        // Validate all queries upfront
+        for q in queries {
+            try checkVector(q)
+        }
+
+        guard let ep = entryPoint else { return queries.map { _ in [] } }
+
+        // Rebuild caches once for entire batch
+        rebuildCSRIfNeeded()
+        let N = nodes.count
+        if N == 0 { return queries.map { _ in [] } }
+
+        // Map metric (validated at init)
+        let m33 = Self.toHNSWMetric(metric)
+
+        // Build context with all data needed for parallel search
+        let ctx = BatchSearchContext(
+            vectorStorage: Array(vectorStorage),
+            csrOffsets: csrOffsetsCache,
+            csrNeighbors: csrNeighborsCache,
+            invNorms: rebuildInvNormsIfNeededForCosine().map { Array(UnsafeBufferPointer(start: $0, count: N)) },
+            allowBits: {
+                let words = (N + 63) >> 6
+                var bits = [UInt64](repeating: 0, count: words)
+                for i in 0..<N {
+                    if !nodes[i].isDeleted {
+                        let w = i >> 6, b = i & 63
+                        bits[w] |= (1 &<< UInt64(b))
+                    }
+                }
+                return bits
+            }(),
+            nodeInfo: nodes.map { ($0.id, $0.metadata) },
+            dim: dimension,
+            maxLevel: maxLevel,
+            entryPoint: ep,
+            N: N,
+            ef: max(config.efSearch, k),
+            k: k,
+            metric: m33,
+            isEuclidean: (metric == .euclidean)
+        )
+
+        // Perform parallel searches using TaskGroup
+        return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+            for (queryIndex, query) in queries.enumerated() {
+                group.addTask {
+                    Self.performSingleSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
+                }
+            }
+
+            // Collect results in original query order
+            var results = [[SearchResult]](repeating: [], count: queries.count)
+            for try await (index, result) in group {
+                results[index] = result
+            }
+            return results
+        }
+    }
+
+    /// Static helper for parallel search - runs in TaskGroup
+    private static func performSingleSearch(
+        query: [Float],
+        queryIndex: Int,
+        ctx: BatchSearchContext,
+        filter: (@Sendable ([String: String]?) -> Bool)?
+    ) -> (Int, [SearchResult]) {
+        var idsOut = [Int32](repeating: -1, count: ctx.ef)
+        var distsOut = [Float](repeating: .infinity, count: ctx.ef)
+
+        let written = query.withUnsafeBufferPointer { qbp in
+            ctx.vectorStorage.withUnsafeBufferPointer { xbbp in
+                ctx.allowBits.withUnsafeBufferPointer { allowBP in
+                    // Build pointer arrays for CSR layers
+                    var offPtrs = [UnsafePointer<Int32>?]()
+                    var nbrPtrs = [UnsafePointer<Int32>?]()
+                    offPtrs.reserveCapacity(ctx.csrOffsets.count)
+                    nbrPtrs.reserveCapacity(ctx.csrNeighbors.count)
+
+                    for arr in ctx.csrOffsets {
+                        arr.withUnsafeBufferPointer { offPtrs.append($0.baseAddress) }
+                    }
+                    for arr in ctx.csrNeighbors {
+                        arr.withUnsafeBufferPointer { nbrPtrs.append($0.baseAddress) }
+                    }
+
+                    return offPtrs.withUnsafeBufferPointer { offArr in
+                        nbrPtrs.withUnsafeBufferPointer { nbrArr in
+                            if let invNorms = ctx.invNorms {
+                                return invNorms.withUnsafeBufferPointer { invNormsBP in
+                                    HNSWTraversal.traverse(
+                                        q: qbp.baseAddress!, d: ctx.dim,
+                                        entryPoint: Int32(ctx.entryPoint), maxLevel: Int32(ctx.maxLevel),
+                                        offsetsPerLayer: offArr.baseAddress!,
+                                        neighborsPerLayer: nbrArr.baseAddress!,
+                                        xb: xbbp.baseAddress!, N: ctx.N, ef: ctx.ef, metric: ctx.metric,
+                                        allowBits: allowBP.baseAddress!, allowN: ctx.N,
+                                        invNorms: invNormsBP.baseAddress,
+                                        idsOut: &idsOut, distsOut: &distsOut
+                                    )
+                                }
+                            } else {
+                                return HNSWTraversal.traverse(
+                                    q: qbp.baseAddress!, d: ctx.dim,
+                                    entryPoint: Int32(ctx.entryPoint), maxLevel: Int32(ctx.maxLevel),
+                                    offsetsPerLayer: offArr.baseAddress!,
+                                    neighborsPerLayer: nbrArr.baseAddress!,
+                                    xb: xbbp.baseAddress!, N: ctx.N, ef: ctx.ef, metric: ctx.metric,
+                                    allowBits: allowBP.baseAddress!, allowN: ctx.N,
+                                    invNorms: nil,
+                                    idsOut: &idsOut, distsOut: &distsOut
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Build results from traversal output
+        var results: [SearchResult] = []
+        results.reserveCapacity(ctx.k)
+        if written > 0 {
+            var picked = 0
+            for i in 0..<written {
+                let idx = Int(idsOut[i])
+                if idx < 0 || idx >= ctx.N { continue }
+                let (nodeId, metadata) = ctx.nodeInfo[idx]
+                if let filter = filter, !filter(metadata) { continue }
+                var score = distsOut[i]
+                if ctx.isEuclidean { score = sqrt(score) }
+                results.append(SearchResult(id: nodeId, score: score))
+                picked += 1
+                if picked == ctx.k { break }
+            }
+        }
+        return (queryIndex, results)
     }
 
     public func clear() async {
         nodes.removeAll(keepingCapacity: false)
         idToIndex.removeAll(keepingCapacity: false)
+        vectorStorage.removeAll(keepingCapacity: false)
         entryPoint = nil
         maxLevel = 0
         activeCount = 0
         // Invalidate caches
         csrOffsetsCache.removeAll(keepingCapacity: false)
         csrNeighborsCache.removeAll(keepingCapacity: false)
-        xbFlatCache.removeAll(keepingCapacity: false)
         invNormsCache = nil
-        csrDirty = true; xbDirty = true; invNormsDirty = true
+        csrDirty = true; invNormsDirty = true
     }
 
     public func contains(id: VectorID) async -> Bool {
@@ -183,7 +351,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
     public func update(id: VectorID, vector: [Float]?, metadata: [String: String]?) async throws -> Bool {
         guard let idx = idToIndex[id] else { return false }
-        var newVec = nodes[idx].vector
+        var newVec = vectorArray(at: idx)
         var newMeta = nodes[idx].metadata
         if let v = vector {
             try checkVector(v)
@@ -200,7 +368,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         entryPoint = nil
         maxLevel = 0
         activeCount = 0
-        markCSRDirty(); markXbDirty()
+        markCSRDirty(); markInvNormsDirty()
     }
 
     public func statistics() async -> IndexStats {
@@ -229,7 +397,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     // MARK: - Internal Structures
     private struct Node {
         let id: VectorID
-        var vector: [Float]
+        let vectorOffset: Int  // Offset into vectorStorage (in floats, not bytes)
         var metadata: [String: String]?
         let level: Int
         var neighbors: [[Int]] // per level neighbor indices
@@ -243,16 +411,28 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     private var activeCount: Int = 0
     private var rng35: HNSWXoroRNGState = HNSWXoroRNGState.from(seed: 0xDEADBEEFCAFEBABE, stream: 0)
 
-    // MARK: - Cached traversal buffers (CSR + xb + optional inv norms)
+    // MARK: - Contiguous Vector Storage
+    // Primary storage for all vectors in row-major layout: [v0[0..d], v1[0..d], ...]
+    // This eliminates per-node heap allocations and enables cache-friendly access.
+    private var vectorStorage: ContiguousArray<Float> = []
+
+    // MARK: - Cached traversal buffers (CSR + optional inv norms)
     // These accelerate Kernel #33 traversal. Rebuilt lazily when marked dirty.
     private var csrOffsetsCache: [[Int32]] = []      // per-layer CSR offsets [N+1]
     private var csrNeighborsCache: [[Int32]] = []    // per-layer neighbor lists (flat)
-    private var xbFlatCache: [Float] = []            // [N * d] row-major vectors
-    private var invNormsCache: [Float]?        // optional: inverse L2 norms for cosine
+    private var invNormsCache: [Float]?              // optional: inverse L2 norms for cosine
 
     private var csrDirty: Bool = true
-    private var xbDirty: Bool = true
     private var invNormsDirty: Bool = true
+
+    // MARK: - Vector Access Helpers
+    /// Returns a copy of the vector at the given node index as [Float] array.
+    /// Use this for distance computations during construction that need [Float].
+    @inline(__always)
+    private func vectorArray(at nodeIndex: Int) -> [Float] {
+        let offset = nodes[nodeIndex].vectorOffset
+        return Array(vectorStorage[offset..<(offset + dimension)])
+    }
 
     // MARK: - Insertion
     private func internalInsert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
@@ -261,11 +441,16 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
         let level = randomLevel()
         let newIndex = nodes.count
-        let node = Node(id: id, vector: vector, metadata: metadata, level: level, neighbors: Array(repeating: [], count: level+1), isDeleted: false)
+
+        // Store vector in contiguous storage and record offset
+        let vectorOffset = vectorStorage.count
+        vectorStorage.append(contentsOf: vector)
+
+        let node = Node(id: id, vectorOffset: vectorOffset, metadata: metadata, level: level, neighbors: Array(repeating: [], count: level+1), isDeleted: false)
         nodes.append(node)
         idToIndex[id] = newIndex
         activeCount += 1
-        markXbDirty(); markCSRDirty()
+        markInvNormsDirty(); markCSRDirty()
 
         if let oldEP = entryPoint {
             var cur = oldEP
@@ -278,8 +463,6 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
             // For each level down to 0: connect to neighbors in that layer
             let ef = max(config.efConstruction, config.m)
-            // Ensure contiguous xb is available for neighbor selection kernel
-            rebuildXBIfNeeded()
             for l in stride(from: min(level, maxLevel), through: 0, by: -1) {
                 let candidates = searchLayer(vector, enter: cur, ef: ef, level: l)
                 // Only neighbors that exist at this layer
@@ -288,19 +471,12 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                 var seen = Set<Int>()
                 filtered = filtered.filter { seen.insert($0).inserted }
 
-                // Select neighbors using #34 kernel
+                // Select neighbors using #34 kernel with contiguous vectorStorage
                 let selected: [Int] = vector.withUnsafeBufferPointer { vbp in
-                    xbFlatCache.withUnsafeBufferPointer { xbbp in
+                    vectorStorage.withUnsafeBufferPointer { xbbp in
                         let ids32 = filtered.map { Int32($0) }
                         var out = [Int32](repeating: -1, count: config.m)
-                        let metric34: HNSWMetric = {
-                            switch metric {
-                            case .euclidean: return .L2
-                            case .dotProduct: return .IP
-                            case .cosine: return .COSINE
-                            default: return .L2
-                            }
-                        }()
+                        let metric34 = Self.toHNSWMetric(metric)
                         let invPtr = (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
                         let written = ids32.withUnsafeBufferPointer { cbp in
                             out.withUnsafeMutableBufferPointer { obp in
@@ -322,7 +498,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
                 connect(newIndex, with: selected, level: l)
                 // Update cur to closest among selected for next lower layer
-                if let best = selected.min(by: { distance(vector, nodes[$0].vector, metric: metric) < distance(vector, nodes[$1].vector, metric: metric) }) {
+                if let best = selected.min(by: { distance(vector, vectorArray(at: $0), metric: metric) < distance(vector, vectorArray(at: $1), metric: metric) }) {
                     cur = best
                 }
             }
@@ -376,21 +552,12 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         offsets[idx] = 0
         offsets[idx + 1] = Int32(neighborsL.count)
 
-        // Ensure xb (and optional cosine norms) are ready
-        rebuildXBIfNeeded()
-        let metric34: HNSWMetric = {
-            switch metric {
-            case .euclidean: return .L2
-            case .dotProduct: return .IP
-            case .cosine: return .COSINE
-            default: return .L2
-            }
-        }()
+        let metric34 = Self.toHNSWMetric(metric)
         let invPtr = (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
 
-        // Call #34 prune
+        // Call #34 prune with contiguous vectorStorage
         var pruned = [Int32](repeating: -1, count: config.m)
-        let kept: Int = xbFlatCache.withUnsafeBufferPointer { xbbp in
+        let kept: Int = vectorStorage.withUnsafeBufferPointer { xbbp in
             offsets.withUnsafeBufferPointer { obp in
                 neighborsL.withUnsafeBufferPointer { nbp in
                     pruned.withUnsafeMutableBufferPointer { pbp in
@@ -427,12 +594,12 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     // MARK: - Layer Search
     private func greedySearchLayer(_ query: [Float], enter: Int, level: Int) -> Int {
         var cur = enter
-        var curDist = distance(query, nodes[cur].vector, metric: metric)
+        var curDist = distance(query, vectorArray(at: cur), metric: metric)
         var changed = true
         while changed {
             changed = false
             for n in nodes[cur].neighbors[safe: level] ?? [] {
-                let d = distance(query, nodes[n].vector, metric: metric)
+                let d = distance(query, vectorArray(at: n), metric: metric)
                 if d < curDist {
                     curDist = d
                     cur = n
@@ -450,7 +617,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         var result: [(Int, Float)] = []
         var visited = Set<Int>()
 
-        let enterDist = distance(query, nodes[enter].vector, metric: metric)
+        let enterDist = distance(query, vectorArray(at: enter), metric: metric)
         candidates.append((enter, enterDist))
         result.append((enter, enterDist))
         visited.insert(enter)
@@ -466,7 +633,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
             for n in nodes[cand].neighbors[safe: level] ?? [] {
                 if visited.insert(n).inserted, !nodes[n].isDeleted {
-                    let d = distance(query, nodes[n].vector, metric: metric)
+                    let d = distance(query, vectorArray(at: n), metric: metric)
                     // Maintain result set up to ef
                     if result.count < ef || d < (result.last?.1 ?? .infinity) {
                         // Insert into candidates
@@ -510,28 +677,8 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
 // MARK: - Kernel #33: Traversal caches and builders
 private extension HNSWIndex {
-    @inline(__always) func markXbDirty() { xbDirty = true; invNormsDirty = true }
+    @inline(__always) func markInvNormsDirty() { invNormsDirty = true }
     @inline(__always) func markCSRDirty() { csrDirty = true }
-
-    func rebuildXBIfNeeded() {
-        guard xbDirty else { return }
-        let N = nodes.count
-        if N == 0 || dimension == 0 {
-            xbFlatCache.removeAll(keepingCapacity: false)
-            xbDirty = false
-            return
-        }
-        xbFlatCache = [Float](repeating: 0, count: N * dimension)
-        var off = 0
-        for i in 0..<N {
-            let row = nodes[i].vector
-            // Defensive: only copy up to d elements
-            let copy = min(dimension, row.count)
-            xbFlatCache.replaceSubrange(off..<(off + copy), with: row.prefix(copy))
-            off += dimension
-        }
-        xbDirty = false
-    }
 
     func rebuildCSRIfNeeded() {
         guard csrDirty else { return }
@@ -574,16 +721,15 @@ private extension HNSWIndex {
         guard metric == .cosine else { return nil }
         let N = nodes.count
         if N == 0 { invNormsCache = nil; invNormsDirty = false; return nil }
-        if invNormsCache == nil || invNormsDirty || xbDirty || invNormsCache!.count != N {
+        if invNormsCache == nil || invNormsDirty || invNormsCache!.count != N {
             invNormsCache = [Float](repeating: 0, count: N)
             let eps: Float = 1e-12
             for i in 0..<N {
-                let row = nodes[i].vector
+                let offset = nodes[i].vectorOffset
                 var s: Float = 0
-                let d = min(dimension, row.count)
                 var j = 0
-                while j < d {
-                    let v = row[j]
+                while j < dimension {
+                    let v = vectorStorage[offset + j]
                     s += v * v
                     j &+= 1
                 }
@@ -610,8 +756,9 @@ extension HNSWIndex {
         // Persist as flat records; graph is rebuilt on load
         var recs: [PersistedRecord] = []
         recs.reserveCapacity(activeCount)
-        for n in nodes where !n.isDeleted {
-            recs.append(PersistedRecord(id: n.id, vector: n.vector, metadata: n.metadata))
+        for (i, n) in nodes.enumerated() where !n.isDeleted {
+            let vector = vectorArray(at: i)
+            recs.append(PersistedRecord(id: n.id, vector: vector, metadata: n.metadata))
         }
         let payload = PersistedIndex(
             type: "HNSW",
@@ -635,13 +782,30 @@ extension HNSWIndex {
 
     public func compact() async throws {
         // Remove deleted nodes and reindex neighbor lists by remapping indices
+        // Also rebuild vectorStorage to eliminate gaps from deleted vectors
         var newNodes: [Node] = []
         newNodes.reserveCapacity(activeCount)
+        var newVectorStorage = ContiguousArray<Float>()
+        newVectorStorage.reserveCapacity(activeCount * dimension)
         var remap: [Int: Int] = [:] // old -> new
+
         for (oldIdx, n) in nodes.enumerated() {
-            if !n.isDeleted { remap[oldIdx] = newNodes.count; newNodes.append(n) }
+            if !n.isDeleted {
+                let newIdx = newNodes.count
+                remap[oldIdx] = newIdx
+                // Copy vector to new contiguous storage
+                let newOffset = newVectorStorage.count
+                let oldOffset = n.vectorOffset
+                newVectorStorage.append(contentsOf: vectorStorage[oldOffset..<(oldOffset + dimension)])
+                // Create new node with updated offset
+                let newNode = Node(id: n.id, vectorOffset: newOffset, metadata: n.metadata,
+                                   level: n.level, neighbors: n.neighbors, isDeleted: false)
+                newNodes.append(newNode)
+            }
         }
+
         // Remap neighbors per level
+        let dim = dimension
         for i in newNodes.indices {
             let lvl = newNodes[i].level
             var lvlLists: [[Int]] = []
@@ -653,14 +817,25 @@ extension HNSWIndex {
                 }
                 // prune to M
                 if mapped.count > config.m {
-                    mapped.sort { distance(newNodes[i].vector, newNodes[$0].vector, metric: metric) < distance(newNodes[i].vector, newNodes[$1].vector, metric: metric) }
+                    let nodeOffset = newNodes[i].vectorOffset
+                    let nodeVec = Array(newVectorStorage[nodeOffset..<(nodeOffset + dim)])
+                    mapped.sort {
+                        let off0 = newNodes[$0].vectorOffset
+                        let off1 = newNodes[$1].vectorOffset
+                        let vec0 = Array(newVectorStorage[off0..<(off0 + dim)])
+                        let vec1 = Array(newVectorStorage[off1..<(off1 + dim)])
+                        return distance(nodeVec, vec0, metric: metric) < distance(nodeVec, vec1, metric: metric)
+                    }
                     mapped = Array(mapped.prefix(config.m))
                 }
                 lvlLists.append(mapped)
             }
             newNodes[i].neighbors = lvlLists
         }
+
         nodes = newNodes
+        vectorStorage = newVectorStorage
+
         // Rebuild idToIndex
         idToIndex.removeAll(keepingCapacity: false)
         activeCount = 0
@@ -677,8 +852,8 @@ extension HNSWIndex {
         } else {
             entryPoint = nodes.isEmpty ? nil : 0
         }
-        // Mark caches dirty (structure and vectors may have shifted)
-        markCSRDirty(); markXbDirty()
+        // Mark caches dirty (structure has changed)
+        markCSRDirty(); markInvNormsDirty()
     }
 }
 
@@ -690,17 +865,18 @@ private extension HNSWIndex {
     // selected neighbor, promoting angular diversity.
     func selectNeighbors(for vec: [Float], among candidates: [Int], level: Int, maxM: Int) -> [Int] {
         // Sort candidates by distance to vec
-        var sorted: [(Int, Float)] = candidates.map { ($0, distance(vec, nodes[$0].vector, metric: metric)) }
+        var sorted: [(Int, Float)] = candidates.map { ($0, distance(vec, vectorArray(at: $0), metric: metric)) }
         sorted.sort { $0.1 < $1.1 }
         var selected: [Int] = []
         selected.reserveCapacity(min(maxM, sorted.count))
         for (cand, _) in sorted {
             var good = true
+            let candVec = vectorArray(at: cand)
             for s in selected {
                 // If candidate is much closer to an already selected neighbor than to the new point,
                 // skip it (encourage spread). Criterion: d(cand, s) < d(cand, new)
-                let d_cs = distance(nodes[cand].vector, nodes[s].vector, metric: metric)
-                let d_cx = distance(nodes[cand].vector, vec, metric: metric)
+                let d_cs = distance(candVec, vectorArray(at: s), metric: metric)
+                let d_cx = distance(candVec, vec, metric: metric)
                 if d_cs < d_cx { good = false; break }
             }
             if good { selected.append(cand) }
@@ -761,23 +937,24 @@ extension HNSWIndex {
         ids.reserveCapacity(candidateIndices.count)
         var metadata: [[String: String]?] = []
         metadata.reserveCapacity(candidateIndices.count)
-        var vectorStorage = ContiguousArray<Float>()
-        vectorStorage.reserveCapacity(candidateIndices.count * dimension)
-        
+        var candidateVectorStorage = ContiguousArray<Float>()
+        candidateVectorStorage.reserveCapacity(candidateIndices.count * dimension)
+
         // Collect candidate data in single pass
         for idx in candidateIndices {
             let node = nodes[idx]
             if !node.isDeleted {
                 ids.append(node.id)
                 metadata.append(node.metadata)
-                // Append directly to contiguous storage (avoids intermediate array)
-                vectorStorage.append(contentsOf: node.vector)
+                // Copy vector from our vectorStorage to the output contiguous storage
+                let offset = node.vectorOffset
+                candidateVectorStorage.append(contentsOf: self.vectorStorage[offset..<(offset + dimension)])
             }
         }
-        
+
         return AccelerationCandidates(
             ids: ids,
-            vectorStorage: vectorStorage,
+            vectorStorage: candidateVectorStorage,
             vectorCount: ids.count,
             dimension: dimension,
             metadata: metadata

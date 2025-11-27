@@ -171,13 +171,101 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         return results.prefix(k).map { SearchResult(id: $0.0, score: $0.1) }
     }
     
+    /// Context for parallel batch search
+    private struct FlatOptimizedBatchSearchContext: @unchecked Sendable {
+        let vectorStorage: [Float]
+        let idToOffset: [VectorID: Int]
+        let idToMetadata: [VectorID: [String: String]?]
+        let dimension: Int
+        let metric: SupportedDistanceMetric
+        let k: Int
+    }
+
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
-        var output: [[SearchResult]] = []
-        output.reserveCapacity(queries.count)
+        guard k > 0 else { return queries.map { _ in [] } }
+        if queries.isEmpty { return [] }
+
+        // Validate all queries upfront
         for query in queries {
-            output.append(try await search(query: query, k: k, filter: filter))
+            guard query.count == dimension else {
+                throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
+            }
         }
-        return output
+
+        // Snapshot data for parallel access
+        let ctx = FlatOptimizedBatchSearchContext(
+            vectorStorage: Array(vectorStorage),
+            idToOffset: idToOffset,
+            idToMetadata: idToMetadata,
+            dimension: dimension,
+            metric: metric,
+            k: k
+        )
+
+        return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+            for (queryIndex, query) in queries.enumerated() {
+                group.addTask {
+                    Self.performFlatOptimizedSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
+                }
+            }
+
+            var results = [[SearchResult]](repeating: [], count: queries.count)
+            for try await (index, result) in group {
+                results[index] = result
+            }
+            return results
+        }
+    }
+
+    /// Static helper for parallel flat optimized search
+    private static func performFlatOptimizedSearch(
+        query: [Float],
+        queryIndex: Int,
+        ctx: FlatOptimizedBatchSearchContext,
+        filter: (@Sendable ([String: String]?) -> Bool)?
+    ) -> (Int, [SearchResult]) {
+        var results: [(VectorID, Float)] = []
+        results.reserveCapacity(min(ctx.k, ctx.idToOffset.count))
+
+        for (id, offset) in ctx.idToOffset {
+            let metadata = ctx.idToMetadata[id] ?? nil
+            if let filter = filter, !filter(metadata) { continue }
+
+            // Compute distance directly from storage
+            var distance: Float = 0
+            switch ctx.metric {
+            case .euclidean:
+                for i in 0..<ctx.dimension {
+                    let diff = query[i] - ctx.vectorStorage[offset + i]
+                    distance += diff * diff
+                }
+                distance = sqrt(distance)
+            case .cosine:
+                var dot: Float = 0
+                var normA: Float = 0
+                var normB: Float = 0
+                for i in 0..<ctx.dimension {
+                    let a = query[i]
+                    let b = ctx.vectorStorage[offset + i]
+                    dot += a * b
+                    normA += a * a
+                    normB += b * b
+                }
+                distance = 1.0 - (dot / (sqrt(normA) * sqrt(normB)))
+            case .dotProduct:
+                for i in 0..<ctx.dimension {
+                    distance -= query[i] * ctx.vectorStorage[offset + i]
+                }
+            default:
+                let vec = Array(ctx.vectorStorage[offset..<(offset + ctx.dimension)])
+                distance = VectorIndex.distance(query, vec, metric: ctx.metric)
+            }
+
+            results.append((id, distance))
+        }
+
+        results.sort { $0.1 < $1.1 }
+        return (queryIndex, results.prefix(ctx.k).map { SearchResult(id: $0.0, score: $0.1) })
     }
     
     public func clear() async {

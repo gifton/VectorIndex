@@ -461,13 +461,145 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
+    /// Context for parallel batch search - bundles immutable data for worker tasks
+    private struct IVFBatchSearchContext: @unchecked Sendable {
+        let centroids: [[Float]]
+        let lists: [[VectorID]]
+        let store: [VectorID: ([Float], [String: String]?)]
+        let dimension: Int
+        let metric: SupportedDistanceMetric
+        let nprobe: Int
+        let k: Int
+    }
+
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
-        var out: [[SearchResult]] = []
-        out.reserveCapacity(queries.count)
+        guard k > 0 else { return queries.map { _ in [] } }
+        if queries.isEmpty { return [] }
+
+        // Validate all queries upfront
         for q in queries {
-            out.append(try await search(query: q, k: k, filter: filter))
+            guard q.count == dimension else {
+                throw VectorError.dimensionMismatch(expected: dimension, actual: q.count)
+            }
         }
-        return out
+
+        // If kernel30 is active, fall back to sequential (kernel might not be thread-safe)
+        if let h = kernel30, h.format == .flat, mappingComplete30,
+           metric == .euclidean || metric == .dotProduct || metric == .cosine {
+            var out: [[SearchResult]] = []
+            out.reserveCapacity(queries.count)
+            for q in queries {
+                out.append(try await searchKernel30Flat(query: q, k: k, filter: filter))
+            }
+            return out
+        }
+
+        // For standard path, use parallel execution
+        if !centroids.isEmpty && !lists.isEmpty {
+            // Snapshot data for parallel access
+            let ctx = IVFBatchSearchContext(
+                centroids: centroids,
+                lists: lists,
+                store: store,
+                dimension: dimension,
+                metric: metric,
+                nprobe: min(config.nprobe, centroids.count),
+                k: k
+            )
+
+            return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+                for (queryIndex, query) in queries.enumerated() {
+                    group.addTask {
+                        Self.performIVFSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
+                    }
+                }
+
+                var results = [[SearchResult]](repeating: [], count: queries.count)
+                for try await (index, result) in group {
+                    results[index] = result
+                }
+                return results
+            }
+        } else {
+            // Linear scan fallback - also parallelize
+            let storeCopy = store
+            let dim = dimension
+            let met = metric
+            let kk = k
+
+            return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+                for (queryIndex, query) in queries.enumerated() {
+                    group.addTask {
+                        Self.performLinearSearch(query: query, queryIndex: queryIndex, store: storeCopy, dimension: dim, metric: met, k: kk, filter: filter)
+                    }
+                }
+
+                var results = [[SearchResult]](repeating: [], count: queries.count)
+                for try await (index, result) in group {
+                    results[index] = result
+                }
+                return results
+            }
+        }
+    }
+
+    /// Static helper for parallel IVF search with centroids
+    private static func performIVFSearch(
+        query: [Float],
+        queryIndex: Int,
+        ctx: IVFBatchSearchContext,
+        filter: (@Sendable ([String: String]?) -> Bool)?
+    ) -> (Int, [SearchResult]) {
+        // Find nprobe nearest centroids
+        var centroidDists: [(Int, Float)] = []
+        centroidDists.reserveCapacity(ctx.centroids.count)
+        for (i, c) in ctx.centroids.enumerated() {
+            centroidDists.append((i, distance(query, c, metric: ctx.metric)))
+        }
+        centroidDists.sort { $0.1 < $1.1 }
+
+        // Gather candidates from top nprobe lists
+        var candidates = Set<VectorID>()
+        for (ci, _) in centroidDists.prefix(ctx.nprobe) {
+            for id in ctx.lists[ci] { candidates.insert(id) }
+        }
+
+        // Score candidates
+        var results: [SearchResult] = []
+        results.reserveCapacity(min(ctx.k, candidates.count))
+        for id in candidates {
+            guard let (vec, meta) = ctx.store[id] else { continue }
+            if let filter = filter, !filter(meta) { continue }
+            let d = distance(query, vec, metric: ctx.metric)
+            results.append(SearchResult(id: id, score: d))
+        }
+        results.sort { $0.score < $1.score }
+        if results.count > ctx.k { results.removeLast(results.count - ctx.k) }
+
+        return (queryIndex, results)
+    }
+
+    /// Static helper for parallel linear scan search
+    private static func performLinearSearch(
+        query: [Float],
+        queryIndex: Int,
+        store: [VectorID: ([Float], [String: String]?)],
+        dimension: Int,
+        metric: SupportedDistanceMetric,
+        k: Int,
+        filter: (@Sendable ([String: String]?) -> Bool)?
+    ) -> (Int, [SearchResult]) {
+        var results: [SearchResult] = []
+        results.reserveCapacity(min(k, store.count))
+        for (id, (vec, meta)) in store {
+            if let filter = filter, !filter(meta) { continue }
+            let d = distance(query, vec, metric: metric)
+            results.append(SearchResult(id: id, score: d))
+        }
+        results.sort { $0.score < $1.score }
+        if results.count > k { results.removeLast(results.count - k) }
+
+        return (queryIndex, results)
     }
 
     public func clear() async {
