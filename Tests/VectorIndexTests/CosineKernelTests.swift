@@ -18,7 +18,7 @@ final class CosineKernelTests: XCTestCase {
         let dims = [1, 2, 3, 7, 15, 16, 31, 32]
         for d in dims {
             let n = 13
-            var q = (0..<d).map { _ in Float.random(in: -1...1) }
+            let q = (0..<d).map { _ in Float.random(in: -1...1) }
             var xb = (0..<(n*d)).map { _ in Float.random(in: -1...1) }
             var out = [Float](repeating: .nan, count: n)
 
@@ -45,8 +45,8 @@ final class CosineKernelTests: XCTestCase {
         let dims = [512, 768, 1024, 1536]
         for d in dims {
             let n = 16
-            var q = (0..<d).map { _ in Float.random(in: -1...1) }
-            var xb = (0..<(n*d)).map { _ in Float.random(in: -1...1) }
+            let q = (0..<d).map { _ in Float.random(in: -1...1) }
+            let xb = (0..<(n*d)).map { _ in Float.random(in: -1...1) }
             var out = [Float](repeating: .nan, count: n)
             var inv = [Float](repeating: 0, count: n)
 
@@ -83,8 +83,8 @@ final class CosineKernelTests: XCTestCase {
 
     func testCosineF16NormsParity() {
         let d = 64, n = 33
-        var q = (0..<d).map { _ in Float.random(in: -1...1) }
-        var xb = (0..<(n*d)).map { _ in Float.random(in: -1...1) }
+        let q = (0..<d).map { _ in Float.random(in: -1...1) }
+        let xb = (0..<(n*d)).map { _ in Float.random(in: -1...1) }
         var invF32 = [Float](repeating: 0, count: n)
         var invF16 = [Float16](repeating: 0, count: n)
         var outF32 = [Float](repeating: .nan, count: n)

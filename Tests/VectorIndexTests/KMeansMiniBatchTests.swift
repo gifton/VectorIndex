@@ -4,6 +4,8 @@ import XCTest
 /// Comprehensive tests for Kernel #12: Mini-batch K-means Training
 /// Validates convergence, sparse accumulators, layout handling, and edge cases
 final class KMeansMiniBatchTests: XCTestCase {
+    // Set to true to enable performance benchmarks (can take several minutes)
+    private static let benchmarksEnabled = false
 
     // MARK: - Basic Convergence Tests
 
@@ -339,7 +341,7 @@ final class KMeansMiniBatchTests: XCTestCase {
         let d = 8
         let k = 5
 
-        var data = [Float](repeating: 0, count: n * d)
+        let data = [Float](repeating: 0, count: n * d)
         var centroids = [Float](repeating: 0, count: k * d)
 
         let cfg = KMeansMBConfig(
@@ -617,7 +619,7 @@ final class KMeansMiniBatchTests: XCTestCase {
         let k = 3
 
         // All data points are identical
-        var data = [Float](repeating: 1.0, count: n * d)
+        let data = [Float](repeating: 1.0, count: n * d)
 
         var centroids = [Float](repeating: 0, count: k * d)
         let cfg = KMeansMBConfig(
@@ -682,11 +684,11 @@ final class KMeansMiniBatchTests: XCTestCase {
     // NOTE: Performance benchmarks are DISABLED by default as they use XCTest's
     // measure{} blocks which run 10 iterations each. With nil initialization, each
     // iteration runs k-means++ seeding which can take several minutes on large datasets.
-    // To enable for performance profiling, comment out the `throw XCTSkip(...)` line.
+    // To enable for performance profiling, set `benchmarksEnabled = true` above.
 
     /// Measure mini-batch k-means performance on moderate dataset
     func testPerformanceModerate() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (runs 10 iterations, can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 5000
         let d = 64
         let k = 50
@@ -715,7 +717,7 @@ final class KMeansMiniBatchTests: XCTestCase {
 
     /// Measure mini-batch k-means performance on large dataset
     func testPerformanceLarge() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (runs 10 iterations, can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 20000
         let d = 128
         let k = 256

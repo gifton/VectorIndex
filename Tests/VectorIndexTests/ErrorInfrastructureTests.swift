@@ -844,7 +844,7 @@ final class ErrorInfrastructureTests: XCTestCase {
         let n = 100
         var listIDs = [Int32](repeating: 0, count: n)
         var externalIDs = [UInt64](repeating: 0, count: n)
-        var codes = [UInt8](repeating: 0, count: n * 8)
+        let codes = [UInt8](repeating: 0, count: n * 8)
 
         // Distribute across lists
         for i in 0..<n {
@@ -883,7 +883,7 @@ final class ErrorInfrastructureTests: XCTestCase {
         let n = 50
         var listIDs = [Int32](repeating: 0, count: n)
         var externalIDs = [UInt64](repeating: 0, count: n)
-        var codes = [UInt8](repeating: 0, count: n * 8)
+        let codes = [UInt8](repeating: 0, count: n * 8)
 
         for i in 0..<n {
             listIDs[i] = Int32(i % 5)
@@ -918,9 +918,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
 
         // Attempt to store an ID larger than UInt32.max
-        var listIDs: [Int32] = [0]
-        var externalIDs: [UInt64] = [UInt64(UInt32.max) + 1] // Too large for 32-bit storage
-        var codes = [UInt8](repeating: 0, count: 8)
+        let listIDs: [Int32] = [0]
+        let externalIDs: [UInt64] = [UInt64(UInt32.max) + 1] // Too large for 32-bit storage
+        let codes = [UInt8](repeating: 0, count: 8)
 
         XCTAssertThrowsError(
             try ivf_append(
@@ -955,7 +955,7 @@ final class ErrorInfrastructureTests: XCTestCase {
             let n = 30
             var listIDs = [Int32](repeating: 0, count: n)
             var externalIDs = [UInt64](repeating: 0, count: n)
-            var vectors = [Float](repeating: 1.0, count: n * 128)
+            let vectors = [Float](repeating: 1.0, count: n * 128)
 
             for i in 0..<n {
                 listIDs[i] = Int32(i % 3)
@@ -984,7 +984,7 @@ final class ErrorInfrastructureTests: XCTestCase {
             let n = 30
             var listIDs = [Int32](repeating: 0, count: n)
             var externalIDs = [UInt64](repeating: 0, count: n)
-            var vectors = [Float](repeating: 1.0, count: n * 128)
+            let vectors = [Float](repeating: 1.0, count: n * 128)
 
             for i in 0..<n {
                 listIDs[i] = Int32(i % 3)
@@ -1015,14 +1015,14 @@ final class ErrorInfrastructureTests: XCTestCase {
             let handle32 = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts32)
 
             // First append some vectors
-            var listIDs: [Int32] = [0, 0, 0]
-            var externalIDs: [UInt64] = [100, 200, 300]
-            var codes = [UInt8](repeating: 1, count: 3 * 8)
+            let listIDs: [Int32] = [0, 0, 0]
+            let externalIDs: [UInt64] = [100, 200, 300]
+            let codes = [UInt8](repeating: 1, count: 3 * 8)
             try ivf_append(list_ids: listIDs, external_ids: externalIDs, codes: codes, n: 3, m: 8, index: handle32, opts: nil, internalIDsOut: nil)
 
             // Insert in the middle
-            var insertIDs: [UInt64] = [150]
-            var insertCodes = [UInt8](repeating: 2, count: 8)
+            let insertIDs: [UInt64] = [150]
+            let insertCodes = [UInt8](repeating: 2, count: 8)
             XCTAssertNoThrow(
                 try ivf_insert_at(
                     list_id: 0,
@@ -1044,14 +1044,14 @@ final class ErrorInfrastructureTests: XCTestCase {
             let handle64 = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts64)
 
             // First append some vectors with large IDs
-            var listIDs: [Int32] = [0, 0]
-            var externalIDs: [UInt64] = [UInt64(UInt32.max) + 100, UInt64(UInt32.max) + 300]
-            var codes = [UInt8](repeating: 1, count: 2 * 8)
+            let listIDs: [Int32] = [0, 0]
+            let externalIDs: [UInt64] = [UInt64(UInt32.max) + 100, UInt64(UInt32.max) + 300]
+            let codes = [UInt8](repeating: 1, count: 2 * 8)
             try ivf_append(list_ids: listIDs, external_ids: externalIDs, codes: codes, n: 2, m: 8, index: handle64, opts: nil, internalIDsOut: nil)
 
             // Insert with large ID
-            var insertIDs: [UInt64] = [UInt64(UInt32.max) + 200]
-            var insertCodes = [UInt8](repeating: 2, count: 8)
+            let insertIDs: [UInt64] = [UInt64(UInt32.max) + 200]
+            let insertCodes = [UInt8](repeating: 2, count: 8)
             XCTAssertNoThrow(
                 try ivf_insert_at(
                     list_id: 0,
@@ -1101,9 +1101,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let totalVectors = numBatches * batchSize
 
         for batch in 0..<numBatches {
-            var listIDs = [Int32](repeating: 0, count: batchSize)
+            let listIDs = [Int32](repeating: 0, count: batchSize)
             var externalIDs = [UInt64](repeating: 0, count: batchSize)
-            var codes = [UInt8](repeating: UInt8(batch % 256), count: batchSize * 8)
+            let codes = [UInt8](repeating: UInt8(batch % 256), count: batchSize * 8)
 
             for i in 0..<batchSize {
                 externalIDs[i] = UInt64(batch * batchSize + i + 1000)
@@ -1150,7 +1150,7 @@ final class ErrorInfrastructureTests: XCTestCase {
         for batch in 0..<(totalVectors / batchSize) {
             var listIDs = [Int32](repeating: 0, count: batchSize)
             var externalIDs = [UInt64](repeating: 0, count: batchSize)
-            var codes = [UInt8](repeating: UInt8(batch % 256), count: batchSize * 8)
+            let codes = [UInt8](repeating: UInt8(batch % 256), count: batchSize * 8)
 
             for i in 0..<batchSize {
                 listIDs[i] = Int32(i % 2)  // Distribute across 2 lists
@@ -1195,15 +1195,15 @@ final class ErrorInfrastructureTests: XCTestCase {
 
             // Append in batches to trigger growth
             for batch in 0..<10 {
-                var listIDs: [Int32] = [0, 0, 0, 0, 0]
-                var externalIDs: [UInt64] = [
+                let listIDs: [Int32] = [0, 0, 0, 0, 0]
+                let externalIDs: [UInt64] = [
                     UInt64(batch * 5 + 0),
                     UInt64(batch * 5 + 1),
                     UInt64(batch * 5 + 2),
                     UInt64(batch * 5 + 3),
                     UInt64(batch * 5 + 4)
                 ]
-                var vectors = [Float](repeating: Float(batch), count: 5 * 64)
+                let vectors = [Float](repeating: Float(batch), count: 5 * 64)
 
                 XCTAssertNoThrow(
                     try ivf_append_flat(
@@ -1235,13 +1235,13 @@ final class ErrorInfrastructureTests: XCTestCase {
             let handle64 = try IVFListHandle(k_c: 1, m: 0, d: 32, opts: opts64)
 
             for batch in 0..<8 {
-                var listIDs: [Int32] = [0, 0, 0]
-                var externalIDs: [UInt64] = [
+                let listIDs: [Int32] = [0, 0, 0]
+                let externalIDs: [UInt64] = [
                     UInt64(UInt32.max) + UInt64(batch * 3 + 0),
                     UInt64(UInt32.max) + UInt64(batch * 3 + 1),
                     UInt64(UInt32.max) + UInt64(batch * 3 + 2)
                 ]
-                var vectors = [Float](repeating: Float(batch + 1), count: 3 * 32)
+                let vectors = [Float](repeating: Float(batch + 1), count: 3 * 32)
 
                 XCTAssertNoThrow(
                     try ivf_append_flat(
@@ -1275,9 +1275,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
 
         // Initial append (fits in initial capacity)
-        var initialIDs: [Int32] = [0, 0]
-        var initialExtIDs: [UInt64] = [100, 200]
-        var initialCodes = [UInt8](repeating: 1, count: 2 * 8)
+        let initialIDs: [Int32] = [0, 0]
+        let initialExtIDs: [UInt64] = [100, 200]
+        let initialCodes = [UInt8](repeating: 1, count: 2 * 8)
         try ivf_append(
             list_ids: initialIDs,
             external_ids: initialExtIDs,
@@ -1291,8 +1291,8 @@ final class ErrorInfrastructureTests: XCTestCase {
 
         // Insert operations that will trigger growth
         for i in 0..<5 {
-            var insertID: [UInt64] = [UInt64(UInt32.max) + UInt64(i * 100)]
-            var insertCodes = [UInt8](repeating: UInt8(i + 2), count: 8)
+            let insertID: [UInt64] = [UInt64(UInt32.max) + UInt64(i * 100)]
+            let insertCodes = [UInt8](repeating: UInt8(i + 2), count: 8)
 
             XCTAssertNoThrow(
                 try ivf_insert_at(
@@ -1331,9 +1331,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 0, d: 128, opts: opts)
 
         // First append some vectors using the correct function for flat format
-        var listIDs: [Int32] = [0, 0, 0]
-        var externalIDs: [UInt64] = [100, 200, 300]
-        var vectors = [Float](repeating: 1.0, count: 3 * 128)
+        let listIDs: [Int32] = [0, 0, 0]
+        let externalIDs: [UInt64] = [100, 200, 300]
+        let vectors = [Float](repeating: 1.0, count: 3 * 128)
         try ivf_append_flat(
             list_ids: listIDs,
             external_ids: externalIDs,
@@ -1346,8 +1346,8 @@ final class ErrorInfrastructureTests: XCTestCase {
         )
 
         // Now attempt to use ivf_insert_at (wrong function for flat format)
-        var insertIDs: [UInt64] = [150]
-        var dummyCodes = [UInt8](repeating: 0, count: 8)  // Codes parameter is ignored but required
+        let insertIDs: [UInt64] = [150]
+        let dummyCodes = [UInt8](repeating: 0, count: 8)  // Codes parameter is ignored but required
 
         XCTAssertThrowsError(
             try ivf_insert_at(
@@ -1391,9 +1391,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
 
         // Append initial vectors
-        var listIDs: [Int32] = [0, 0, 0]
-        var externalIDs: [UInt64] = [100, 200, 300]
-        var codes = [UInt8](repeating: 1, count: 3 * 8)
+        let listIDs: [Int32] = [0, 0, 0]
+        let externalIDs: [UInt64] = [100, 200, 300]
+        let codes = [UInt8](repeating: 1, count: 3 * 8)
         try ivf_append(
             list_ids: listIDs,
             external_ids: externalIDs,
@@ -1406,8 +1406,8 @@ final class ErrorInfrastructureTests: XCTestCase {
         )
 
         // Insert should succeed for PQ8 format
-        var insertIDs: [UInt64] = [150]
-        var insertCodes = [UInt8](repeating: 2, count: 8)
+        let insertIDs: [UInt64] = [150]
+        let insertCodes = [UInt8](repeating: 2, count: 8)
 
         XCTAssertNoThrow(
             try ivf_insert_at(
@@ -1433,9 +1433,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 8, d: 0, opts: opts)
 
         // Append initial vectors
-        var listIDs: [Int32] = [0, 0]
-        var externalIDs: [UInt64] = [100, 200]
-        var codes = [UInt8](repeating: 1, count: 2 * 4)  // PQ4: m/2 = 8/2 = 4 bytes per vector
+        let listIDs: [Int32] = [0, 0]
+        let externalIDs: [UInt64] = [100, 200]
+        let codes = [UInt8](repeating: 1, count: 2 * 4)  // PQ4: m/2 = 8/2 = 4 bytes per vector
         try ivf_append(
             list_ids: listIDs,
             external_ids: externalIDs,
@@ -1448,8 +1448,8 @@ final class ErrorInfrastructureTests: XCTestCase {
         )
 
         // Insert should succeed for PQ4 format
-        var insertIDs: [UInt64] = [150]
-        var insertCodes = [UInt8](repeating: 2, count: 4)
+        let insertIDs: [UInt64] = [150]
+        let insertCodes = [UInt8](repeating: 2, count: 4)
 
         XCTAssertNoThrow(
             try ivf_insert_at(
@@ -1476,9 +1476,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 0, d: 64, opts: opts)
 
         // Append initial vectors using ivf_append_flat
-        var listIDs: [Int32] = [0, 0]
-        var externalIDs: [UInt64] = [100, 300]
-        var vectors = [Float](repeating: 1.0, count: 2 * 64)
+        let listIDs: [Int32] = [0, 0]
+        let externalIDs: [UInt64] = [100, 300]
+        let vectors = [Float](repeating: 1.0, count: 2 * 64)
         try ivf_append_flat(
             list_ids: listIDs,
             external_ids: externalIDs,
@@ -1491,8 +1491,8 @@ final class ErrorInfrastructureTests: XCTestCase {
         )
 
         // Insert using the correct function for flat format
-        var insertIDs: [UInt64] = [200]
-        var insertVectors = [Float](repeating: 2.0, count: 64)
+        let insertIDs: [UInt64] = [200]
+        let insertVectors = [Float](repeating: 2.0, count: 64)
 
         XCTAssertNoThrow(
             try ivf_insert_at_flat(
@@ -1518,9 +1518,9 @@ final class ErrorInfrastructureTests: XCTestCase {
         let handle = try IVFListHandle(k_c: 1, m: 0, d: 128, opts: opts)
 
         // Append one vector to ensure list is non-empty
-        var listIDs: [Int32] = [0]
-        var externalIDs: [UInt64] = [100]
-        var vectors = [Float](repeating: 1.0, count: 128)
+        let listIDs: [Int32] = [0]
+        let externalIDs: [UInt64] = [100]
+        let vectors = [Float](repeating: 1.0, count: 128)
         try ivf_append_flat(
             list_ids: listIDs,
             external_ids: externalIDs,
@@ -1533,8 +1533,8 @@ final class ErrorInfrastructureTests: XCTestCase {
         )
 
         // Attempt incorrect function
-        var insertIDs: [UInt64] = [200]
-        var dummyCodes = [UInt8](repeating: 0, count: 8)
+        let insertIDs: [UInt64] = [200]
+        let dummyCodes = [UInt8](repeating: 0, count: 8)
 
         do {
             try ivf_insert_at(

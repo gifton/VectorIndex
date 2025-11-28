@@ -15,7 +15,7 @@ final class HNSWNeighborSelectionTests: XCTestCase {
             2, 0,   // id=2
             1, 0.1  // id=3
         ]
-        var candidates: [Int32] = [1, 2, 3]
+        let candidates: [Int32] = [1, 2, 3]
         var selected = [Int32](repeating: -1, count: 2)
         let written = x_new.withUnsafeBufferPointer { q in
             xb.withUnsafeBufferPointer { base in
@@ -50,8 +50,8 @@ final class HNSWNeighborSelectionTests: XCTestCase {
         ]
         let N = 4
         // CSR for layer 0: only node 0 has neighbors [1,2,3]
-        var offsets: [Int32] = [0, 3, 0, 0, 0]
-        var neighbors: [Int32] = [1, 2, 3]
+        let offsets: [Int32] = [0, 3, 0, 0, 0]
+        let neighbors: [Int32] = [1, 2, 3]
         var out = [Int32](repeating: -1, count: 2)
         let kept = xb.withUnsafeBufferPointer { base in
             offsets.withUnsafeBufferPointer { ob in

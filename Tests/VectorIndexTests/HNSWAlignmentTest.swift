@@ -115,7 +115,7 @@ final class HNSWAlignmentTest: XCTestCase {
         let structureAfter = await index.getIndexStructure()
         
         // Both should be valid HNSW structures
-        guard case .hnsw(let before) = structureBefore,
+        guard case .hnsw = structureBefore,
               case .hnsw(let after) = structureAfter else {
             XCTFail("Expected HNSW structures")
             return

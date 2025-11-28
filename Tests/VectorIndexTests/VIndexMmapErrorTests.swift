@@ -49,7 +49,7 @@ final class VIndexMmapErrorTests: XCTestCase {
         let fh = try XCTUnwrap(FileHandle(forUpdatingAtPath: path))
         defer { try? fh.close() }
         fh.seek(toFileOffset: 80) // reserved region beyond CRC field
-        var b: UInt8 = 0
+        let b: UInt8 = 0
         fh.write(Data([b ^ 0xFF]))
 
         var opts = MmapOpts()

@@ -2,11 +2,16 @@ import XCTest
 @testable import VectorIndex
 
 final class IDMapPersistenceTests: XCTestCase {
+    // TODO: Re-enable when CRC validation refactoring is complete (0.1.1)
+    private static let idMapPersistenceEnabled = false
+
     func testIDMapSnapshotRoundTripMmap() throws {
-        throw XCTSkip("Known issue: CRC validation needs refactoring for mmap persistence - deferred to 0.1.1")
+        guard Self.idMapPersistenceEnabled else {
+            throw XCTSkip("Known issue: CRC validation needs refactoring for mmap persistence - deferred to 0.1.1")
+        }
         // Build an IDMap with a few entries
         let ext: [UInt64] = [101, 202, 303, 404]
-        var map = idmapInit(capacityHint: 16, opts: .default)
+        let map = idmapInit(capacityHint: 16, opts: .default)
         var assigned = [Int64](repeating: -1, count: ext.count)
         try ext.withUnsafeBufferPointer { ep in
             try assigned.withUnsafeMutableBufferPointer { ap in
@@ -42,14 +47,16 @@ final class IDMapPersistenceTests: XCTestCase {
     }
 
     func testIVFIndexLoadsIDMapFromDurableContainerAndRejectsDuplicates() async throws {
-        throw XCTSkip("Known issue: CRC validation needs refactoring for mmap persistence - deferred to 0.1.1")
+        guard Self.idMapPersistenceEnabled else {
+            throw XCTSkip("Known issue: CRC validation needs refactoring for mmap persistence - deferred to 0.1.1")
+        }
         // Prepare durable container with a pre-populated IDMap containing [777]
         let tmp = FileManager.default.temporaryDirectory.appendingPathComponent("vindex_\(UUID().uuidString).bin")
         let mmap = try VIndexContainerBuilder.createMinimalContainer(path: tmp.path, format: .flat, k_c: 2, m: 0, d: 2, includeIDMap: true)
         // Build a map with one ID
-        var map = idmapInit(capacityHint: 8, opts: .default)
+        let map = idmapInit(capacityHint: 8, opts: .default)
         var assigned = [Int64](repeating: -1, count: 1)
-        var extOne: [UInt64] = [777]
+        let extOne: [UInt64] = [777]
         try extOne.withUnsafeBufferPointer { ep in
             try assigned.withUnsafeMutableBufferPointer { ap in
                 _ = try idmapAppend(map, externalIDs: ep.baseAddress!, count: 1, internalIDsOut: ap.baseAddress!)

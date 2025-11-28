@@ -203,12 +203,22 @@ public func pq_train_f32(
                 // Downsample candidate set to __nsSeed uniformly without replacement
                 let poolCount = Int(ns)
                 let pos = sampleWithoutReplacement(n: UInt32(poolCount), k: UInt32(__nsSeed), rng: &rng)
+                #if DEBUG
+                if pos.count != __nsSeed {
+                    print("[PQTrain][subsample][debug] j=\(j) pos.count=\(pos.count) expected=\(__nsSeed)")
+                }
+                #endif
                 var tmp = [Float](repeating: 0, count: __nsSeed * dsub)
                 for (t, p) in pos.enumerated() {
                     let poolIndex = Int(p)
                     // If ns==n, idx is 0..n-1; else map via idx
                     let i = (ns == n) ? poolIndex : Int(idx[poolIndex])
                     let base = i * d + j * dsub
+                    #if DEBUG
+                    if base + dsub > x.count {
+                        print("[PQTrain][subsample][debug] j=\(j) OUT OF BOUNDS: t=\(t) i=\(i) base=\(base) dsub=\(dsub) x.count=\(x.count)")
+                    }
+                    #endif
                     if let coarse = coarseCentroids, let a = assignments {
                         let gid = Int(a[i])
                         let gBase = gid * d + j * dsub
@@ -217,6 +227,18 @@ public func pq_train_f32(
                         for u in 0..<dsub { tmp[t*dsub + u] = x[base + u] }
                     }
                 }
+                #if DEBUG
+                // Validate tmp before seeding
+                var tmpNaN = 0, tmpInf = 0, tmpZero = 0
+                for v in tmp {
+                    if v.isNaN { tmpNaN += 1 }
+                    if v.isInfinite { tmpInf += 1 }
+                    if v == 0 { tmpZero += 1 }
+                }
+                if tmpNaN > 0 || tmpInf > 0 || tmpZero == tmp.count {
+                    print("[PQTrain][subsample][debug] j=\(j) tmp: nan=\(tmpNaN) inf=\(tmpInf) allZero=\(tmpZero == tmp.count) count=\(tmp.count)")
+                }
+                #endif
                 kmeansppSeedSubspaceDense(
                     xDense: tmp, n: __nsSeed, dsub: dsub, ks: ks,
                     rng: &rng, outC: &Cj
@@ -432,7 +454,7 @@ public func pq_train_streaming_f32(
 
     let t0 = nowSec()
 
-    var warmStartCount = 0
+    let warmStartCount = 0  // TODO: implement warm-start for streaming mode
     for j in 0..<m {
         var rng = Xoroshiro128(splitFrom: cfg.seed, streamID: UInt64(cfg.streamID), taskID: UInt64(j))
         var Cj = [Float](repeating: 0, count: ks * dsub)
@@ -766,76 +788,110 @@ private func kmeansppSeedSubspace(
     rng: inout Xoroshiro128,
     outC: inout [Float]
 ) {
-    // Create local var copies for &array[index] syntax
-    var x = x
-    let coarse = coarse
-
     let nI = Int(n)
     var i0 = Int(rng.uniformF64() * Double(n))
     if i0 < 0 { i0 = 0 }
     if i0 >= nI { i0 = nI - 1 }
     let base0 = i0 * d + j * dsub
-    if let coarse = coarse, let assign = assign {
-        let gid = Int(assign[i0])
+    if let coarseArr = coarse, let assignArr = assign {
+        let gid = Int(assignArr[i0])
         let gbase = gid * d + j * dsub
-        for u in 0..<dsub { outC[u] = x[base0 + u] - coarse[gbase + u] }
+        for u in 0..<dsub { outC[u] = x[base0 + u] - coarseArr[gbase + u] }
     } else {
         for u in 0..<dsub { outC[u] = x[base0 + u] }
     }
 
     var dmin = [Float](repeating: .infinity, count: nI)
-    for i in 0..<nI {
-        let base = i * d + j * dsub
-        if let coarse = coarse, let assign = assign {
-            var coarse = coarse  // Re-shadow as var for &coarse syntax
-            let gid = Int(assign[i])
-            let gbase = gid * d + j * dsub
-            dmin[i] = l2Sq(&x[base], &outC[0], dsub, subtract: &coarse[gbase])
-        } else {
-            dmin[i] = l2Sq(&x[base], &outC[0], dsub)
-        }
-    }
 
-    for k in 1..<ks {
-        var sum: Double = 0
-        for i in 0..<nI { sum += Double(dmin[i]) }
-        if !(sum > 0) {
-            var ir = Int(rng.uniformF64() * Double(n))
-            ir = max(0, min(ir, nI - 1))
-            let base = ir * d + j * dsub
-            if let coarse = coarse, let assign = assign {
-                let gid = Int(assign[ir]); let gbase = gid * d + j * dsub
-                for u in 0..<dsub { outC[k*dsub + u] = x[base + u] - coarse[gbase + u] }
-            } else {
-                for u in 0..<dsub { outC[k*dsub + u] = x[base + u] }
-            }
-            continue
-        }
-        var r = rng.uniformF64() * sum
-        var pick = nI - 1
-        for i in 0..<nI {
-            r -= Double(dmin[i])
-            if r <= 0 { pick = i; break }
-        }
-        let base = pick * d + j * dsub
-        if let coarse = coarse, let assign = assign {
-            let gid = Int(assign[pick]); let gbase = gid * d + j * dsub
-            for u in 0..<dsub { outC[k*dsub + u] = x[base + u] - coarse[gbase + u] }
-        } else {
-            for u in 0..<dsub { outC[k*dsub + u] = x[base + u] }
-        }
+    // Use withUnsafeBufferPointer for stable pointer access
+    x.withUnsafeBufferPointer { xbuf in
+        outC.withUnsafeMutableBufferPointer { cbuf in
+            let xbase = xbuf.baseAddress!
+            let cbase = cbuf.baseAddress!
 
-        for i in 0..<nI {
-            let basei = i * d + j * dsub
-            let di: Float
-            if let coarse = coarse, let assign = assign {
-                var coarse = coarse  // Re-shadow as var for &coarse syntax
-                let gid = Int(assign[i]); let gbase = gid * d + j * dsub
-                di = l2Sq(&x[basei], &outC[k*dsub], dsub, subtract: &coarse[gbase])
+            // Compute initial distances
+            if let coarseArr = coarse, let assignArr = assign {
+                coarseArr.withUnsafeBufferPointer { gbuf in
+                    let gptr = gbuf.baseAddress!
+                    for i in 0..<nI {
+                        let base = i * d + j * dsub
+                        let gid = Int(assignArr[i])
+                        let gbase = gid * d + j * dsub
+                        dmin[i] = l2Sq(xbase + base, cbase, dsub, subtract: gptr + gbase)
+                    }
+                }
             } else {
-                di = l2Sq(&x[basei], &outC[k*dsub], dsub)
+                for i in 0..<nI {
+                    let base = i * d + j * dsub
+                    dmin[i] = l2Sq(xbase + base, cbase, dsub)
+                }
             }
-            if di < dmin[i] { dmin[i] = di }
+
+            for k in 1..<ks {
+                var sum: Double = 0
+                for i in 0..<nI { sum += Double(dmin[i]) }
+                if !(sum > 0) {
+                    var ir = Int(rng.uniformF64() * Double(n))
+                    ir = max(0, min(ir, nI - 1))
+                    let base = ir * d + j * dsub
+                    if let coarseArr = coarse, let assignArr = assign {
+                        let gid = Int(assignArr[ir]); let gbase = gid * d + j * dsub
+                        for u in 0..<dsub { cbuf[k*dsub + u] = xbuf[base + u] - coarseArr[gbase + u] }
+                    } else {
+                        for u in 0..<dsub { cbuf[k*dsub + u] = xbuf[base + u] }
+                    }
+                    // Update dmin for newly placed centroid
+                    if let coarseArr = coarse, let assignArr = assign {
+                        coarseArr.withUnsafeBufferPointer { gbuf in
+                            let gptr = gbuf.baseAddress!
+                            for i in 0..<nI {
+                                let basei = i * d + j * dsub
+                                let gid = Int(assignArr[i]); let gbase = gid * d + j * dsub
+                                let di = l2Sq(xbase + basei, cbase + k*dsub, dsub, subtract: gptr + gbase)
+                                if di < dmin[i] { dmin[i] = di }
+                            }
+                        }
+                    } else {
+                        for i in 0..<nI {
+                            let basei = i * d + j * dsub
+                            let di = l2Sq(xbase + basei, cbase + k*dsub, dsub)
+                            if di < dmin[i] { dmin[i] = di }
+                        }
+                    }
+                    continue
+                }
+                var r = rng.uniformF64() * sum
+                var pick = nI - 1
+                for i in 0..<nI {
+                    r -= Double(dmin[i])
+                    if r <= 0 { pick = i; break }
+                }
+                let base = pick * d + j * dsub
+                if let coarseArr = coarse, let assignArr = assign {
+                    let gid = Int(assignArr[pick]); let gbase = gid * d + j * dsub
+                    for u in 0..<dsub { cbuf[k*dsub + u] = xbuf[base + u] - coarseArr[gbase + u] }
+                } else {
+                    for u in 0..<dsub { cbuf[k*dsub + u] = xbuf[base + u] }
+                }
+
+                if let coarseArr = coarse, let assignArr = assign {
+                    coarseArr.withUnsafeBufferPointer { gbuf in
+                        let gptr = gbuf.baseAddress!
+                        for i in 0..<nI {
+                            let basei = i * d + j * dsub
+                            let gid = Int(assignArr[i]); let gbase = gid * d + j * dsub
+                            let di = l2Sq(xbase + basei, cbase + k*dsub, dsub, subtract: gptr + gbase)
+                            if di < dmin[i] { dmin[i] = di }
+                        }
+                    }
+                } else {
+                    for i in 0..<nI {
+                        let basei = i * d + j * dsub
+                        let di = l2Sq(xbase + basei, cbase + k*dsub, dsub)
+                        if di < dmin[i] { dmin[i] = di }
+                    }
+                }
+            }
         }
     }
 }
@@ -844,33 +900,49 @@ private func kmeansppSeedSubspaceDense(
     xDense: [Float], n: Int, dsub: Int, ks: Int,
     rng: inout Xoroshiro128, outC: inout [Float]
 ) {
-    // Create local var copy for &array[index] syntax
-    var xDense = xDense
-
     var i0 = Int(rng.uniformF64() * Double(n))
     i0 = max(0, min(i0, n - 1))
     for u in 0..<dsub { outC[u] = xDense[i0*dsub + u] }
     var dmin = [Float](repeating: .infinity, count: n)
-    for i in 0..<n { dmin[i] = l2Sq(&xDense[i*dsub], &outC[0], dsub) }
-    for k in 1..<ks {
-        var sum: Double = 0
-        for i in 0..<n { sum += Double(dmin[i]) }
-        if !(sum > 0) {
-            var ir = Int(rng.uniformF64() * Double(n))
-            ir = max(0, min(ir, n - 1))
-            for u in 0..<dsub { outC[k*dsub + u] = xDense[ir*dsub + u] }
-            continue
-        }
-        var r = rng.uniformF64() * sum
-        var pick = n - 1
-        for i in 0..<n {
-            r -= Double(dmin[i])
-            if r <= 0 { pick = i; break }
-        }
-        for u in 0..<dsub { outC[k*dsub + u] = xDense[pick*dsub + u] }
-        for i in 0..<n {
-            let di = l2Sq(&xDense[i*dsub], &outC[k*dsub], dsub)
-            if di < dmin[i] { dmin[i] = di }
+
+    // Use withUnsafeBufferPointer for stable pointer access
+    // This avoids Swift's &array[index] pointer aliasing issues
+    xDense.withUnsafeBufferPointer { xbuf in
+        outC.withUnsafeMutableBufferPointer { cbuf in
+            let xbase = xbuf.baseAddress!
+            let cbase = cbuf.baseAddress!
+
+            // Compute initial distances to first centroid
+            for i in 0..<n {
+                dmin[i] = l2Sq(xbase + i*dsub, cbase, dsub)
+            }
+
+            for k in 1..<ks {
+                var sum: Double = 0
+                for i in 0..<n { sum += Double(dmin[i]) }
+                if !(sum > 0) {
+                    var ir = Int(rng.uniformF64() * Double(n))
+                    ir = max(0, min(ir, n - 1))
+                    for u in 0..<dsub { cbuf[k*dsub + u] = xbuf[ir*dsub + u] }
+                    // Update dmin for the newly placed centroid
+                    for i in 0..<n {
+                        let di = l2Sq(xbase + i*dsub, cbase + k*dsub, dsub)
+                        if di < dmin[i] { dmin[i] = di }
+                    }
+                    continue
+                }
+                var r = rng.uniformF64() * sum
+                var pick = n - 1
+                for i in 0..<n {
+                    r -= Double(dmin[i])
+                    if r <= 0 { pick = i; break }
+                }
+                for u in 0..<dsub { cbuf[k*dsub + u] = xbuf[pick*dsub + u] }
+                for i in 0..<n {
+                    let di = l2Sq(xbase + i*dsub, cbase + k*dsub, dsub)
+                    if di < dmin[i] { dmin[i] = di }
+                }
+            }
         }
     }
 }
@@ -884,10 +956,6 @@ private func lloydKMeansSubspace(
     C: inout [Float],
     outDistortion: inout Double, outIters: inout Int, outEmpties: inout Int
 ) {
-    // Create local var copies for &array[index] syntax
-    var x = x
-    let coarse = coarse
-
     let nI = Int(n)
     var prevDist = Double.infinity
     var it = 0
@@ -924,45 +992,59 @@ private func lloydKMeansSubspace(
         counts.withUnsafeMutableBufferPointer { $0.initialize(repeating: 0) }
         var distortion: Double = 0
 
-        for i in 0..<nI {
-            let base = i * d + j * dsub
-            var bestK = 0
-            var bestD: Float
-            if let coarse = coarse, let assign = assign {
-                var coarse = coarse  // Re-shadow as var for &coarse syntax
-                let gid = Int(assign[i]); let gbase = gid * d + j * dsub
-                bestD = l2Sq(&x[base], &C[0], dsub, subtract: &coarse[gbase])
-                for k in 1..<ks {
-                    let dk = l2Sq(&x[base], &C[k*dsub], dsub, subtract: &coarse[gbase])
-                    // ✅ Deterministic tie-breaking
-                    if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
-                }
-                for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u] - coarse[gbase+u]) }
-            } else {
-                if useDot, let qn = qnorms {
-                    bestD = distDotTrick(x: &x[base], c: &C[0], dsub: dsub, x2: qn[i], c2: Cnorms[0])
-                    for k in 1..<ks {
-                        let dk = distDotTrick(x: &x[base], c: &C[k*dsub], dsub: dsub, x2: qn[i], c2: Cnorms[k])
-                        if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+        // Use withUnsafeBufferPointer for stable pointer access
+        // This avoids Swift's &array[index] pointer aliasing issues
+        x.withUnsafeBufferPointer { xbuf in
+            C.withUnsafeMutableBufferPointer { cbuf in
+                let xbase = xbuf.baseAddress!
+                let cbase = cbuf.baseAddress!
+
+                // Handle coarse case separately since it needs its own buffer pointer
+                if let coarseArr = coarse, let assignArr = assign {
+                    coarseArr.withUnsafeBufferPointer { coarseBuf in
+                        let gbase_ptr = coarseBuf.baseAddress!
+                        for i in 0..<nI {
+                            let base = i * d + j * dsub
+                            var bestK = 0
+                            let gid = Int(assignArr[i]); let gbase = gid * d + j * dsub
+                            var bestD = l2Sq(xbase + base, cbase, dsub, subtract: gbase_ptr + gbase)
+                            for k in 1..<ks {
+                                let dk = l2Sq(xbase + base, cbase + k*dsub, dsub, subtract: gbase_ptr + gbase)
+                                if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                            }
+                            for u in 0..<dsub { sums[bestK*dsub + u] += Double(xbuf[base+u] - coarseBuf[gbase+u]) }
+                            kAssign[i] = bestK
+                            if bestD < 0 { bestD = 0 }
+                            counts[bestK] += 1
+                            distortion += Double(bestD)
+                        }
                     }
                 } else {
-                    bestD = l2Sq(&x[base], &C[0], dsub)
-                    for k in 1..<ks {
-                        let dk = l2Sq(&x[base], &C[k*dsub], dsub)
-                        if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                    for i in 0..<nI {
+                        let base = i * d + j * dsub
+                        var bestK = 0
+                        var bestD: Float
+                        if useDot, let qn = qnorms {
+                            bestD = distDotTrick(x: xbase + base, c: cbase, dsub: dsub, x2: qn[i], c2: Cnorms[0])
+                            for k in 1..<ks {
+                                let dk = distDotTrick(x: xbase + base, c: cbase + k*dsub, dsub: dsub, x2: qn[i], c2: Cnorms[k])
+                                if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                            }
+                        } else {
+                            bestD = l2Sq(xbase + base, cbase, dsub)
+                            for k in 1..<ks {
+                                let dk = l2Sq(xbase + base, cbase + k*dsub, dsub)
+                                if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                            }
+                        }
+                        for u in 0..<dsub { sums[bestK*dsub + u] += Double(xbuf[base+u]) }
+                        kAssign[i] = bestK
+                        if bestD < 0 { bestD = 0 }
+                        counts[bestK] += 1
+                        distortion += Double(bestD)
                     }
                 }
-                for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u]) }
             }
-            kAssign[i] = bestK
-            #if DEBUG
-            if useDot && bestD < -1e-6 {
-                print("[PQTrain][lloyd][debug] j=\(j) i=\(i) negative dist from dot-trick: \(bestD)")
-            }
-            #endif
-            if bestD < 0 { bestD = 0 }
-            counts[bestK] += 1
-            distortion += Double(bestD)
         }
 
         var empties = 0
@@ -993,21 +1075,28 @@ private func lloydKMeansSubspace(
                 // Approximate split-largest: compute min-distance once for a sampled subset,
                 // then assign the top-|empties| farthest points to empty clusters.
                 let sample = min(nI, max(128, nI / 4))
-                let stride = max(1, nI / sample)
+                let strideS = max(1, nI / sample)
                 var sampledIdx: [Int] = []
                 sampledIdx.reserveCapacity(sample)
-                var i = 0
-                while i < nI { sampledIdx.append(i); i += stride }
+                var idx = 0
+                while idx < nI { sampledIdx.append(idx); idx += strideS }
                 // Compute min distance to any centroid for sampled points
                 var mins = [Float](repeating: 0, count: sampledIdx.count)
-                for (t, ii) in sampledIdx.enumerated() {
-                    let base = ii * d + j * dsub
-                    var md = l2Sq(&x[base], &C[0], dsub)
-                    for kk in 1..<ks {
-                        let di = l2Sq(&x[base], &C[kk*dsub], dsub)
-                        if di < md { md = di }
+                // Use withUnsafeBufferPointer for stable pointer access
+                x.withUnsafeBufferPointer { xbuf in
+                    C.withUnsafeBufferPointer { cbuf in
+                        let xbase = xbuf.baseAddress!
+                        let cbase = cbuf.baseAddress!
+                        for (t, ii) in sampledIdx.enumerated() {
+                            let base = ii * d + j * dsub
+                            var md = l2Sq(xbase + base, cbase, dsub)
+                            for kk in 1..<ks {
+                                let di = l2Sq(xbase + base, cbase + kk*dsub, dsub)
+                                if di < md { md = di }
+                            }
+                            mins[t] = md
+                        }
                     }
-                    mins[t] = md
                 }
                 // Prepare list of empty cluster ids
                 var emptyIds: [Int] = []
@@ -1025,13 +1114,6 @@ private func lloydKMeansSubspace(
                 outEmpties += empties
             }
         }
-
-        #if DEBUG
-        let distPer = distortion / Double(max(nI, 1))
-        print("[PQTrain][lloyd][debug] j=\(j) iter=\(iter+1) distortion=\(distPer) empties=\(empties)")
-        // Centroid finiteness check
-        for v in C { if !v.isFinite { print("[PQTrain][lloyd][debug] non-finite centroid value detected"); assertionFailure("Non-finite centroid") } }
-        #endif
 
         let improve = (prevDist - distortion) / (prevDist == 0 ? 1 : prevDist)
         prevDist = distortion

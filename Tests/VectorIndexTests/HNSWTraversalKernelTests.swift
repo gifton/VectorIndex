@@ -13,8 +13,8 @@ final class HNSWTraversalKernelTests: XCTestCase {
             1, 0    // id=2
         ]
         // CSR layer 0: node 0 → [1,2], others empty
-        var offsetsL0: [Int32] = [0, 2, 2, 2]
-        var neighborsL0: [Int32] = [1, 2]
+        let offsetsL0: [Int32] = [0, 2, 2, 2]
+        let neighborsL0: [Int32] = [1, 2]
         let q: [Float] = [1, 0]
         var idsOut = [Int32](repeating: -1, count: 2)
         var distsOut = [Float](repeating: .infinity, count: 2)

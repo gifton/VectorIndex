@@ -6,15 +6,17 @@ import XCTest
 ///
 /// NOTE: These benchmarks are DISABLED by default as they can take many minutes to run.
 /// They use XCTest's `measure {}` blocks which run 10 iterations each, and test large
-/// datasets (up to 50K vectors × 256D). To enable for performance profiling, comment out
-/// the `throw XCTSkip(...)` line in each test method.
+/// datasets (up to 50K vectors × 256D). To enable for performance profiling, set
+/// `benchmarksEnabled = true` below.
 final class KMeansKernelBenchmarks: XCTestCase {
+    // Set to true to enable performance benchmarks (can take several minutes)
+    private static let benchmarksEnabled = false
 
     // MARK: - Kernel #11 Benchmarks (K-means++ Seeding)
 
     /// Benchmark k-means++ seeding: Small dataset (1K vectors, 64D)
     func testBench_KMeansPP_Small_1K_64D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 1_000
         let d = 64
         let k = 50
@@ -45,7 +47,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark k-means++ seeding: Medium dataset (10K vectors, 128D)
     func testBench_KMeansPP_Medium_10K_128D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -75,7 +77,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark k-means++ seeding: Large dataset (50K vectors, 256D)
     func testBench_KMeansPP_Large_50K_256D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 50_000
         let d = 256
         let k = 256
@@ -105,7 +107,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark k-means++ seeding: High-dimensional (10K vectors, 1024D)
     func testBench_KMeansPP_HighDim_10K_1024D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 1024  // Very high dimension
         let k = 100
@@ -135,7 +137,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark k-means++ seeding: Many clusters (10K vectors, 128D, k=1000)
     func testBench_KMeansPP_ManyClusters_10K_k1000() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 1000  // Many centroids
@@ -166,7 +168,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark mini-batch k-means: Small dataset (1K vectors, 64D)
     func testBench_MiniBatch_Small_1K_64D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 1_000
         let d = 64
         let k = 50
@@ -199,7 +201,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark mini-batch k-means: Medium dataset (10K vectors, 128D)
     func testBench_MiniBatch_Medium_10K_128D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -232,7 +234,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark mini-batch k-means: Large dataset (50K vectors, 256D)
     func testBench_MiniBatch_Large_50K_256D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 50_000
         let d = 256
         let k = 256
@@ -265,7 +267,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark mini-batch k-means: Batch size sweep (10K vectors, 128D)
     func testBench_MiniBatch_BatchSizeSweep_10K_128D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -302,7 +304,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark mini-batch k-means: AoS vs AoSoA layout (10K vectors, 128D)
     func testBench_MiniBatch_LayoutComparison_10K_128D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -367,7 +369,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark mini-batch k-means: Learning rate schedule comparison
     func testBench_MiniBatch_LearningRateComparison_10K_128D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -431,7 +433,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Benchmark full pipeline: k-means++ seeding → mini-batch training
     func testBench_FullPipeline_10K_128D() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -483,7 +485,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Measure memory allocation overhead
     func testBench_MemoryAllocation() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let k = 100
@@ -534,7 +536,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Test scalability with increasing dataset size
     func testBench_Scalability_DatasetSize() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let d = 128
         let k = 100
         let sizes = [1_000, 5_000, 10_000, 20_000, 50_000]
@@ -571,7 +573,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Test scalability with increasing dimension
     func testBench_Scalability_Dimension() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let k = 100
         let dimensions = [32, 64, 128, 256, 512]
@@ -607,7 +609,7 @@ final class KMeansKernelBenchmarks: XCTestCase {
 
     /// Test scalability with increasing number of clusters
     func testBench_Scalability_Clusters() throws {
-        throw XCTSkip("Performance benchmark - enable manually for profiling (can take several minutes)")
+        guard Self.benchmarksEnabled else { throw XCTSkip("Performance benchmark disabled") }
         let n = 10_000
         let d = 128
         let clusterCounts = [10, 50, 100, 200, 500]
