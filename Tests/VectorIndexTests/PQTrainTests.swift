@@ -351,7 +351,7 @@ final class PQTrainTests: XCTestCase {
 
         var seedCodebooks = [Float]()
         var nilNorms: [Float]?
-        let seedStats = try pq_train_f32(
+        _ = try pq_train_f32(
             x: x, n: n, d: d, m: m, ks: ks,
             cfg: seedCfg,
             codebooksOut: &seedCodebooks,
@@ -561,7 +561,7 @@ final class PQTrainTests: XCTestCase {
         let n: Int64 = 50
         let ks = 100
 
-        var x = [Float](repeating: 0, count: Int(n) * 128)
+        let x = [Float](repeating: 0, count: Int(n) * 128)
         var codebooks = [Float]()
 
         XCTAssertThrowsError(
@@ -585,7 +585,7 @@ final class PQTrainTests: XCTestCase {
     func testInvalidDimension() throws {
         var nilNorms: [Float]?
         // Should throw error when d not divisible by m
-        var x = [Float](repeating: 0, count: 1000 * 100)
+        let x = [Float](repeating: 0, count: 1000 * 100)
         var codebooks = [Float]()
 
         XCTAssertThrowsError(
@@ -658,7 +658,6 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Performance Validation Tests
 
     func testLargeScaleTraining() throws {
-        var nilNorms: [Float]?
         // Test with realistic production scale
         let n: Int64 = 50_000
         let d = 768

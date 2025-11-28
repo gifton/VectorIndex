@@ -281,7 +281,7 @@ final class IVFSelectTests: XCTestCase {
         let centroids = randomVectors(n: kc, d: d)
 
         let wordCount = (kc + 63) / 64
-        var disabledMask = [UInt64](repeating: UInt64.max, count: wordCount)
+        let disabledMask = [UInt64](repeating: UInt64.max, count: wordCount)
 
         var ids = [Int32](repeating: -1, count: nprobe)
         var scores: [Float]? = [Float](repeating: 0, count: nprobe)
@@ -413,7 +413,7 @@ final class IVFSelectTests: XCTestCase {
         // Build simple k-NN graph (random neighbors for testing)
         let deg = 16
         var knnGraph = [Int32]()
-        for i in 0..<kc {
+        for _ in 0..<kc {
             for _ in 0..<deg {
                 let neighbor = Int32.random(in: 0..<Int32(kc))
                 knnGraph.append(neighbor)

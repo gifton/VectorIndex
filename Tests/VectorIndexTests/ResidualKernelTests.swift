@@ -338,13 +338,11 @@ final class ResidualKernelTests: XCTestCase {
     func testResidualThroughput() throws {
         // Scale workload to avoid OOM/hangs in constrained CI while keeping
         // enough work per call to amortize overheads.
-        var d = 256          // smaller dim to reduce memory footprint
+        let d = 256          // smaller dim to reduce memory footprint (already divisible by 8)
         let kc = 1_000
         let budgetMB = 192   // cap x+residuals to ~192 MB total
         let bytesPerVec = d * 4 * 2 // x + residuals (Float32)
-        var n = min(100_000, max(20_000, (budgetMB * 1024 * 1024) / bytesPerVec))
-        // Ensure d is divisible by 8 for the vectorized paths
-        if d % 8 != 0 { d += (8 - (d % 8)) }
+        let n = min(100_000, max(20_000, (budgetMB * 1024 * 1024) / bytesPerVec))
 
         let x = generateRandomVectors(n: n, d: d)
         let centroids = generateRandomVectors(n: kc, d: d)

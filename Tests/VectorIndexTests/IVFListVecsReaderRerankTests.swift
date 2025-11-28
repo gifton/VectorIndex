@@ -27,13 +27,13 @@ final class IVFListVecsReaderRerankTests: XCTestCase {
         // Query near (1,0); choose components so a+b>1 to avoid a tie between [0,0] and [1,1]
         // For L2, tie occurs when a+b == 1 (equal distance to [0,0] and [1,1]).
         let q: [Float] = [0.95, 0.06]
-        var candIDs: [Int64] = [0, 1, 2, 3]
+        let candIDs: [Int64] = [0, 1, 2, 3]
         var scores = [Float](repeating: 0, count: 2)
         var ids = [Int64](repeating: -1, count: 2)
         q.withUnsafeBufferPointer { qb in
             id2List.withUnsafeBufferPointer { lb in
                 id2Offset.withUnsafeBufferPointer { ob in
-                    var reader = IndexOps.Rerank.IVFListVecsReader(
+                    let reader = IndexOps.Rerank.IVFListVecsReader(
                         lists: lists,
                         id2List: lb.baseAddress!,
                         id2Offset: ob.baseAddress!,
