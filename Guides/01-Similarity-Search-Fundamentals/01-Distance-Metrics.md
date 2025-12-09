@@ -60,12 +60,16 @@ d(a, b) = √(2² + 3²) = √13 ≈ 3.6
 **VectorIndex implementation:**
 
 ```swift
-// 📍 See: Sources/VectorIndex/Operations/Scoring/L2Sqr.swift
+// 📍 See: Sources/VectorIndex/DistanceUtils.swift:14-20
 //
 // We often compute L2² (squared) to avoid the sqrt:
 // - Preserves ordering (if d₁ < d₂, then d₁² < d₂²)
 // - Faster computation
 // - Take sqrt only for final results if needed
+//
+// The distance function uses VectorCore's SIMD provider:
+// let d2 = SwiftFloatSIMDProvider.distanceSquared(a, b, count: count)
+// return sqrt(d2)
 ```
 
 ### 2. Cosine Similarity
@@ -109,12 +113,15 @@ angular_distance = arccos(cosine_similarity) / π
 **VectorIndex implementation:**
 
 ```swift
-// 📍 See: Sources/VectorIndex/Operations/Scoring/Cosine.swift
+// 📍 See: Sources/VectorIndex/DistanceUtils.swift:21-35
 //
-// We precompute inverse norms for efficiency:
-// cos(a, b) = (a · b) × invNorm(a) × invNorm(b)
-//
-// This avoids computing ||a|| per query when searching.
+// Cosine distance = 1 - cosine_similarity
+// The implementation computes:
+//   dot = SwiftFloatSIMDProvider.dot(a, b, count)
+//   amag2 = SwiftFloatSIMDProvider.sumOfSquares(a, count)
+//   bmag2 = SwiftFloatSIMDProvider.sumOfSquares(b, count)
+//   sim = dot / sqrt(amag2 * bmag2)
+//   return 1 - sim
 ```
 
 ### 3. Inner Product (Dot Product)
@@ -188,21 +195,21 @@ This means for normalized vectors, all three metrics give equivalent rankings! Y
 
 ## In VectorIndex
 
-VectorIndex supports multiple metrics through `SupportedDistanceMetric`:
+VectorIndex uses `SupportedDistanceMetric` from **VectorCore**:
 
 ```swift
-// 📍 See: Sources/VectorIndex/IndexProtocols.swift
+// 📍 See: VectorCore/Sources/VectorCore/Protocols/ProviderProtocols.swift
 
-public enum SupportedDistanceMetric: String, Codable, Sendable {
-    case euclidean    // L2 distance
-    case dotProduct   // Inner product (negated for distance ordering)
-    case cosine       // 1 - cosine similarity
-    case manhattan    // L1 distance (FlatIndex only)
-    case chebyshev    // L∞ distance (FlatIndex only)
+public enum SupportedDistanceMetric: String, CaseIterable, Sendable {
+    case euclidean = "euclidean"
+    case cosine = "cosine"
+    case dotProduct = "dot_product"
+    case manhattan = "manhattan"
+    case chebyshev = "chebyshev"
 }
 ```
 
-Each index type validates which metrics it supports:
+This enum is imported by VectorIndex for API compatibility. Each index type validates which metrics it supports:
 
 ```swift
 // 📍 See: Sources/VectorIndex/HNSWIndex.swift:36
@@ -210,6 +217,8 @@ Each index type validates which metrics it supports:
 private static let supportedMetrics: Set<SupportedDistanceMetric> =
     [.euclidean, .dotProduct, .cosine]
 ```
+
+Note: Manhattan and Chebyshev are supported only by FlatIndex.
 
 ---
 
@@ -255,10 +264,11 @@ let sq = diff * diff     // 1e40 → OVERFLOW (Float max ≈ 3.4e38)
 **Solution:** Compute in double precision or use scaled algorithms:
 
 ```swift
-// 📍 See: Sources/VectorIndex/Operations/Scoring/L2SqrKernel.swift
+// 📍 See: Sources/VectorIndex/DistanceUtils.swift
 //
-// VectorIndex uses Float32 for storage but can accumulate in Float64
-// for long vectors, or use two-pass scaling like VectorCore's normalize.
+// VectorIndex uses VectorCore's SIMD providers which handle
+// accumulation carefully. For extreme cases, consider normalizing
+// vectors before storage (making magnitude-based metrics equivalent).
 ```
 
 ---

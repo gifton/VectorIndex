@@ -243,24 +243,30 @@ if results.count > k { results.removeLast(results.count - k) }
 For the typical case where vectors.count is moderate, this is efficient enough. The dedicated TopK kernel is used for larger-scale operations:
 
 ```swift
-// 📍 See: Sources/VectorIndex/Operations/Selection/TopK.swift
+// 📍 See: Sources/VectorIndex/Operations/Selection/TopK.swift:54-106
 
-// Heap-based top-k for large candidate sets
-public struct TopKCollector {
-    private var heap: [(id: Int, score: Float)]
-    private let k: Int
+// Fixed-size heap for top-k selection (Structure of Arrays layout)
+public struct TopKHeap {
+    public let ordering: HeapOrdering  // .min or .max
+    public let capacity: Int           // k
+    private var scores: UnsafeMutablePointer<Float>
+    private var ids: UnsafeMutablePointer<Int32>
 
-    public mutating func offer(id: Int, score: Float) {
-        if heap.count < k {
-            heap.append((id, score))
-            if heap.count == k { buildMaxHeap() }
-        } else if score < heap[0].score {
-            heap[0] = (id, score)
-            siftDown(0)
+    public mutating func push(score: Float, id: Int32) {
+        if count < capacity {
+            // Add to heap
+            _directWrite(at: count, score: score, id: id)
+            _siftUp(from: count)
+            count += 1
+        } else if ordering.shouldReplace(score, id, rootScore: scores[0], rootId: ids[0]) {
+            // Replace root and re-heapify
+            replaceRoot(score: score, id: id)
         }
     }
 }
 ```
+
+The heap uses Structure-of-Arrays (SoA) layout for cache efficiency: separate arrays for scores and IDs.
 
 ---
 

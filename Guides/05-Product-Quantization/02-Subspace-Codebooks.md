@@ -65,33 +65,38 @@ If training data is limited:
 ## Encoding Process
 
 ```swift
-// 📍 See: Sources/VectorIndex/Operations/Quantization/PQEncode.swift
+// 📍 See: Sources/VectorIndex/Operations/Quantization/PQEncode.swift:66-124
 
 @inlinable
 public func pq_encode_u8_f32(
-    _ x: UnsafePointer<Float>,         // Input vectors
-    _ n: Int64,
-    _ d: Int32,
-    _ m: Int32,
-    _ ks: Int32,                        // k=256
-    _ codebooks: UnsafePointer<Float>,  // Trained codebooks
-    _ codes: UnsafeMutablePointer<UInt8>,
-    _ opts: UnsafePointer<PQEncodeOpts>?
+    _ x: UnsafePointer<Float>,          // [n × d] input vectors
+    _ n64: Int64,
+    _ d32: Int32,
+    _ m32: Int32,
+    _ ks32: Int32,                       // k=256 for u8
+    _ codebooks: UnsafePointer<Float>,   // [m × ks × dsub]
+    _ codes: UnsafeMutablePointer<UInt8>, // [n × m] output
+    _ optsPtr: UnsafePointer<PQEncodeOpts>?
 ) {
-    let dsub = Int(d) / Int(m)
+    let n = Int(n64), d = Int(d32), m = Int(m32), ks = Int(ks32)
+    let dsub = d / m
 
-    for i in 0..<Int(n) {
-        let xRow = x + i * Int(d)
+    // Precompute centroid squared norms for dot-product trick
+    let centroidSq = ensureCentroidSqNorms(...)
 
-        for j in 0..<Int(m) {
-            // Find nearest centroid in subspace j
+    for i in 0..<n {
+        let xRow = x + i * d
+        for j in 0..<m {
+            // Find nearest centroid using dot-product trick
             let code = argminCode_u8(
                 xSub: xRow + j * dsub,
-                codebook_j: codebooks + j * Int(ks) * dsub,
-                ks: Int(ks),
-                dsub: dsub
+                codebook_j: codebooks + j * ks * dsub,
+                centroidSq_j: centroidSq + j * ks,  // Precomputed ||c||²
+                ks: ks,
+                dsub: dsub,
+                useDot: opts.useDotTrick
             )
-            codes[i * Int(m) + j] = UInt8(code)
+            codes[i * m + j] = UInt8(code)
         }
     }
 }

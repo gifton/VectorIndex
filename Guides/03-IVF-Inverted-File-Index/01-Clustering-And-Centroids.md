@@ -125,34 +125,34 @@ Random init:                    K-means++ init:
 VectorIndex uses k-means++ and mini-batch k-means for efficiency:
 
 ```swift
-// 📍 See: Sources/VectorIndex/Kernels/KMeansSeeding.swift
+// 📍 See: Sources/VectorIndex/Kernels/KMeansSeeding.swift:167
 
-// K-means++ initialization
+// K-means++ initialization (C-style API for performance)
 public func kmeansPlusPlusSeed(
-    data: [Float],
-    count: Int,
-    dimension: Int,
+    data: UnsafePointer<Float>,
+    count n: Int,
+    dimension d: Int,
     k: Int,
     config: KMeansSeedConfig,
-    centroidsOut: inout [Float],
-    chosenIndicesOut: inout [Int32]?
-) throws -> KMeansSeedStatus
+    centroidsOut: UnsafeMutablePointer<Float>,
+    chosenIndicesOut: UnsafeMutablePointer<Int32>?
+) throws -> KMeansSeedStats
 ```
 
 ```swift
-// 📍 See: Sources/VectorIndex/Kernels/KMeansMiniBatchKernel.swift
+// 📍 See: Sources/VectorIndex/Kernels/KMeansMiniBatchKernel.swift:424
 
 // Mini-batch k-means for large datasets
 public func kmeans_minibatch_f32(
-    x: [Float],
+    x: UnsafePointer<Float>,    // [n × d] row-major
     n: Int64,
     d: Int,
-    kc: Int,
-    initCentroids: [Float],
+    kc: Int,                     // number of centroids
+    initCentroids: UnsafePointer<Float>,
     cfg: KMeansMBConfig,
-    centroidsOut: inout [Float],
-    assignOut: [Int32]?,
-    statsOut: inout KMeansStats?
+    centroidsOut: UnsafeMutablePointer<Float>,
+    assignOut: UnsafeMutablePointer<Int32>?,
+    statsOut: UnsafeMutablePointer<KMeansMBStats>?
 ) -> KMeansStatus
 ```
 

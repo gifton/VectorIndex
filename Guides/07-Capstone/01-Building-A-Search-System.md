@@ -92,11 +92,12 @@ actor SearchService {
     private let dimension: Int
     private var chunks: [String: DocumentChunk] = [:]
 
-    init(dimension: Int = 768, config: HNSWIndex.Configuration? = nil) {
+    init(dimension: Int = 768, config: HNSWIndex.Configuration? = nil) async {
         self.dimension = dimension
+        // HNSWIndex is an actor - create and configure
         self.index = HNSWIndex(
             dimension: dimension,
-            metric: .cosine,
+            metric: .cosine,  // From VectorCore.SupportedDistanceMetric
             config: config ?? .init(m: 16, efConstruction: 200, efSearch: 64)
         )
     }
