@@ -244,6 +244,26 @@ Tuning required:  None
 
 ---
 
+## 🔗 VectorCore Connection
+
+FlatIndex directly leverages VectorCore for every search:
+
+```swift
+// 🔗 VectorCore: The entire search is VectorCore distances
+
+for (id, (vec, meta)) in vectors {
+    let d = distance(query, vec, metric: metric)  // ← Every single call is VectorCore
+    results.append(SearchResult(id: id, score: d))
+}
+
+// FlatIndex performance = VectorCore performance × n
+// A 2× faster distance kernel = 2× faster FlatIndex search
+```
+
+This is why FlatIndex is an excellent **baseline for measuring VectorCore optimizations**. Any improvement to the underlying distance kernels translates directly to faster flat search.
+
+---
+
 ## Key Takeaways
 
 1. **Start with FlatIndex.** It's the simplest option that might just work.

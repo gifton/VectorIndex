@@ -196,6 +196,36 @@ public struct PQEncodeOpts {
 
 ---
 
+## 🔗 VectorCore Connection
+
+PQ interacts with VectorCore in two places:
+
+```swift
+// 🔗 VectorCore: Codebook training (one-time cost)
+
+// Training uses k-means per subspace
+for subspace in 0..<m {
+    let subdata = extractSubspace(training_vectors, subspace, dsub)
+    // VectorCore distances for k-means assignment
+    centroids[subspace] = kmeans(subdata, k: 256)  // ← SIMD-accelerated
+}
+
+// 🔗 VectorCore: Encoding (one-time per vector)
+
+for j in 0..<m {
+    // Find nearest centroid in subspace j
+    for code in 0..<256 {
+        let d = distance(subvector_j, centroid[j][code])  // ← SIMD
+        if d < bestDist { bestCode = code }
+    }
+    codes[j] = bestCode
+}
+```
+
+Once encoded, **search bypasses VectorCore entirely**—distances become table lookups. This is PQ's power: trade upfront SIMD work for ultra-fast search.
+
+---
+
 ## Key Takeaways
 
 1. **PQ compresses by dictionary lookup.** Store indices, not floats.
