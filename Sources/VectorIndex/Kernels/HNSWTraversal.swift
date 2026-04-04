@@ -93,7 +93,7 @@ private struct MinHeap {
         let dm = dists[mid]
         if dist < dm || (dist == dm && id < ids[mid]) { hi = mid } else { lo = mid + 1 }
     }
-    if count < ef { ids.insert(id, at: lo); dists.insert(dist, at: lo); count &+= 1 } else { ids.removeLast(); dists.removeLast(); ids.insert(id, at: lo); dists.insert(dist, at: lo) }
+    if count < ef { ids.insert(id, at: lo); dists.insert(dist, at: lo); count &+= 1 } else { ids.removeLast(); dists.removeLast(); let clamped = min(lo, ids.count); ids.insert(id, at: clamped); dists.insert(dist, at: clamped) }
 }
 
 @inline(__always) private func selectBatchSize(_ d: Int) -> Int { if d <= 256 { return 64 }; if d <= 1024 { return 32 }; return 16 }
