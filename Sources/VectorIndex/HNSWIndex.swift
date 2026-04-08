@@ -99,7 +99,14 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         // Minimal: no-op; future: rebuild/prune
     }
 
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
+        try await search(query: query, k: k, filter: filter, qInvNorm: nil)
+    }
+
+    /// Internal search accepting an optional pre-computed query inverse norm
+    /// for cosine metric. When the query is known to be unit-normalized, pass 1.0
+    /// to skip the norm computation in the traversal kernel.
+    func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, qInvNorm: Float?) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
         try checkVector(query)
         guard let ep = entryPoint else { return [] }
@@ -144,9 +151,10 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                                 neighborsPerLayer: nbrArr.baseAddress!,
                                 xb: xbbp.baseAddress!, N: N, ef: ef, metric: m33,
                                 allowBits: allowBP.baseAddress!, allowN: N, invNorms: invNormsPtr,
+                                qInvNorm: qInvNorm,
                                 idsOut: &idsOut, distsOut: &distsOut
                             )
-                            var results: [SearchResult] = []
+                            var results: [StringSearchResult] = []
                             results.reserveCapacity(k)
                             if written > 0 {
                                 var picked = 0
@@ -156,7 +164,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                                     if let filter = filter, !filter(node.metadata) { continue }
                                     var score = distsOut[i]
                                     if metric == .euclidean { score = sqrt(score) }
-                                    results.append(SearchResult(id: node.id, score: score))
+                                    results.append(StringSearchResult(id: node.id, distance: score))
                                     picked += 1
                                     if picked == k { break }
                                 }
@@ -187,7 +195,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         let isEuclidean: Bool
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -235,7 +243,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         )
 
         // Perform parallel searches using TaskGroup
-        return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+        return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
             for (queryIndex, query) in queries.enumerated() {
                 group.addTask {
                     Self.performSingleSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
@@ -243,7 +251,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
             }
 
             // Collect results in original query order
-            var results = [[SearchResult]](repeating: [], count: queries.count)
+            var results = [[StringSearchResult]](repeating: [], count: queries.count)
             for try await (index, result) in group {
                 results[index] = result
             }
@@ -257,7 +265,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         queryIndex: Int,
         ctx: BatchSearchContext,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) -> (Int, [SearchResult]) {
+    ) -> (Int, [StringSearchResult]) {
         var idsOut = [Int32](repeating: -1, count: ctx.ef)
         var distsOut = [Float](repeating: .infinity, count: ctx.ef)
 
@@ -311,7 +319,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
 
         // Build results from traversal output
-        var results: [SearchResult] = []
+        var results: [StringSearchResult] = []
         results.reserveCapacity(ctx.k)
         if written > 0 {
             var picked = 0
@@ -322,7 +330,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                 if let filter = filter, !filter(metadata) { continue }
                 var score = distsOut[i]
                 if ctx.isEuclidean { score = sqrt(score) }
-                results.append(SearchResult(id: nodeId, score: score))
+                results.append(StringSearchResult(id: nodeId, distance: score))
                 picked += 1
                 if picked == ctx.k { break }
             }
@@ -1029,8 +1037,8 @@ extension HNSWIndex {
         candidates: AccelerationCandidates,
         results: AcceleratedResults,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [SearchResult] {
-        var finalResults: [SearchResult] = []
+    ) async -> [StringSearchResult] {
+        var finalResults: [StringSearchResult] = []
         
         for (idx, distance) in zip(results.indices, results.distances) {
             guard idx < candidates.ids.count else { continue }
@@ -1038,9 +1046,9 @@ extension HNSWIndex {
             let metadata = candidates.metadata[idx]
             if let filter = filter, !filter(metadata) { continue }
             
-            finalResults.append(SearchResult(
+            finalResults.append(StringSearchResult(
                 id: candidates.ids[idx],
-                score: distance
+                distance: distance
             ))
         }
         

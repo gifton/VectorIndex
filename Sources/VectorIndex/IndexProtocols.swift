@@ -25,15 +25,9 @@ import VectorCore
 
 // Note: VectorID is imported directly from VectorCore (no redefinition needed)
 
-/// Basic search result representation.
-public struct SearchResult: Sendable, Equatable {
-    public let id: VectorID
-    public let score: Float
-    public init(id: VectorID, score: Float) {
-        self.id = id
-        self.score = score
-    }
-}
+// VectorCore 0.2.0 provides SearchResult<ID> and StringSearchResult (= SearchResult<String>).
+// We adopt StringSearchResult as our canonical result type.
+// Field mapping: old .score → new .distance (both stored raw distance values).
 
 /// Basic statistics for an index instance.
 public struct IndexStats: Sendable, Equatable {
@@ -72,10 +66,10 @@ public protocol VectorIndexProtocol: Actor {
     func remove(id: VectorID) async throws
 
     /// k-NN search with optional filter (implementation-defined semantics).
-    func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult]
+    func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult]
 
     /// Batch k-NN search
-    func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]]
+    func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]]
 
     /// Batch insert convenience.
     func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?)]) async throws

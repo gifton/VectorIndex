@@ -173,10 +173,10 @@ private var scoringAccum_ns: UInt64 = 0
     let beg = Int(offsets[u]); let end = Int(offsets[u &+ 1]); let base = neighbors.advanced(by: beg); return UnsafeBufferPointer(start: base, count: max(0, end - beg))
 }
 
-private func greedyDescent_core(q: UnsafePointer<Float>, d: Int, entryPoint: Int32, maxLevel: Int32, offsetsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, neighborsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, xb: UnsafePointer<Float>, N: Int, metric: HNSWMetric, invNorms: UnsafePointer<Float>?) -> Int32 {
+private func greedyDescent_core(q: UnsafePointer<Float>, d: Int, entryPoint: Int32, maxLevel: Int32, offsetsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, neighborsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, xb: UnsafePointer<Float>, N: Int, metric: HNSWMetric, invNorms: UnsafePointer<Float>?, qInvNorm: Float? = nil) -> Int32 {
     guard N > 0, d > 0, entryPoint >= 0, entryPoint < Int32(N) else { return -1 }
     var current = Int(entryPoint)
-    let qInv: Float? = (metric == .COSINE) ? invnorm_f32(q, d) : nil
+    let qInv: Float? = (metric == .COSINE) ? (qInvNorm ?? invnorm_f32(q, d)) : nil
     #if ENABLE_TELEMETRY
     let t0 = DispatchTime.now().uptimeNanoseconds
     #endif
@@ -218,10 +218,10 @@ private var neighborBatchesCount: Int = 0
 private var candidatesPushedCount: Int = 0
 #endif
 
-private func efSearch_core(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offsetsL0: UnsafePointer<Int32>, neighborsL0: UnsafePointer<Int32>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
+private func efSearch_core(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offsetsL0: UnsafePointer<Int32>, neighborsL0: UnsafePointer<Int32>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, qInvNorm: Float? = nil, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
     if N <= 0 || d <= 0 || ef <= 0 { return -1 }
     guard enterL0 >= 0 && enterL0 < Int32(N) else { return -1 }
-    let qInv: Float? = (metric == .COSINE) ? invnorm_f32(q, d) : nil
+    let qInv: Float? = (metric == .COSINE) ? (qInvNorm ?? invnorm_f32(q, d)) : nil
     let allowDomain = (allowBits != nil && allowN > 0) ? allowN : 0
     let visitedWords = (N + 63) >> 6
     let visited = UnsafeMutablePointer<UInt64>.allocate(capacity: visitedWords)
@@ -290,20 +290,20 @@ public enum HNSWTraversal {
         #endif
         return id
     }
-    public static func efSearch(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offsetsL0: UnsafePointer<Int32>, neighborsL0: UnsafePointer<Int32>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
+    public static func efSearch(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offsetsL0: UnsafePointer<Int32>, neighborsL0: UnsafePointer<Int32>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, qInvNorm: Float? = nil, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
         #if ENABLE_TELEMETRY
         greedy_ns_accum = 0; efsearch_ns_accum = 0; scoringAccum_ns = 0; earlyExitCount = 0; edgesVisitedCount = 0; neighborBatchesCount = 0; candidatesPushedCount = 0
         #endif
-        let c = efSearch_core(q: q, d: d, enterL0: enterL0, offsetsL0: offsetsL0, neighborsL0: neighborsL0, xb: xb, N: N, ef: ef, metric: metric, allowBits: allowBits, allowN: allowN, invNorms: invNorms, idsOut: idsOut, distsOut: distsOut)
+        let c = efSearch_core(q: q, d: d, enterL0: enterL0, offsetsL0: offsetsL0, neighborsL0: neighborsL0, xb: xb, N: N, ef: ef, metric: metric, allowBits: allowBits, allowN: allowN, invNorms: invNorms, qInvNorm: qInvNorm, idsOut: idsOut, distsOut: distsOut)
         #if ENABLE_TELEMETRY
         var t = HNSWTraversalTelemetry(); t.efsearch_ns = efsearch_ns_accum; t.scoring_ns = scoringAccum_ns; t.total_ns = efsearch_ns_accum &+ scoringAccum_ns; t.earlyExits = earlyExitCount; t.edgesVisited = edgesVisitedCount; t.neighborBatches = neighborBatchesCount; t.candidatesPushed = candidatesPushedCount; HNSWTelemetryRecorder.record?(t)
         #endif
         return c
     }
-    public static func traverse(q: UnsafePointer<Float>, d: Int, entryPoint: Int32, maxLevel: Int32, offsetsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, neighborsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
-        let enterL0 = greedyDescent_core(q: q, d: d, entryPoint: entryPoint, maxLevel: maxLevel, offsetsPerLayer: offsetsPerLayer, neighborsPerLayer: neighborsPerLayer, xb: xb, N: N, metric: metric, invNorms: nil)
+    public static func traverse(q: UnsafePointer<Float>, d: Int, entryPoint: Int32, maxLevel: Int32, offsetsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, neighborsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, qInvNorm: Float? = nil, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
+        let enterL0 = greedyDescent_core(q: q, d: d, entryPoint: entryPoint, maxLevel: maxLevel, offsetsPerLayer: offsetsPerLayer, neighborsPerLayer: neighborsPerLayer, xb: xb, N: N, metric: metric, invNorms: nil, qInvNorm: qInvNorm)
         if enterL0 < 0 { return -1 }
-        return efSearch_core(q: q, d: d, enterL0: enterL0, offsetsL0: offsetsPerLayer.pointee!, neighborsL0: neighborsPerLayer.pointee!, xb: xb, N: N, ef: ef, metric: metric, allowBits: allowBits, allowN: allowN, invNorms: invNorms, idsOut: idsOut, distsOut: distsOut)
+        return efSearch_core(q: q, d: d, enterL0: enterL0, offsetsL0: offsetsPerLayer.pointee!, neighborsL0: neighborsPerLayer.pointee!, xb: xb, N: N, ef: ef, metric: metric, allowBits: allowBits, allowN: allowN, invNorms: invNorms, qInvNorm: qInvNorm, idsOut: idsOut, distsOut: distsOut)
     }
 }
 

@@ -113,7 +113,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         cosineNormsHandle = nil
     }
     
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
@@ -168,7 +168,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         
         // Sort and return top-k
         results.sort { $0.1 < $1.1 }
-        return results.prefix(k).map { SearchResult(id: $0.0, score: $0.1) }
+        return results.prefix(k).map { StringSearchResult(id: $0.0, distance: $0.1) }
     }
     
     /// Context for parallel batch search
@@ -181,7 +181,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         let k: Int
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -202,14 +202,14 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
             k: k
         )
 
-        return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+        return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
             for (queryIndex, query) in queries.enumerated() {
                 group.addTask {
                     Self.performFlatOptimizedSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
                 }
             }
 
-            var results = [[SearchResult]](repeating: [], count: queries.count)
+            var results = [[StringSearchResult]](repeating: [], count: queries.count)
             for try await (index, result) in group {
                 results[index] = result
             }
@@ -223,7 +223,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         queryIndex: Int,
         ctx: FlatOptimizedBatchSearchContext,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) -> (Int, [SearchResult]) {
+    ) -> (Int, [StringSearchResult]) {
         var results: [(VectorID, Float)] = []
         results.reserveCapacity(min(ctx.k, ctx.idToOffset.count))
 
@@ -265,7 +265,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         }
 
         results.sort { $0.1 < $1.1 }
-        return (queryIndex, results.prefix(ctx.k).map { SearchResult(id: $0.0, score: $0.1) })
+        return (queryIndex, results.prefix(ctx.k).map { StringSearchResult(id: $0.0, distance: $0.1) })
     }
     
     public func clear() async {
@@ -372,7 +372,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
 extension FlatIndexOptimized {
     /// Attempt a fast search using microkernels when storage is compact and contiguous.
     /// Falls back by throwing if layout isn't suitable.
-    fileprivate func fastSearchWithMicrokernels(query: [Float], k: Int) -> [SearchResult]? {
+    fileprivate func fastSearchWithMicrokernels(query: [Float], k: Int) -> [StringSearchResult]? {
         // Storage must be fully compact: no holes and contiguous offsets
         guard freeOffsets.isEmpty, !idToOffset.isEmpty else { return nil }
         guard vectorStorage.count == idToOffset.count * dimension else { return nil }
@@ -427,7 +427,7 @@ extension FlatIndexOptimized {
         h.deallocate()
 
         // Map indices back to external IDs and convert to API distance semantics
-        var results: [SearchResult] = []
+        var results: [StringSearchResult] = []
         results.reserveCapacity(merged.count)
         for (score, idx32) in merged {
             let idx = Int(idx32)
@@ -436,15 +436,15 @@ extension FlatIndexOptimized {
             switch metric {
             case .euclidean:
                 // Kernel produced L2^2; API returns L2
-                results.append(SearchResult(id: id, score: sqrt(score)))
+                results.append(StringSearchResult(id: id, distance: sqrt(score)))
             case .dotProduct:
                 // Kernel produced dot; API defines distance = -dot
-                results.append(SearchResult(id: id, score: -score))
+                results.append(StringSearchResult(id: id, distance: -score))
             case .cosine:
                 // Kernel produced similarity in [-1,1]; API returns distance = 1 - sim
-                results.append(SearchResult(id: id, score: 1.0 - score))
+                results.append(StringSearchResult(id: id, distance: 1.0 - score))
             default:
-                results.append(SearchResult(id: id, score: score))
+                results.append(StringSearchResult(id: id, distance: score))
             }
             if results.count == k { break }
         }
@@ -566,8 +566,8 @@ extension FlatIndexOptimized {
         candidates: AccelerationCandidates,
         results: AcceleratedResults,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [SearchResult] {
-        var finalResults: [SearchResult] = []
+    ) async -> [StringSearchResult] {
+        var finalResults: [StringSearchResult] = []
         
         for (idx, distance) in zip(results.indices, results.distances) {
             guard idx < candidates.ids.count else { continue }
@@ -575,9 +575,9 @@ extension FlatIndexOptimized {
             let metadata = candidates.metadata[idx]
             if let filter = filter, !filter(metadata) { continue }
             
-            finalResults.append(SearchResult(
+            finalResults.append(StringSearchResult(
                 id: candidates.ids[idx],
-                score: distance
+                distance: distance
             ))
         }
         

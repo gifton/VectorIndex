@@ -145,5 +145,28 @@ See [ERRORS.md](ERRORS.md) for complete error handling guide.
 ### Tests
 - Added VIndexMmap error tests: header CRC mismatch, version mismatch, section CRC mismatch, missing file open, and a pragmatic growth/remap failure case (asserts `.fileIOError` or `.mmapError` depending on environment).
 
+## 0.1.4 (Unreleased)
+
+### Breaking Changes
+
+- **VectorCore 0.2.0 adoption.** Minimum `VectorCore` dependency bumped from `0.1.6` to `0.2.0`. Public search APIs now return VectorCore's `StringSearchResult` (alias for `SearchResult<String>`) instead of the previously-local `SearchResult` struct, which has been removed.
+  - Field rename: `.score` → `.distance` on all returned results.
+  - Affected protocols: `VectorIndexProtocol.search` / `.batchSearch`, `AccelerableIndex.finalizeResults` / `.finalizeBatchResults`.
+  - Affected actors: `FlatIndex`, `FlatIndexOptimized`, `HNSWIndex`, `IVFIndex`.
+
+### Features
+
+- **`searchWithMetadata` / `batchSearchWithMetadata`** (new `SearchResultsAdapter.swift`). Convenience extensions on `VectorIndexProtocol` that wrap results in VectorCore's `StringSearchResults`, surfacing `candidatesSearched`, `searchTimeNanos`, and `isExhaustive`. Per-index overrides report accurate `isExhaustive` semantics: `true` for `FlatIndex` / `FlatIndexOptimized`, `false` for `HNSWIndex` / `IVFIndex`.
+- **Cosine fast path.** `distance(_:_:metric:queryIsNormalized:)` accepts a `queryIsNormalized` flag that skips the query-side `sumOfSquares` when the caller guarantees a unit-norm query. `HNSWIndex.search` gains an internal `qInvNorm:` overload that threads the pre-computed inverse norm into the traversal kernel.
+- **Manhattan distance: SIMD4 rewrite.** Eliminates the temporary difference allocation; uses a `SIMD4<Float>` accumulator with a scalar tail.
+
+### Bug Fixes
+
+- **HNSW distance-insertion bounds.** Fixed an out-of-bounds issue in HNSW distance insertions (commit 9ee23d2).
+
+### Tests
+
+- Updated `AccelerableIndexTests`, `CosineFusedCacheIntegrationTests`, `MicrokernelIntegrationTests`, and `PQTrainTests` for the new `StringSearchResult` / `.distance` field naming and related API changes.
+
 ---
 <!-- moved to docs/ -->

@@ -410,7 +410,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         return cents
     }
 
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
@@ -435,27 +435,27 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
                 for id in lists[ci] { candidates.insert(id) }
             }
             // Score candidates
-            var results: [SearchResult] = []
+            var results: [StringSearchResult] = []
             results.reserveCapacity(min(k, candidates.count))
             for id in candidates {
                 guard let (vec, meta) = store[id] else { continue }
                 if let filter = filter, !filter(meta) { continue }
                 let d = distance(query, vec, metric: metric)
-                results.append(SearchResult(id: id, score: d))
+                results.append(StringSearchResult(id: id, distance: d))
             }
-            results.sort { $0.score < $1.score }
+            results.sort { $0.distance < $1.distance }
             if results.count > k { results.removeLast(results.count - k) }
             return results
         } else {
             // Linear scan fallback
-            var results: [SearchResult] = []
+            var results: [StringSearchResult] = []
             results.reserveCapacity(min(k, store.count))
             for (id, (vec, meta)) in store {
                 if let filter = filter, !filter(meta) { continue }
                 let d = distance(query, vec, metric: metric)
-                results.append(SearchResult(id: id, score: d))
+                results.append(StringSearchResult(id: id, distance: d))
             }
-            results.sort { $0.score < $1.score }
+            results.sort { $0.distance < $1.distance }
             if results.count > k { results.removeLast(results.count - k) }
             return results
         }
@@ -472,7 +472,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         let k: Int
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -486,7 +486,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         // If kernel30 is active, fall back to sequential (kernel might not be thread-safe)
         if let h = kernel30, h.format == .flat, mappingComplete30,
            metric == .euclidean || metric == .dotProduct || metric == .cosine {
-            var out: [[SearchResult]] = []
+            var out: [[StringSearchResult]] = []
             out.reserveCapacity(queries.count)
             for q in queries {
                 out.append(try await searchKernel30Flat(query: q, k: k, filter: filter))
@@ -507,14 +507,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
                 k: k
             )
 
-            return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+            return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
                 for (queryIndex, query) in queries.enumerated() {
                     group.addTask {
                         Self.performIVFSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
                     }
                 }
 
-                var results = [[SearchResult]](repeating: [], count: queries.count)
+                var results = [[StringSearchResult]](repeating: [], count: queries.count)
                 for try await (index, result) in group {
                     results[index] = result
                 }
@@ -527,14 +527,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             let met = metric
             let kk = k
 
-            return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+            return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
                 for (queryIndex, query) in queries.enumerated() {
                     group.addTask {
                         Self.performLinearSearch(query: query, queryIndex: queryIndex, store: storeCopy, dimension: dim, metric: met, k: kk, filter: filter)
                     }
                 }
 
-                var results = [[SearchResult]](repeating: [], count: queries.count)
+                var results = [[StringSearchResult]](repeating: [], count: queries.count)
                 for try await (index, result) in group {
                     results[index] = result
                 }
@@ -549,7 +549,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         queryIndex: Int,
         ctx: IVFBatchSearchContext,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) -> (Int, [SearchResult]) {
+    ) -> (Int, [StringSearchResult]) {
         // Find nprobe nearest centroids
         var centroidDists: [(Int, Float)] = []
         centroidDists.reserveCapacity(ctx.centroids.count)
@@ -565,15 +565,15 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
 
         // Score candidates
-        var results: [SearchResult] = []
+        var results: [StringSearchResult] = []
         results.reserveCapacity(min(ctx.k, candidates.count))
         for id in candidates {
             guard let (vec, meta) = ctx.store[id] else { continue }
             if let filter = filter, !filter(meta) { continue }
             let d = distance(query, vec, metric: ctx.metric)
-            results.append(SearchResult(id: id, score: d))
+            results.append(StringSearchResult(id: id, distance: d))
         }
-        results.sort { $0.score < $1.score }
+        results.sort { $0.distance < $1.distance }
         if results.count > ctx.k { results.removeLast(results.count - ctx.k) }
 
         return (queryIndex, results)
@@ -588,15 +588,15 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         metric: SupportedDistanceMetric,
         k: Int,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) -> (Int, [SearchResult]) {
-        var results: [SearchResult] = []
+    ) -> (Int, [StringSearchResult]) {
+        var results: [StringSearchResult] = []
         results.reserveCapacity(min(k, store.count))
         for (id, (vec, meta)) in store {
             if let filter = filter, !filter(meta) { continue }
             let d = distance(query, vec, metric: metric)
-            results.append(SearchResult(id: id, score: d))
+            results.append(StringSearchResult(id: id, distance: d))
         }
-        results.sort { $0.score < $1.score }
+        results.sort { $0.distance < $1.distance }
         if results.count > k { results.removeLast(results.count - k) }
 
         return (queryIndex, results)
@@ -811,8 +811,8 @@ extension IVFIndex {
         candidates: AccelerationCandidates,
         results: AcceleratedResults,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [SearchResult] {
-        var finalResults: [SearchResult] = []
+    ) async -> [StringSearchResult] {
+        var finalResults: [StringSearchResult] = []
         
         for (idx, distance) in zip(results.indices, results.distances) {
             guard idx < candidates.ids.count else { continue }
@@ -820,9 +820,9 @@ extension IVFIndex {
             let metadata = candidates.metadata[idx]
             if let filter = filter, !filter(metadata) { continue }
             
-            finalResults.append(SearchResult(
+            finalResults.append(StringSearchResult(
                 id: candidates.ids[idx],
-                score: distance
+                distance: distance
             ))
         }
         
@@ -859,7 +859,7 @@ extension IVFIndex {
         return (list, off)
     }
 
-    private func searchKernel30Flat(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
+    private func searchKernel30Flat(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
         guard let h = kernel30, h.format == .flat else { return [] }
         // 1) Select lists to probe
         let kc = h.k_c
@@ -966,7 +966,7 @@ extension IVFIndex {
         }
 
         // 4) Map internal IDs to external VectorIDs and apply optional filter
-        var results: [SearchResult] = []
+        var results: [StringSearchResult] = []
         results.reserveCapacity(k)
         outer: for i in 0..<topIDs.count {
             let iid = topIDs[i]
@@ -978,7 +978,7 @@ extension IVFIndex {
                 let meta = store[vid]?.1
                 if !filter(meta) { continue }
             }
-            results.append(SearchResult(id: vid, score: topScores[i]))
+            results.append(StringSearchResult(id: vid, distance: topScores[i]))
             if results.count == k { break outer }
         }
         return results
