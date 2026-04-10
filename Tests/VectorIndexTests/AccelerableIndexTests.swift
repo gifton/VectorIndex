@@ -51,8 +51,8 @@ final class AccelerableIndexTests: XCTestCase {
         )
         
         XCTAssertEqual(finalResults.count, 2)
-        XCTAssertEqual(finalResults[0].score, 1.732, accuracy: 0.001)
-        XCTAssertEqual(finalResults[1].score, 5.196, accuracy: 0.001)
+        XCTAssertEqual(finalResults[0].distance, 1.732, accuracy: 0.001)
+        XCTAssertEqual(finalResults[1].distance, 5.196, accuracy: 0.001)
         
         // Test with filter
         let filteredResults = await index.finalizeResults(
@@ -178,11 +178,11 @@ final class AccelerableIndexTests: XCTestCase {
         XCTAssertEqual(finalBatchResults[1].count, 2)
         
         // First batch should have results in order of indices [0, 1]
-        XCTAssertEqual(finalBatchResults[0][0].score, 1.0)
-        XCTAssertEqual(finalBatchResults[0][1].score, 2.0)
+        XCTAssertEqual(finalBatchResults[0][0].distance, 1.0)
+        XCTAssertEqual(finalBatchResults[0][1].distance, 2.0)
         
         // Second batch should have results in order of indices [1, 0]
-        XCTAssertEqual(finalBatchResults[1][0].score, 1.5)
-        XCTAssertEqual(finalBatchResults[1][1].score, 2.5)
+        XCTAssertEqual(finalBatchResults[1][0].distance, 1.5)
+        XCTAssertEqual(finalBatchResults[1][1].distance, 2.5)
     }
 }

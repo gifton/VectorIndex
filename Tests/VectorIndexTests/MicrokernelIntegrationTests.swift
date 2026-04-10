@@ -21,7 +21,7 @@ final class MicrokernelIntegrationTests: XCTestCase {
         XCTAssertEqual(r1.map { $0.id }, r2.map { $0.id })
         // Distances should be very close (sqrt of L2^2 vs scalar)
         for (a, b) in zip(r1, r2) {
-            XCTAssertLessThan(abs(a.score - b.score), 1e-4)
+            XCTAssertLessThan(abs(a.distance - b.distance), 1e-4)
         }
     }
 
@@ -42,6 +42,6 @@ final class MicrokernelIntegrationTests: XCTestCase {
         let r2 = try await opt.search(query: q, k: k, filter: nil)
 
         XCTAssertEqual(r1.map { $0.id }, r2.map { $0.id })
-        for (a, b) in zip(r1, r2) { XCTAssertLessThan(abs(a.score - b.score), 1e-4) }
+        for (a, b) in zip(r1, r2) { XCTAssertLessThan(abs(a.distance - b.distance), 1e-4) }
     }
 }

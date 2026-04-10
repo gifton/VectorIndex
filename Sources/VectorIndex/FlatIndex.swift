@@ -45,9 +45,9 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         // No-op for flat index
     }
 
-    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [SearchResult] {
+    public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
-        var results: [SearchResult] = []
+        var results: [StringSearchResult] = []
         results.reserveCapacity(min(k, vectors.count))
 
         for (id, (vec, meta)) in vectors {
@@ -56,11 +56,11 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
                 throw VectorError.dimensionMismatch(expected: query.count, actual: vec.count)
             }
             let d = distance(query, vec, metric: metric)
-            results.append(SearchResult(id: id, score: d))
+            results.append(StringSearchResult(id: id, distance: d))
         }
 
         // Keep top-k smallest distances
-        results.sort { $0.score < $1.score }
+        results.sort { $0.distance < $1.distance }
         if results.count > k { results.removeLast(results.count - k) }
         return results
     }
@@ -73,7 +73,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         let k: Int
     }
 
-    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[SearchResult]] {
+    public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -85,14 +85,14 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
             k: k
         )
 
-        return try await withThrowingTaskGroup(of: (Int, [SearchResult]).self) { group in
+        return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
             for (queryIndex, query) in queries.enumerated() {
                 group.addTask {
                     try Self.performFlatSearch(query: query, queryIndex: queryIndex, ctx: ctx, filter: filter)
                 }
             }
 
-            var results = [[SearchResult]](repeating: [], count: queries.count)
+            var results = [[StringSearchResult]](repeating: [], count: queries.count)
             for try await (index, result) in group {
                 results[index] = result
             }
@@ -106,8 +106,8 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         queryIndex: Int,
         ctx: FlatBatchSearchContext,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) throws -> (Int, [SearchResult]) {
-        var results: [SearchResult] = []
+    ) throws -> (Int, [StringSearchResult]) {
+        var results: [StringSearchResult] = []
         results.reserveCapacity(min(ctx.k, ctx.vectors.count))
 
         for (id, (vec, meta)) in ctx.vectors {
@@ -116,10 +116,10 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
                 throw VectorError.dimensionMismatch(expected: query.count, actual: vec.count)
             }
             let d = distance(query, vec, metric: ctx.metric)
-            results.append(SearchResult(id: id, score: d))
+            results.append(StringSearchResult(id: id, distance: d))
         }
 
-        results.sort { $0.score < $1.score }
+        results.sort { $0.distance < $1.distance }
         if results.count > ctx.k { results.removeLast(results.count - ctx.k) }
         return (queryIndex, results)
     }
@@ -249,8 +249,8 @@ extension FlatIndex {
         candidates: AccelerationCandidates,
         results: AcceleratedResults,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [SearchResult] {
-        var finalResults: [SearchResult] = []
+    ) async -> [StringSearchResult] {
+        var finalResults: [StringSearchResult] = []
         
         for (idx, distance) in zip(results.indices, results.distances) {
             guard idx < candidates.ids.count else { continue }
@@ -258,9 +258,9 @@ extension FlatIndex {
             let metadata = candidates.metadata[idx]
             if let filter = filter, !filter(metadata) { continue }
             
-            finalResults.append(SearchResult(
+            finalResults.append(StringSearchResult(
                 id: candidates.ids[idx],
-                score: distance
+                distance: distance
             ))
         }
         

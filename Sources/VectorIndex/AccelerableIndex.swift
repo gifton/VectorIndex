@@ -166,7 +166,7 @@ public protocol AccelerableIndex: VectorIndexProtocol {
         candidates: AccelerationCandidates,
         results: AcceleratedResults,
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [SearchResult]
+    ) async -> [StringSearchResult]
     
     /// Finalize batch results from accelerated computation
     /// - Parameters:
@@ -178,7 +178,7 @@ public protocol AccelerableIndex: VectorIndexProtocol {
         batchCandidates: [AccelerationCandidates],
         batchResults: [AcceleratedResults],
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [[SearchResult]]
+    ) async -> [[StringSearchResult]]
     
     /// Check if acceleration would be beneficial for given parameters
     /// - Parameters:
@@ -205,8 +205,8 @@ public extension AccelerableIndex {
         batchCandidates: [AccelerationCandidates],
         batchResults: [AcceleratedResults],
         filter: (@Sendable ([String: String]?) -> Bool)?
-    ) async -> [[SearchResult]] {
-        var finalResults: [[SearchResult]] = []
+    ) async -> [[StringSearchResult]] {
+        var finalResults: [[StringSearchResult]] = []
         for (candidates, results) in zip(batchCandidates, batchResults) {
             let queryResults = await finalizeResults(
                 candidates: candidates,

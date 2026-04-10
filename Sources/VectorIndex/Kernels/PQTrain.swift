@@ -278,6 +278,7 @@ public func pq_train_f32(
                 x: x, n: n, d: d, j: j, dsub: dsub, ks: ks,
                 coarse: coarseCentroids, assign: assignments,
                 cfg: cfgLocal, rng: &rng, C: &Cj,
+                didWarmStart: didWarmStart,
                 outDistortion: &distortion, outIters: &iters, outEmpties: &emptiesFixed
             )
         case .lloyd:
@@ -1137,6 +1138,7 @@ private func minibatchKMeansSubspace(
     coarse: [Float]?, assign: [Int32]?,
     cfg: PQTrainConfig, rng: inout Xoroshiro128,
     C: inout [Float],
+    didWarmStart: Bool = false,
     outDistortion: inout Double, outIters: inout Int, outEmpties: inout Int
 ) {
     // Create local var copies for &array[index] syntax
@@ -1151,8 +1153,13 @@ private func minibatchKMeansSubspace(
     var iters = 0
     var emptiesFixed = 0
 
-    // Global counts across all batches/passes for incremental means
+    // Global counts across all batches/passes for incremental means.
+    // When warm-starting, give existing centroids a prior weight so the
+    // first batch doesn't overwrite them entirely.
     var globalCounts = [Int64](repeating: 0, count: ks)
+    if didWarmStart {
+        for k in 0..<ks { globalCounts[k] = Int64(B) }
+    }
     // Reusable per-batch accumulators
     var sums = [Double](repeating: 0, count: ks * dsub)
     var counts = [Int64](repeating: 0, count: ks)

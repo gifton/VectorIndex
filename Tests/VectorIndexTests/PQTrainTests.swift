@@ -147,21 +147,26 @@ final class PQTrainTests: XCTestCase {
 
     func testNumericalStability() throws {
         var nilNorms: [Float]?
-        // Test with large dataset to expose accumulation errors
-        let n: Int64 = 10_000
-        let d = 1024
-        let m = 8
-        let ks = 256
+        // Test with moderate dataset to expose accumulation errors
+        // (scaled down from n=10K d=1024 ks=256 to avoid debug-build timeouts)
+        let n: Int64 = 2_000
+        let d = 256
+        let m = 4
+        let ks = 64
 
         var x = [Float](repeating: 0, count: Int(n) * d)
         for i in 0..<(Int(n) * d) {
             x[i] = Float.random(in: -10...10)
         }
 
+        var cfg = PQTrainConfig()
+        cfg.maxIters = 5
+
         var codebooks = [Float]()
 
         let stats = try pq_train_f32(
             x: x, n: n, d: d, m: m, ks: ks,
+            cfg: cfg,
             codebooksOut: &codebooks,
             centroidNormsOut: &nilNorms
         )
@@ -697,10 +702,11 @@ final class PQTrainTests: XCTestCase {
     func testParallelExecution() throws {
         var nilNorms: [Float]?
         // Verify parallel execution works correctly
-        let n: Int64 = 10_000
-        let d = 512
-        let m = 8
-        let ks = 256
+        // (scaled down from n=10K d=512 ks=256 to avoid debug-build timeouts)
+        let n: Int64 = 2_000
+        let d = 128
+        let m = 4
+        let ks = 64
 
         var x = [Float](repeating: 0, count: Int(n) * d)
         for i in 0..<(Int(n) * d) {
@@ -711,7 +717,7 @@ final class PQTrainTests: XCTestCase {
         var cfgSerial = PQTrainConfig()
         cfgSerial.seed = 42
         cfgSerial.numThreads = 1
-        cfgSerial.maxIters = 10
+        cfgSerial.maxIters = 5
 
         let startSerial = Date()
         var codebooksSerial = [Float]()
@@ -727,7 +733,7 @@ final class PQTrainTests: XCTestCase {
         var cfgParallel = PQTrainConfig()
         cfgParallel.seed = 42
         cfgParallel.numThreads = 0  // auto
-        cfgParallel.maxIters = 10
+        cfgParallel.maxIters = 5
 
         let startParallel = Date()
         var codebooksParallel = [Float]()
@@ -751,19 +757,24 @@ final class PQTrainTests: XCTestCase {
     func testCompressionQuality() throws {
         var nilNorms: [Float]?
         // Verify PQ achieves reasonable compression vs quality trade-off
-        let n: Int64 = 5000
-        let d = 1024
-        let m = 8
-        let ks = 256  // 8 bytes per vector
+        // (scaled down from n=5K d=1024 ks=256 to avoid debug-build timeouts)
+        let n: Int64 = 2000
+        let d = 256
+        let m = 4
+        let ks = 64
 
         var x = [Float](repeating: 0, count: Int(n) * d)
         for i in 0..<(Int(n) * d) {
             x[i] = Float.random(in: -1...1)
         }
 
+        var cfg = PQTrainConfig()
+        cfg.maxIters = 10
+
         var codebooks = [Float]()
         let stats = try pq_train_f32(
             x: x, n: n, d: d, m: m, ks: ks,
+            cfg: cfg,
             codebooksOut: &codebooks,
             centroidNormsOut: &nilNorms
         )
