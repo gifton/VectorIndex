@@ -49,7 +49,7 @@ public enum Endian: UInt8 { case little = 1, big = 2 }
     ((fileEndian == .little) == hostIsLittleEndian()) ? v : v.byteSwapped
 }
 
-private struct CRC32 {
+internal struct CRC32 {
     private static let table: [UInt32] = {
         (0..<256).map { i -> UInt32 in
             var c = UInt32(i)

@@ -71,10 +71,28 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
     public func insert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
         try checkVector(vector)
-        try await internalInsert(id: id, vector: vector, metadata: metadata)
+        try await internalInsert(id: id, vector: vector, metadata: metadata, knownInvNorm: nil)
+    }
+
+    /// Internal entry point used by the `IndexableVector` typed overload to
+    /// carry a pre-computed inverse norm (1/‖v‖) for cosine. When provided,
+    /// the invNormsCache is populated incrementally on the insert side so the
+    /// next search does not trigger a full O(N·d) rebuild.
+    func insert(id: VectorID, vector: [Float], metadata: [String: String]?, knownInvNorm: Float?) async throws {
+        try checkVector(vector)
+        try await internalInsert(id: id, vector: vector, metadata: metadata, knownInvNorm: knownInvNorm)
     }
 
     public func remove(id: VectorID) async throws {
+        if let wal = walWriter, idToIndex[id] != nil {
+            try wal.append(.remove(id: id))
+        }
+        internalRemove(id: id)
+    }
+
+    /// Soft-delete path with no WAL logging. Called by `remove()` after it
+    /// has appended a remove record, and by the WAL replay loop.
+    private func internalRemove(id: VectorID) {
         if let idx = idToIndex[id] {
             nodes[idx].isDeleted = true
             idToIndex.removeValue(forKey: id)
@@ -92,7 +110,38 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     public func batchInsert(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?)]) async throws {
-        for item in items { try await insert(id: item.id, vector: item.vector, metadata: item.metadata) }
+        try await batchInsertWithHints(items.map { ($0.id, $0.vector, $0.metadata, nil) })
+    }
+
+    /// Internal batch entry point used by both the plain `batchInsert` path
+    /// and the typed `IndexableVector` overload. Draws every level up-front,
+    /// serializes them into a single WAL frame (so batch semantics are atomic
+    /// across a crash), then applies all items via `internalInsertAtLevel`
+    /// without firing per-item WAL writes.
+    internal func batchInsertWithHints(_ items: [(id: VectorID, vector: [Float], metadata: [String: String]?, knownInvNorm: Float?)]) async throws {
+        guard !items.isEmpty else { return }
+        for item in items { try checkVector(item.vector) }
+
+        var walItems: [HNSWWALInsertItem] = []
+        walItems.reserveCapacity(items.count)
+        for item in items {
+            let level = randomLevel()
+            walItems.append(HNSWWALInsertItem(
+                id: item.id, level: Int32(level),
+                vector: item.vector, metadata: item.metadata,
+                knownInvNorm: item.knownInvNorm
+            ))
+        }
+        if let wal = walWriter {
+            try wal.append(.batchInsert(walItems))
+        }
+        for wi in walItems {
+            try await internalInsertAtLevel(
+                id: wi.id, level: Int(wi.level),
+                vector: wi.vector, metadata: wi.metadata,
+                knownInvNorm: wi.knownInvNorm
+            )
+        }
     }
 
     public func optimize() async throws {
@@ -433,6 +482,11 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     private var csrDirty: Bool = true
     private var invNormsDirty: Bool = true
 
+    // MARK: - Durability (optional sidecar WAL)
+    // When non-nil, every protocol-level mutation is appended to the WAL
+    // before the in-memory state is touched (write-ahead discipline).
+    private var walWriter: HNSWWALWriter?
+
     // MARK: - Vector Access Helpers
     /// Returns a copy of the vector at the given node index as [Float] array.
     /// Use this for distance computations during construction that need [Float].
@@ -443,11 +497,32 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     // MARK: - Insertion
-    private func internalInsert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
+
+    /// Live insert path — draws a random level from `rng35`, records the
+    /// operation in the WAL (if enabled) before any in-memory mutation, then
+    /// delegates to `internalInsertAtLevel`. The split isolates RNG consumption
+    /// from graph mutation so that WAL replay can reuse the exact level that
+    /// was sampled during the original insert (without re-advancing the RNG).
+    private func internalInsert(id: VectorID, vector: [Float], metadata: [String: String]?, knownInvNorm: Float? = nil) async throws {
+        let level = randomLevel()
+        if let wal = walWriter {
+            try wal.append(.insert(HNSWWALInsertItem(
+                id: id, level: Int32(level),
+                vector: vector, metadata: metadata,
+                knownInvNorm: knownInvNorm
+            )))
+        }
+        try await internalInsertAtLevel(id: id, level: level, vector: vector, metadata: metadata, knownInvNorm: knownInvNorm)
+    }
+
+    /// Replay-friendly insert path — takes a pre-sampled `level` and performs
+    /// graph mutation without consulting `rng35`. Called by both the live
+    /// wrapper above and (later) by the WAL replay loop with a level read
+    /// directly from a log record.
+    private func internalInsertAtLevel(id: VectorID, level: Int, vector: [Float], metadata: [String: String]?, knownInvNorm: Float? = nil) async throws {
         if idToIndex[id] != nil { // replace existing vector: simple remove then reinsert
             try await remove(id: id)
         }
-        let level = randomLevel()
         let newIndex = nodes.count
 
         // Store vector in contiguous storage and record offset
@@ -458,7 +533,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         nodes.append(node)
         idToIndex[id] = newIndex
         activeCount += 1
-        markInvNormsDirty(); markCSRDirty()
+        appendInvNormIncremental(knownInvNorm: knownInvNorm); markCSRDirty()
 
         if let oldEP = entryPoint {
             var cur = oldEP
@@ -683,10 +758,59 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     }
 }
 
+// MARK: - Test observability hooks
+extension HNSWIndex {
+    /// Number of entries currently in the inverse-norm cache, or 0 if nil.
+    /// Used by tests to verify incremental cache population across inserts.
+    internal var _testInvNormsCacheCount: Int { invNormsCache?.count ?? 0 }
+
+    /// Whether the inverse-norm cache is currently marked dirty.
+    internal var _testInvNormsCacheIsDirty: Bool { invNormsDirty }
+}
+
 // MARK: - Kernel #33: Traversal caches and builders
 private extension HNSWIndex {
     @inline(__always) func markInvNormsDirty() { invNormsDirty = true }
     @inline(__always) func markCSRDirty() { csrDirty = true }
+
+    /// Append the inverse norm for the most recently inserted node to the
+    /// existing invNormsCache, keeping it coherent across inserts so the next
+    /// search does not trigger a full O(N·d) rebuild.
+    ///
+    /// If `knownInvNorm` is provided (e.g. from an `IndexableVector` with
+    /// `isNormalized` or `cachedMagnitude`), the append is O(1). Otherwise
+    /// the inverse norm is computed for just the single new vector in O(d).
+    ///
+    /// Falls back to marking the cache dirty when the cache is absent or
+    /// already out of sync — the existing lazy rebuild path remains correct.
+    func appendInvNormIncremental(knownInvNorm: Float?) {
+        guard metric == .cosine else { return }
+        // Must be called immediately after nodes.append, so the new node lives
+        // at nodes.count - 1 and the cache should be exactly one entry short.
+        guard let existing = invNormsCache,
+              !invNormsDirty,
+              existing.count + 1 == nodes.count else {
+            markInvNormsDirty()
+            return
+        }
+        let newIdx = nodes.count - 1
+        let inv: Float
+        if let k = knownInvNorm, k.isFinite, k > 0 {
+            inv = k
+        } else {
+            let offset = nodes[newIdx].vectorOffset
+            let eps: Float = 1e-12
+            var s: Float = 0
+            var j = 0
+            while j < dimension {
+                let v = vectorStorage[offset + j]
+                s += v * v
+                j &+= 1
+            }
+            inv = 1.0 / sqrtf(max(s, eps))
+        }
+        invNormsCache!.append(inv)
+    }
 
     func rebuildCSRIfNeeded() {
         guard csrDirty else { return }
@@ -755,6 +879,121 @@ private extension Array where Element == [Int] {
     subscript(safe idx: Int) -> [Int]? {
         guard idx >= 0 && idx < count else { return nil }
         return self[idx]
+    }
+}
+
+// MARK: - Durability (sidecar WAL)
+extension HNSWIndex {
+    /// Open (or create) a write-ahead log sidecar inside `directory`. On open,
+    /// any existing WAL file is replayed against the current in-memory state
+    /// to reconstruct mutations that landed after the last snapshot. After
+    /// this call returns, every subsequent `insert` / `remove` / `batchInsert`
+    /// is durably recorded before the in-memory state is updated.
+    ///
+    /// Note: the WAL captures protocol-level mutations only. A full snapshot
+    /// (produced by `save(to:)` or `checkpointWAL(to:)`) is still required for
+    /// baseline durability — the WAL is an operation log on top of that.
+    public func enableWAL(directory: URL) async throws {
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let walPath = directory.appendingPathComponent("hnsw.wal").path
+
+        // Replay any existing log BEFORE opening the writer. Records are
+        // applied in order via `internalInsertAtLevel` / `internalRemove`,
+        // which bypass the WAL append path so replay does not re-log.
+        let (records, _) = try HNSWWALReader.replay(path: walPath)
+        for record in records {
+            try await applyReplayRecord(record)
+        }
+
+        self.walWriter = try HNSWWALWriter(path: walPath)
+    }
+
+    /// Write a fresh snapshot at `snapshotURL` and truncate the WAL.
+    /// Strict ordering: snapshot write completes (atomic rename) before the
+    /// WAL truncation. A crash between the two leaves a valid snapshot plus a
+    /// redundant WAL; replay is safe because duplicate-id inserts collapse
+    /// into a remove-then-reinsert with the same level.
+    public func checkpointWAL(to snapshotURL: URL) async throws {
+        try await self.save(to: snapshotURL)
+        if let wal = walWriter {
+            try wal.truncate()
+        }
+    }
+
+    /// Close the WAL. Writes a checkpoint first when `autoCheckpoint` is true
+    /// and a snapshot URL is supplied (otherwise the WAL is closed with all
+    /// its records intact — the next `enableWAL` call will replay them).
+    public func disableWAL(checkpointTo snapshotURL: URL? = nil) async throws {
+        if let snapshot = snapshotURL {
+            try await checkpointWAL(to: snapshot)
+        }
+        walWriter?.close()
+        walWriter = nil
+    }
+
+    /// Factory: load an index from `snapshotURL` if present (or create an
+    /// empty one), then enable the WAL sidecar under `walDirectory` — which
+    /// includes replaying any pending WAL records.
+    public static func openDurable(
+        snapshotURL: URL?,
+        walDirectory: URL,
+        dimension: Int,
+        metric: SupportedDistanceMetric = .euclidean,
+        config: Configuration = .init()
+    ) async throws -> HNSWIndex {
+        let idx: HNSWIndex
+        if let snap = snapshotURL, FileManager.default.fileExists(atPath: snap.path) {
+            idx = try await HNSWIndex.load(from: snap)
+        } else {
+            idx = HNSWIndex(dimension: dimension, metric: metric, config: config)
+        }
+        try await idx.enableWAL(directory: walDirectory)
+        return idx
+    }
+
+    /// Dispatch a decoded WAL record to the in-memory state via the internal
+    /// (non-WAL-writing) mutation methods. Called only by the replay loop.
+    private func applyReplayRecord(_ record: HNSWWALRecord) async throws {
+        switch record {
+        case .insert(let item):
+            try checkVector(item.vector)
+            try await internalInsertAtLevel(
+                id: item.id, level: Int(item.level),
+                vector: item.vector, metadata: item.metadata,
+                knownInvNorm: item.knownInvNorm
+            )
+        case .remove(let id):
+            internalRemove(id: id)
+        case .update:
+            // MVP: update() emits a remove + insert pair, so standalone
+            // .update records are not produced. Ignore if encountered for
+            // forward compatibility with future single-frame updates.
+            break
+        case .clear:
+            // MVP: clear() does not currently log to the WAL, so .clear
+            // records are not produced. Accept them as a forward-compat
+            // signal to reset in-memory state without cascading.
+            nodes.removeAll(keepingCapacity: false)
+            idToIndex.removeAll(keepingCapacity: false)
+            vectorStorage.removeAll(keepingCapacity: false)
+            entryPoint = nil
+            maxLevel = 0
+            activeCount = 0
+            csrOffsetsCache.removeAll(keepingCapacity: false)
+            csrNeighborsCache.removeAll(keepingCapacity: false)
+            invNormsCache = nil
+            csrDirty = true
+            invNormsDirty = true
+        case .batchInsert(let items):
+            for item in items {
+                try checkVector(item.vector)
+                try await internalInsertAtLevel(
+                    id: item.id, level: Int(item.level),
+                    vector: item.vector, metadata: item.metadata,
+                    knownInvNorm: item.knownInvNorm
+                )
+            }
+        }
     }
 }
 
