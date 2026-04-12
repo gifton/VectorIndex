@@ -80,7 +80,39 @@ public extension FlatIndex {
 
 public extension HNSWIndex {
     func insert<V: IndexableVector>(id: VectorID, vector: V, metadata: [String: String]? = nil) async throws {
-        try await insert(id: id, vector: vector.toArray(), metadata: metadata)
+        // For cosine, propagate stored-side hints so the invNormsCache is
+        // populated incrementally instead of marked dirty on every insert.
+        let knownInv: Float? = {
+            guard metric == .cosine else { return nil }
+            if vector.isNormalized { return 1.0 }
+            if let m = vector.cachedMagnitude, m.isFinite, m > 1e-12 {
+                return 1.0 / m
+            }
+            return nil
+        }()
+        try await insert(id: id, vector: vector.toArray(), metadata: metadata, knownInvNorm: knownInv)
+    }
+
+    func batchInsert<V: IndexableVector>(_ items: [(id: VectorID, vector: V, metadata: [String: String]?)]) async throws {
+        // Convert each item once: extract the cosine hint up-front so the
+        // single-frame WAL path can capture it (and so the in-memory cache
+        // is populated incrementally during the batch).
+        let hinted: [(VectorID, [Float], [String: String]?, Float?)] = items.map { item in
+            let knownInv: Float?
+            if metric == .cosine {
+                if item.vector.isNormalized {
+                    knownInv = 1.0
+                } else if let m = item.vector.cachedMagnitude, m.isFinite, m > 1e-12 {
+                    knownInv = 1.0 / m
+                } else {
+                    knownInv = nil
+                }
+            } else {
+                knownInv = nil
+            }
+            return (item.id, item.vector.toArray(), item.metadata, knownInv)
+        }
+        try await batchInsertWithHints(hinted)
     }
 
     func search<V: IndexableVector>(query: V, k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [StringSearchResult] {
