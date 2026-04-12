@@ -411,11 +411,17 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
+        try await search(query: query, k: k, filter: filter, queryIsNormalized: false)
+    }
+
+    /// Internal search with optional cosine query-norm hint.
+    func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, queryIsNormalized: Bool) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
         }
         // Kernel #30 IVF-Flat accelerated path with exact rerank (#40).
+        // Kernel30 manages its own norms; hint not threaded here.
         if let h = kernel30, h.format == .flat, mappingComplete30,
            metric == .euclidean || metric == .dotProduct || metric == .cosine {
             return try await searchKernel30Flat(query: query, k: k, filter: filter)
@@ -427,7 +433,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             var centroidDists: [(Int, Float)] = []
             centroidDists.reserveCapacity(centroids.count)
             for (i, c) in centroids.enumerated() {
-                centroidDists.append((i, distance(query, c, metric: metric)))
+                centroidDists.append((i, distance(query, c, metric: metric, queryIsNormalized: queryIsNormalized)))
             }
             centroidDists.sort { $0.1 < $1.1 }
             var candidates = Set<VectorID>()
@@ -440,7 +446,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             for id in candidates {
                 guard let (vec, meta) = store[id] else { continue }
                 if let filter = filter, !filter(meta) { continue }
-                let d = distance(query, vec, metric: metric)
+                let d = distance(query, vec, metric: metric, queryIsNormalized: queryIsNormalized)
                 results.append(StringSearchResult(id: id, distance: d))
             }
             results.sort { $0.distance < $1.distance }
@@ -452,7 +458,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             results.reserveCapacity(min(k, store.count))
             for (id, (vec, meta)) in store {
                 if let filter = filter, !filter(meta) { continue }
-                let d = distance(query, vec, metric: metric)
+                let d = distance(query, vec, metric: metric, queryIsNormalized: queryIsNormalized)
                 results.append(StringSearchResult(id: id, distance: d))
             }
             results.sort { $0.distance < $1.distance }
@@ -470,9 +476,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         let metric: SupportedDistanceMetric
         let nprobe: Int
         let k: Int
+        let queryIsNormalized: Bool
     }
 
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
+        try await batchSearch(queries: queries, k: k, filter: filter, queryIsNormalized: false)
+    }
+
+    func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, queryIsNormalized: Bool) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -504,7 +515,8 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
                 dimension: dimension,
                 metric: metric,
                 nprobe: min(config.nprobe, centroids.count),
-                k: k
+                k: k,
+                queryIsNormalized: queryIsNormalized
             )
 
             return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
@@ -526,11 +538,12 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             let dim = dimension
             let met = metric
             let kk = k
+            let qNorm = queryIsNormalized
 
             return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
                 for (queryIndex, query) in queries.enumerated() {
                     group.addTask {
-                        Self.performLinearSearch(query: query, queryIndex: queryIndex, store: storeCopy, dimension: dim, metric: met, k: kk, filter: filter)
+                        Self.performLinearSearch(query: query, queryIndex: queryIndex, store: storeCopy, dimension: dim, metric: met, k: kk, filter: filter, queryIsNormalized: qNorm)
                     }
                 }
 
@@ -554,7 +567,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         var centroidDists: [(Int, Float)] = []
         centroidDists.reserveCapacity(ctx.centroids.count)
         for (i, c) in ctx.centroids.enumerated() {
-            centroidDists.append((i, distance(query, c, metric: ctx.metric)))
+            centroidDists.append((i, distance(query, c, metric: ctx.metric, queryIsNormalized: ctx.queryIsNormalized)))
         }
         centroidDists.sort { $0.1 < $1.1 }
 
@@ -570,7 +583,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         for id in candidates {
             guard let (vec, meta) = ctx.store[id] else { continue }
             if let filter = filter, !filter(meta) { continue }
-            let d = distance(query, vec, metric: ctx.metric)
+            let d = distance(query, vec, metric: ctx.metric, queryIsNormalized: ctx.queryIsNormalized)
             results.append(StringSearchResult(id: id, distance: d))
         }
         results.sort { $0.distance < $1.distance }
@@ -587,13 +600,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         dimension: Int,
         metric: SupportedDistanceMetric,
         k: Int,
-        filter: (@Sendable ([String: String]?) -> Bool)?
+        filter: (@Sendable ([String: String]?) -> Bool)?,
+        queryIsNormalized: Bool = false
     ) -> (Int, [StringSearchResult]) {
         var results: [StringSearchResult] = []
         results.reserveCapacity(min(k, store.count))
         for (id, (vec, meta)) in store {
             if let filter = filter, !filter(meta) { continue }
-            let d = distance(query, vec, metric: metric)
+            let d = distance(query, vec, metric: metric, queryIsNormalized: queryIsNormalized)
             results.append(StringSearchResult(id: id, distance: d))
         }
         results.sort { $0.distance < $1.distance }

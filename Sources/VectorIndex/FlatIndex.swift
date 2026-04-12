@@ -46,6 +46,13 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
+        try await search(query: query, k: k, filter: filter, queryIsNormalized: false)
+    }
+
+    /// Internal search with optional cosine query-norm hint. When
+    /// `queryIsNormalized` is true and metric is cosine, the query's
+    /// sum-of-squares computation is skipped in the distance kernel.
+    func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, queryIsNormalized: Bool) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
         var results: [StringSearchResult] = []
         results.reserveCapacity(min(k, vectors.count))
@@ -55,7 +62,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
             guard vec.count == query.count else {
                 throw VectorError.dimensionMismatch(expected: query.count, actual: vec.count)
             }
-            let d = distance(query, vec, metric: metric)
+            let d = distance(query, vec, metric: metric, queryIsNormalized: queryIsNormalized)
             results.append(StringSearchResult(id: id, distance: d))
         }
 
@@ -71,9 +78,14 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
         let dimension: Int
         let metric: SupportedDistanceMetric
         let k: Int
+        let queryIsNormalized: Bool
     }
 
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
+        try await batchSearch(queries: queries, k: k, filter: filter, queryIsNormalized: false)
+    }
+
+    func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, queryIsNormalized: Bool) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -82,7 +94,8 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
             vectors: vectors,
             dimension: dimension,
             metric: metric,
-            k: k
+            k: k,
+            queryIsNormalized: queryIsNormalized
         )
 
         return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
@@ -115,7 +128,7 @@ public actor FlatIndex: VectorIndexProtocol, AccelerableIndex {
             guard vec.count == query.count else {
                 throw VectorError.dimensionMismatch(expected: query.count, actual: vec.count)
             }
-            let d = distance(query, vec, metric: ctx.metric)
+            let d = distance(query, vec, metric: ctx.metric, queryIsNormalized: ctx.queryIsNormalized)
             results.append(StringSearchResult(id: id, distance: d))
         }
 

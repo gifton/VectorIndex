@@ -44,7 +44,7 @@ public extension IndexOps.Scoring {
                         let qInv = h.queryInvNorm ?? IndexOps.Scoring.Cosine.computeQueryInvNorm(q: q, d: d, epsilon: h.epsilon)
                         IndexOps.Scoring.Cosine.runF16(q: q, xb: xb, n: n, d: d, out: out, dbInvNormsF16: invF16, queryInvNorm: qInv)
                     } else {
-                        IndexOps.Scoring.Cosine.run(q: q, xb: xb, n: n, d: d, out: out)
+                        IndexOps.Scoring.Cosine.run(q: q, xb: xb, n: n, d: d, out: out, queryInvNorm: h.queryInvNorm)
                     }
                 } else {
                     // On-the-fly norms (two-pass) when no cache provided
