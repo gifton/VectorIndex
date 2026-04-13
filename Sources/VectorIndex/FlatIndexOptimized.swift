@@ -114,24 +114,32 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
     }
     
     public func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [StringSearchResult] {
+        try await search(query: query, k: k, filter: filter, queryIsNormalized: false)
+    }
+
+    /// Internal search with optional cosine query-norm hint. When
+    /// `queryIsNormalized` is true and metric is cosine, the query's
+    /// magnitude computation is skipped.
+    func search(query: [Float], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, queryIsNormalized: Bool) async throws -> [StringSearchResult] {
         guard k > 0 else { return [] }
         guard query.count == dimension else {
             throw VectorError.dimensionMismatch(expected: dimension, actual: query.count)
         }
 
         // Fast path: if storage is compact/contiguous AoS and no filter, use microkernels
-        if filter == nil, let fast = fastSearchWithMicrokernels(query: query, k: k) {
+        if filter == nil, let fast = fastSearchWithMicrokernels(query: query, k: k, queryIsNormalized: queryIsNormalized) {
             return fast
         }
-        
+
+        let qNorm = queryIsNormalized && metric == .cosine
         var results: [(VectorID, Float)] = []
         results.reserveCapacity(min(k, count))
-        
+
         // Process vectors without copying using direct storage access
         for (id, offset) in idToOffset {
             let metadata = idToMetadata[id] ?? nil
             if let filter = filter, !filter(metadata) { continue }
-            
+
             // Compute distance directly from storage without copying
             var distance: Float = 0
             switch metric {
@@ -143,13 +151,13 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
                 distance = sqrt(distance)
             case .cosine:
                 var dot: Float = 0
-                var normA: Float = 0
+                var normA: Float = qNorm ? 1.0 : 0.0
                 var normB: Float = 0
                 for i in 0..<dimension {
                     let a = query[i]
                     let b = vectorStorage[offset + i]
                     dot += a * b
-                    normA += a * a
+                    if !qNorm { normA += a * a }
                     normB += b * b
                 }
                 distance = 1.0 - (dot / (sqrt(normA) * sqrt(normB)))
@@ -162,10 +170,10 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
                 let vec = Array(vectorStorage[offset..<(offset + dimension)])
                 distance = VectorIndex.distance(query, vec, metric: metric)
             }
-            
+
             results.append((id, distance))
         }
-        
+
         // Sort and return top-k
         results.sort { $0.1 < $1.1 }
         return results.prefix(k).map { StringSearchResult(id: $0.0, distance: $0.1) }
@@ -179,9 +187,14 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         let dimension: Int
         let metric: SupportedDistanceMetric
         let k: Int
+        let queryIsNormalized: Bool
     }
 
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
+        try await batchSearch(queries: queries, k: k, filter: filter, queryIsNormalized: false)
+    }
+
+    func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?, queryIsNormalized: Bool) async throws -> [[StringSearchResult]] {
         guard k > 0 else { return queries.map { _ in [] } }
         if queries.isEmpty { return [] }
 
@@ -199,7 +212,8 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
             idToMetadata: idToMetadata,
             dimension: dimension,
             metric: metric,
-            k: k
+            k: k,
+            queryIsNormalized: queryIsNormalized
         )
 
         return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
@@ -224,6 +238,7 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
         ctx: FlatOptimizedBatchSearchContext,
         filter: (@Sendable ([String: String]?) -> Bool)?
     ) -> (Int, [StringSearchResult]) {
+        let qNorm = ctx.queryIsNormalized && ctx.metric == .cosine
         var results: [(VectorID, Float)] = []
         results.reserveCapacity(min(ctx.k, ctx.idToOffset.count))
 
@@ -242,13 +257,13 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
                 distance = sqrt(distance)
             case .cosine:
                 var dot: Float = 0
-                var normA: Float = 0
+                var normA: Float = qNorm ? 1.0 : 0.0
                 var normB: Float = 0
                 for i in 0..<ctx.dimension {
                     let a = query[i]
                     let b = ctx.vectorStorage[offset + i]
                     dot += a * b
-                    normA += a * a
+                    if !qNorm { normA += a * a }
                     normB += b * b
                 }
                 distance = 1.0 - (dot / (sqrt(normA) * sqrt(normB)))
@@ -371,8 +386,8 @@ public actor FlatIndexOptimized: VectorIndexProtocol, AccelerableIndex {
 // MARK: - Microkernel fast path integration
 extension FlatIndexOptimized {
     /// Attempt a fast search using microkernels when storage is compact and contiguous.
-    /// Falls back by throwing if layout isn't suitable.
-    fileprivate func fastSearchWithMicrokernels(query: [Float], k: Int) -> [StringSearchResult]? {
+    /// Falls back by returning nil if layout isn't suitable.
+    fileprivate func fastSearchWithMicrokernels(query: [Float], k: Int, queryIsNormalized: Bool = false) -> [StringSearchResult]? {
         // Storage must be fully compact: no holes and contiguous offsets
         guard freeOffsets.isEmpty, !idToOffset.isEmpty else { return nil }
         guard vectorStorage.count == idToOffset.count * dimension else { return nil }
@@ -392,7 +407,17 @@ extension FlatIndexOptimized {
         query.withUnsafeBufferPointer { qp in
             vectorStorage.withUnsafeBufferPointer { xbp in
                 guard let qptr = qp.baseAddress, let xbptr = xbp.baseAddress else { return }
-                let norms = (metric == .cosine) ? cosineNormsHandle : nil
+                var norms = (metric == .cosine) ? cosineNormsHandle : nil
+                // When query is known-normalized, provide a minimal handle so
+                // ScoreBlock can skip the query magnitude computation.
+                if queryIsNormalized && metric == .cosine && (norms == nil || norms?.queryInvNorm == nil) {
+                    norms = .init(
+                        dbInvNormsF32: norms?.dbInvNormsF32,
+                        dbInvNormsF16: norms?.dbInvNormsF16,
+                        queryInvNorm: 1.0,
+                        epsilon: norms?.epsilon ?? 1e-12
+                    )
+                }
                 // Write raw kernel scores:
                 // - Euclidean: L2^2 (smaller is better)
                 // - DotProduct: dot (larger is better)

@@ -64,17 +64,49 @@ public extension IVFIndex {
     }
 }
 
+public extension FlatIndexOptimized {
+    func insert<V: VectorProtocol>(id: VectorID, vector: V, metadata: [String: String]? = nil) async throws where V.Scalar == Float {
+        try await insert(id: id, vector: vector.toArray(), metadata: metadata)
+    }
+
+    func batchInsert<V: VectorProtocol>(_ items: [(id: VectorID, vector: V, metadata: [String: String]?)]) async throws where V.Scalar == Float {
+        let converted = items.map { ($0.id, $0.vector.toArray(), $0.metadata) }
+        try await batchInsert(converted)
+    }
+
+    func search<V: VectorProtocol>(query: V, k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [StringSearchResult] where V.Scalar == Float {
+        try await search(query: query.toArray(), k: k, filter: filter)
+    }
+
+    func batchSearch<V: VectorProtocol>(queries: [V], k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [[StringSearchResult]] where V.Scalar == Float {
+        let q = queries.map { $0.toArray() }
+        return try await batchSearch(queries: q, k: k, filter: filter)
+    }
+}
+
 // MARK: - IndexableVector overloads
-// Accept VectorCore 0.2.0 IndexableVector types and propagate optimization hints
-// (isNormalized, cachedMagnitude) for cosine fast paths.
+// Accept VectorCore 0.2.1+ IndexableVector types (including NormalizationHint<V>)
+// and propagate optimization hints (isNormalized, cachedMagnitude) for cosine fast paths.
 
 public extension FlatIndex {
     func insert<V: IndexableVector>(id: VectorID, vector: V, metadata: [String: String]? = nil) async throws {
         try await insert(id: id, vector: vector.toArray(), metadata: metadata)
     }
 
+    func batchInsert<V: IndexableVector>(_ items: [(id: VectorID, vector: V, metadata: [String: String]?)]) async throws {
+        let converted = items.map { ($0.id, $0.vector.toArray(), $0.metadata) }
+        try await batchInsert(converted)
+    }
+
     func search<V: IndexableVector>(query: V, k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [StringSearchResult] {
-        try await search(query: query.toArray(), k: k, filter: filter)
+        let qNorm = query.isNormalized && metric == .cosine
+        return try await search(query: query.toArray(), k: k, filter: filter, queryIsNormalized: qNorm)
+    }
+
+    func batchSearch<V: IndexableVector>(queries: [V], k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [[StringSearchResult]] {
+        let qNorm = queries.first.map { $0.isNormalized && metric == .cosine } ?? false
+        let q = queries.map { $0.toArray() }
+        return try await batchSearch(queries: q, k: k, filter: filter, queryIsNormalized: qNorm)
     }
 }
 
@@ -120,6 +152,16 @@ public extension HNSWIndex {
         let qInv: Float? = (query.isNormalized && metric == .cosine) ? 1.0 : nil
         return try await search(query: query.toArray(), k: k, filter: filter, qInvNorm: qInv)
     }
+
+    func batchSearch<V: IndexableVector>(queries: [V], k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [[StringSearchResult]] {
+        var results: [[StringSearchResult]] = []
+        results.reserveCapacity(queries.count)
+        for q in queries {
+            let qInv: Float? = (q.isNormalized && metric == .cosine) ? 1.0 : nil
+            results.append(try await search(query: q.toArray(), k: k, filter: filter, qInvNorm: qInv))
+        }
+        return results
+    }
 }
 
 public extension IVFIndex {
@@ -127,7 +169,41 @@ public extension IVFIndex {
         try await insert(id: id, vector: vector.toArray(), metadata: metadata)
     }
 
+    func batchInsert<V: IndexableVector>(_ items: [(id: VectorID, vector: V, metadata: [String: String]?)]) async throws {
+        let converted = items.map { ($0.id, $0.vector.toArray(), $0.metadata) }
+        try await batchInsert(converted)
+    }
+
     func search<V: IndexableVector>(query: V, k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [StringSearchResult] {
-        try await search(query: query.toArray(), k: k, filter: filter)
+        let qNorm = query.isNormalized && metric == .cosine
+        return try await search(query: query.toArray(), k: k, filter: filter, queryIsNormalized: qNorm)
+    }
+
+    func batchSearch<V: IndexableVector>(queries: [V], k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [[StringSearchResult]] {
+        let qNorm = queries.first.map { $0.isNormalized && metric == .cosine } ?? false
+        let q = queries.map { $0.toArray() }
+        return try await batchSearch(queries: q, k: k, filter: filter, queryIsNormalized: qNorm)
+    }
+}
+
+public extension FlatIndexOptimized {
+    func insert<V: IndexableVector>(id: VectorID, vector: V, metadata: [String: String]? = nil) async throws {
+        try await insert(id: id, vector: vector.toArray(), metadata: metadata)
+    }
+
+    func batchInsert<V: IndexableVector>(_ items: [(id: VectorID, vector: V, metadata: [String: String]?)]) async throws {
+        let converted = items.map { ($0.id, $0.vector.toArray(), $0.metadata) }
+        try await batchInsert(converted)
+    }
+
+    func search<V: IndexableVector>(query: V, k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [StringSearchResult] {
+        let qNorm = query.isNormalized && metric == .cosine
+        return try await search(query: query.toArray(), k: k, filter: filter, queryIsNormalized: qNorm)
+    }
+
+    func batchSearch<V: IndexableVector>(queries: [V], k: Int, filter: (@Sendable ([String: String]?) -> Bool)? = nil) async throws -> [[StringSearchResult]] {
+        let qNorm = queries.first.map { $0.isNormalized && metric == .cosine } ?? false
+        let q = queries.map { $0.toArray() }
+        return try await batchSearch(queries: q, k: k, filter: filter, queryIsNormalized: qNorm)
     }
 }
