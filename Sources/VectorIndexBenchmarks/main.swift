@@ -20,6 +20,11 @@ struct VectorIndexBenchmarks {
             return
         }
 
+        if config.knnGraph {
+            await runKNNGraphBenchmark(config: config)
+            return
+        }
+
         let bench = Benchmark(config: config)
         do {
             let result = try await bench.run()
@@ -39,6 +44,7 @@ struct VectorIndexBenchmarks {
         var q: Int = 100
         var dim: Int = 128
         var k: Int = 10
+        var knnGraph: Bool = false
         var metric: SupportedDistanceMetric = .euclidean
         // HNSW
         var m: Int = 16
@@ -68,6 +74,7 @@ struct VectorIndexBenchmarks {
             case "--q": if let v = next(), let iv = Int(v) { c.q = iv }
             case "--dim": if let v = next(), let iv = Int(v) { c.dim = iv }
             case "--k": if let v = next(), let iv = Int(v) { c.k = iv }
+            case "--knn-graph": c.knnGraph = true
             case "--metric": if let v = next() { c.metric = SupportedDistanceMetric(rawValue: v) ?? .euclidean }
             case "--m": if let v = next(), let iv = Int(v) { c.m = iv }
             case "--efc": if let v = next(), let iv = Int(v) { c.efc = iv }
@@ -87,6 +94,80 @@ struct VectorIndexBenchmarks {
         }
     }
 
+    static func runKNNGraphBenchmark(config: CLIConfig) async {
+        struct LCG {
+            var state: UInt64
+            mutating func next() -> UInt64 {
+                state = 2862933555777941757 &* state &+ 3037000493
+                return state
+            }
+            mutating func nextFloat() -> Float { Float(next() >> 11) / Float(1 << 53) }
+        }
+        var rng = LCG(state: config.seed)
+        var data: [[Float]] = []
+        data.reserveCapacity(config.n)
+        for _ in 0..<config.n {
+            var v = (0..<config.dim).map { _ in rng.nextFloat() * 2 - 1 }
+            let norm = sqrt(v.reduce(0) { $0 + $1 * $1 })
+            if norm > 0 { v = v.map { $0 / norm } }
+            data.append(v)
+        }
+        do {
+            let index = HNSWIndex(
+                dimension: config.dim, metric: config.metric,
+                config: .init(m: config.m, efConstruction: config.efc, efSearch: config.efs, rngSeed: config.seed)
+            )
+            let tInsert0 = DispatchTime.now()
+            let chunk = 10_000
+            var i = 0
+            while i < config.n {
+                let hi = min(config.n, i + chunk)
+                try await index.batchInsert((i..<hi).map { (id: "id\($0)", vector: data[$0], metadata: nil) })
+                i = hi
+            }
+            let insertSec = Double(DispatchTime.now().uptimeNanoseconds - tInsert0.uptimeNanoseconds) / 1e9
+
+            let tBuild0 = DispatchTime.now()
+            let (graph, _) = try await index.buildKNNGraph(k: config.k)
+            let buildSec = Double(DispatchTime.now().uptimeNanoseconds - tBuild0.uptimeNanoseconds) / 1e9
+
+            // Recall on a deterministic sample of rows vs exact scan
+            // (graph row order == insertion order == data order)
+            let sampleCount = min(1000, config.n)
+            let strideStep = max(1, config.n / sampleCount)
+            var totalRecall = 0.0
+            var sampled = 0
+            var row = 0
+            while row < config.n && sampled < sampleCount {
+                let q = data[row]
+                var scored: [(Int, Float)] = []
+                scored.reserveCapacity(config.n)
+                for j in 0..<config.n where j != row {
+                    var s: Float = 0
+                    for c in 0..<config.dim { let d = q[c] - data[j][c]; s += d * d }
+                    scored.append((j, s))
+                }
+                scored.sort { $0.1 < $1.1 || ($0.1 == $1.1 && $0.0 < $1.0) }
+                let truth = Set(scored.prefix(config.k).map { Int32($0.0) })
+                let approx = Set(graph.neighborRange(of: row).map { graph.neighborIndices[$0] })
+                totalRecall += Double(approx.intersection(truth).count) / Double(truth.count)
+                sampled += 1
+                row += strideStep
+            }
+            let recall = totalRecall / Double(sampled)
+            print("""
+            {"benchmark": "hnsw_knn_graph", "n": \(config.n), "dim": \(config.dim), "k": \(config.k), \
+            "m": \(config.m), "efc": \(config.efc), "efs": \(config.efs), "seed": \(config.seed), \
+            "insert_sec": \(insertSec), "build_sec": \(buildSec), \
+            "points_per_sec": \(Double(config.n) / buildSec), "edges": \(graph.edgeCount), \
+            "recall_at_\(config.k)_sample\(sampled)": \(recall)}
+            """)
+        } catch {
+            fputs("knn-graph benchmark failed: \(error)\n", stderr)
+            exit(1)
+        }
+    }
+
     static func printUsage() {
         let help = """
         Usage: VectorIndexBenchmarks [options]
@@ -96,6 +177,7 @@ struct VectorIndexBenchmarks {
           --q <int>                       Number of queries (default: 100)
           --dim <int>                     Vector dimension (default: 128)
           --k <int>                       Top-k (default: 10)
+          --knn-graph                     Benchmark HNSW buildKNNGraph (uses --n/--dim/--k/--m/--efc/--efs/--seed)
           --metric <euclidean|dotProduct|cosine>  Distance metric (default: euclidean)
           --m <int>                       HNSW M (default: 16)
           --efc <int>                     HNSW efConstruction (default: 200)
