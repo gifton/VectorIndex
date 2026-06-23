@@ -387,6 +387,64 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         return (queryIndex, results)
     }
 
+    /// Read-only snapshot for parallel kNN-graph construction (see HNSWKNNGraph.swift).
+    /// Immutable value snapshot; vectorStorage is COW-shared (no element copy unless
+    /// the actor mutates mid-build, which yields snapshot semantics).
+    struct KNNBuildContext: @unchecked Sendable {
+        let vectorStorage: ContiguousArray<Float>
+        let csrOffsets: [[Int32]]
+        let csrNeighbors: [[Int32]]
+        let invNorms: [Float]?          // cosine only
+        let allowBits: [UInt64]
+        let rowToNode: [Int32]          // graph row -> internal node index (insertion order)
+        let nodeToRow: [Int32]          // internal node index -> graph row, -1 for tombstones
+        let dim: Int
+        let maxLevel: Int
+        let entryPoint: Int
+        let N: Int
+        let ef: Int
+        let k: Int
+        let metric: HNSWMetric
+    }
+
+    /// Snapshot factory for `buildKNNGraph`. Returns nil when the index has no entry point.
+    func makeKNNBuildContext(k: Int, ef: Int) -> (ctx: KNNBuildContext, ids: [VectorID])? {
+        guard let ep = entryPoint else { return nil }
+        rebuildCSRIfNeeded()
+        let N = nodes.count
+        let words = (N + 63) >> 6
+        var allowBits = [UInt64](repeating: 0, count: words)
+        var rowToNode = [Int32]()
+        rowToNode.reserveCapacity(activeCount)
+        var nodeToRow = [Int32](repeating: -1, count: N)
+        var ids: [VectorID] = []
+        ids.reserveCapacity(activeCount)
+        for i in 0..<N where !nodes[i].isDeleted {
+            allowBits[i >> 6] |= (1 &<< UInt64(i & 63))
+            nodeToRow[i] = Int32(rowToNode.count)
+            rowToNode.append(Int32(i))
+            ids.append(nodes[i].id)
+        }
+        let invNorms = rebuildInvNormsIfNeededForCosine().map { Array(UnsafeBufferPointer(start: $0, count: N)) }
+        let ctx = KNNBuildContext(
+            vectorStorage: vectorStorage,
+            csrOffsets: csrOffsetsCache,
+            csrNeighbors: csrNeighborsCache,
+            invNorms: invNorms,
+            allowBits: allowBits,
+            rowToNode: rowToNode,
+            nodeToRow: nodeToRow,
+            dim: dimension,
+            maxLevel: maxLevel,
+            entryPoint: ep,
+            N: N,
+            ef: ef,
+            k: k,
+            metric: Self.toHNSWMetric(metric)
+        )
+        return (ctx, ids)
+    }
+
     public func clear() async {
         nodes.removeAll(keepingCapacity: false)
         idToIndex.removeAll(keepingCapacity: false)
