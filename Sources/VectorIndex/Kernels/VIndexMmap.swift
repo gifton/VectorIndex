@@ -949,11 +949,13 @@ internal final class IndexMmap {
                         .info("toc_index", "\(i)")
                         .build()
                 }
-                let off = readLE64(te.advanced(by: 8))
-                let sz  = readLE64(te.advanced(by: 16))
-                let al  = readLE32(te.advanced(by: 24))
-                let flags = readLE32(te.advanced(by: 28))
-                let crc = readLE32(te.advanced(by: 32))
+                // Packed: offset@+4, size@+12, align@+20, flags@+24, crc@+28 (matches the
+                // canonical writer/indexInit layout — see indexInit() above).
+                let off = readLE64(te.advanced(by: 4))
+                let sz  = readLE64(te.advanced(by: 12))
+                let al  = readLE32(te.advanced(by: 20))
+                let flags = readLE32(te.advanced(by: 24))
+                let crc = readLE32(te.advanced(by: 28))
                 tocByType[ty2] = HostTOCEntry(type: ty2, offset: off, size: sz, align: al, flags: flags, crc32: crc)
             }
             // Rebuild section base pointers
