@@ -1,0 +1,1 @@
+{"benchmark": "hnsw_knn_graph", "n": 3000, "dim": 384, "k": 15, "m": 16, "efc": 200, "efs": 96, "seed": 42, "insert_sec": 7.726439084, "build_sec": 1.125184709, "points_per_sec": 2666.2289097993776, "edges": 45000, "recall_at_15_sample1000": 0.9569333333333252}

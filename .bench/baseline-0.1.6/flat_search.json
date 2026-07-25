@@ -1,0 +1,34 @@
+{
+  "config" : {
+    "dim" : "384",
+    "efc" : "200",
+    "efs" : "64",
+    "index" : "flat",
+    "k" : "10",
+    "m" : "16",
+    "metric" : "euclidean",
+    "n" : "5000",
+    "nlist" : "64",
+    "nprobe" : "4",
+    "q" : "200"
+  },
+  "results" : [
+    {
+      "buildSeconds" : 0.00079875,
+      "dim" : 384,
+      "indexType" : "Flat",
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 5000,
+      "optimizeSeconds" : 0,
+      "params" : {
+
+      },
+      "q" : 200,
+      "recallAvg" : 1,
+      "searchAvgMs" : 1.784170865,
+      "searchP95Ms" : 0.5569999999999999,
+      "throughputQps" : 560.484435441109
+    }
+  ]
+}
