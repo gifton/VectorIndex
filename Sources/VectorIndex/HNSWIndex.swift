@@ -186,6 +186,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         return query.withUnsafeBufferPointer { qbp in
             vectorStorage.withUnsafeBufferPointer { xbbp in
                 allowBits.withUnsafeBufferPointer { allowBP in
+                  withExtendedLifetime(csrOffsetsCache) { withExtendedLifetime(csrNeighborsCache) {
                     // Build pointer arrays for layers from cached CSR
                     let offPtrsOpt = csrOffsetsCache.map { arr in arr.withUnsafeBufferPointer { Optional($0.baseAddress!) } }
                     let nbrPtrsOpt = csrNeighborsCache.map { arr in arr.withUnsafeBufferPointer { Optional($0.baseAddress!) } }
@@ -221,6 +222,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                             return results
                         }
                     }
+                  } }
                 }
             }
         }
@@ -321,6 +323,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         let written = query.withUnsafeBufferPointer { qbp in
             ctx.vectorStorage.withUnsafeBufferPointer { xbbp in
                 ctx.allowBits.withUnsafeBufferPointer { allowBP in
+                  withExtendedLifetime(ctx.csrOffsets) { withExtendedLifetime(ctx.csrNeighbors) {
                     // Build pointer arrays for CSR layers
                     var offPtrs = [UnsafePointer<Int32>?]()
                     var nbrPtrs = [UnsafePointer<Int32>?]()
@@ -363,6 +366,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                             }
                         }
                     }
+                  } }
                 }
             }
         }

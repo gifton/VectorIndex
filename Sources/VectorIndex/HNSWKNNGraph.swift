@@ -122,6 +122,7 @@ extension HNSWIndex {
 
         ctx.vectorStorage.withUnsafeBufferPointer { xbbp in
             ctx.allowBits.withUnsafeBufferPointer { allowBP in
+              withExtendedLifetime(ctx.csrOffsets) { withExtendedLifetime(ctx.csrNeighbors) {
                 // Pin per-layer CSR pointers (same pattern as performSingleSearch).
                 var offPtrs = [UnsafePointer<Int32>?]()
                 var nbrPtrs = [UnsafePointer<Int32>?]()
@@ -175,6 +176,7 @@ extension HNSWIndex {
                         }
                     }
                 }
+              } }
             }
         }
         return out
