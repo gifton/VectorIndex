@@ -480,9 +480,8 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
     public func batchRemove(_ ids: [VectorID]) async throws {
         for id in ids { try await remove(id: id) }
-        entryPoint = nil
-        maxLevel = 0
-        activeCount = 0
+        // `remove()` -> `internalRemove()` already maintains entryPoint/activeCount
+        // per id; only the CSR/invNorms caches need invalidating for the batch.
         markCSRDirty(); markInvNormsDirty()
     }
 
