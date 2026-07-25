@@ -235,11 +235,11 @@ final class HNSWKNNGraphTests: XCTestCase {
     // (f) End-to-end: our graph through Core's UMAP separates two clusters.
     // Mirrors VectorCore Tests/ComprehensiveTests/UMAPTests.swift (separationRatio > 2).
     //
-    // Points are inserted in seeded-shuffled order: cluster-sequential insertion
-    // triggers a pre-existing HNSW construction bug (naive closest-M reverse-edge
-    // pruning disconnects well-separated clusters — see
-    // testKnownIssue_SequentialClusterInsertDisconnectsGraph). Shuffled order is
-    // also the representative ingestion pattern for real corpora.
+    // Points are inserted in seeded-shuffled order, which is also the representative
+    // ingestion pattern for real corpora. (Cluster-sequential insertion no longer
+    // disconnects the graph — see testKnownIssue_SequentialClusterInsertDisconnectsGraph,
+    // now a permanent regression guard for A9 — but shuffled order remains the
+    // intended fixture shape for this end-to-end UMAP check.)
     func testUMAPIntegrationTwoClusters() async throws {
         let half = 60
         let data = twoClusters(seed: 73, half: half, dim: 10, separation: 12, scale: 0.5)
@@ -307,23 +307,20 @@ final class HNSWKNNGraphTests: XCTestCase {
         XCTAssertGreaterThan(ratio, 2, "separation ratio \(ratio)")
     }
 
-    // Known issue (pre-existing, NOT a buildKNNGraph bug — flagged for a separate fix):
-    // inserting two well-separated clusters sequentially disconnects the navigable
-    // graph. `pruneNeighbors` (HNSWIndex.swift) shrinks overflowed reverse-edge lists
-    // via hnsw_prune_neighbors_f32_swift, which keeps the M closest with NO diversity
-    // heuristic (HNSWNeighborSelection.swift), so the long A↔B bridge edges are
-    // discarded from both sides and the first-inserted cluster becomes unreachable
-    // from the entry point — public search() can't even find an indexed point at
-    // distance 0, regardless of ef. When the prune kernel adopts the same diversity
-    // heuristic as hnsw_select_neighbors_f32_swift, this XCTExpectFailure flips to a
-    // hard failure: delete this test and re-enable sequential fixtures.
+    // Regression guard (A9, docs/verification-gap-analysis-p0.md §6.1): inserting two
+    // well-separated clusters sequentially used to disconnect the navigable graph.
+    // `pruneNeighbors` (HNSWIndex.swift) shrinks overflowed reverse-edge lists via
+    // `hnsw_select_neighbors_f32_swift` — the same diversity-heuristic kernel insertion
+    // uses — instead of keeping the M closest with no diversity heuristic, so the long
+    // A↔B bridge edges survive on both sides and the first-inserted cluster stays
+    // reachable from the entry point. This guards against that regression: search()
+    // must still find an indexed point as its own nearest neighbor (distance 0) after
+    // cluster-sequential insertion.
     func testKnownIssue_SequentialClusterInsertDisconnectsGraph() async throws {
         let half = 60
         let data = twoClusters(seed: 73, half: half, dim: 10, separation: 12, scale: 0.5)
         let index = try await buildIndex(data: data) // sequential: all A, then all B
         let hits = try await index.search(query: data[5], k: 1, filter: nil)
-        XCTExpectFailure("pre-existing HNSW prune bug: first-inserted cluster unreachable after cluster-sequential insertion") {
-            XCTAssertEqual(hits.first?.id, "id5", "indexed point should be its own nearest neighbor")
-        }
+        XCTAssertEqual(hits.first?.id, "id5", "indexed point should be its own nearest neighbor")
     }
 }
