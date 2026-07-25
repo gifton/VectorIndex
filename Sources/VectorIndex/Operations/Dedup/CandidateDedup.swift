@@ -151,6 +151,7 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
     @usableFromInline internal var touchedWords: UnsafeMutablePointer<Int>?
     @usableFromInline internal var touchedCount: Int = 0
     @usableFromInline internal var touchedCapacity: Int = 0
+    @usableFromInline internal var touchedOverflowed: Bool = false
 
     // MARK: Init / Deinit
 
@@ -289,7 +290,9 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
         } else if mode == .fixedBitset {
             // Clear only touched words if sparse, else full clear is faster.
             let tc = touchedCount
-            if tc > 0, let bw = bitWords {
+            if touchedOverflowed, let bw = bitWords {
+                for i in 0..<wordCount { bw[i] = 0 }   // ring saturated: sparse set is incomplete
+            } else if tc > 0, let bw = bitWords {
                 if tc < wordCount / 4, let tw = touchedWords {
                     for i in 0..<tc {
                         bw[tw[i]] = 0
@@ -300,6 +303,7 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
                 }
             }
             touchedCount = 0
+            touchedOverflowed = false
         }
 
         // SparsePaged epoch wrap handling (rare): if epoch wrapped to 0,
@@ -469,9 +473,13 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
         if (word & mask) == 0 {
             bw[w] = word | mask
             // Track newly touched word (if word was previously 0)
-            if word == 0, touchedCount < touchedCapacity, let tw = touchedWords {
-                tw[touchedCount] = w
-                touchedCount &+= 1
+            if word == 0 {
+                if touchedCount < touchedCapacity, let tw = touchedWords {
+                    tw[touchedCount] = w
+                    touchedCount &+= 1
+                } else {
+                    touchedOverflowed = true
+                }
             }
             uniqueCount &+= 1
             return true
@@ -630,6 +638,8 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
         if touchedCount < touchedCapacity, let tw = touchedWords {
             tw[touchedCount] = w
             touchedCount &+= 1
+        } else {
+            touchedOverflowed = true
         }
     }
 
