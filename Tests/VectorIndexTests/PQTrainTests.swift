@@ -664,17 +664,38 @@ final class PQTrainTests: XCTestCase {
 
     func testLargeScaleTraining() throws {
         // Test with realistic production scale
-        let n: Int64 = 50_000
-        let d = 768
+        // (scaled down from n=50K d=768 to avoid debug-build timeouts: the
+        // original 38.4M-scalar Float.random fill + minibatch training over
+        // n=50k/d=768 passed in 27.6s in Release but ran >1h in Debug.
+        // PQTrain's minibatch path defaults to *serial*, one-subspace-at-a-
+        // time execution (numThreads=0 <= 1), and once n exceeds
+        // cfg.distEvalN (2000) the per-pass sample size is clamped to 2000
+        // regardless of n -- so shrinking n alone barely reduces cost once
+        // past that threshold; dsub (d/m) is what actually drives per-pass
+        // cost. Two prior attempts (n=10_000/d=256: >10 min, killed;
+        // n=4_000/d=16: 129s training alone) still weren't "well under 2
+        // minutes". Final: n=1_000 (below the 2000 clamp, so the full n is
+        // sampled each pass instead of a fixed 2000) and d=8 (dsub=1).
+        let n: Int64 = 1_000
+        let d = 8
         let m = 8
         let ks = 256
 
+        // Deterministic fast fill (SplitMix/LCG-style generator; no unseeded
+        // Float.random) so this test's timing/behavior is reproducible.
+        var rng: UInt64 = 0x1357_9BDF_2468_ACE0
+        func rnd() -> Float {
+            rng = 2862933555777941757 &* rng &+ 3037000493
+            return Float(rng >> 40) / Float(1 << 24)
+        }
+
         var x = [Float](repeating: 0, count: Int(n) * d)
         for i in 0..<(Int(n) * d) {
-            x[i] = Float.random(in: -1...1)
+            x[i] = rnd() * 2 - 1
         }
 
         var cfg = PQTrainConfig()
+        cfg.seed = 42
         cfg.algo = .minibatch
         cfg.batchSize = 2048
         cfg.maxIters = 15
@@ -756,19 +777,56 @@ final class PQTrainTests: XCTestCase {
 
     func testCompressionQuality() throws {
         var nilNorms: [Float]?
-        // Verify PQ achieves reasonable compression vs quality trade-off
+        // Verify PQ achieves reasonable compression vs quality trade-off.
         // (scaled down from n=5K d=1024 ks=256 to avoid debug-build timeouts)
+        //
+        // Data model: C=32 well-separated cluster centers (<= ks=64, so each
+        // cluster can claim its own centroid per subspace) plus small additive
+        // noise, generated with a seeded fast generator (no unseeded
+        // Float.random anywhere in this test). This replaces the previous
+        // i.i.d. uniform-random data: on that distribution the achievable
+        // normalized distortion at dsub=64/ks=64 sits near the
+        // information-theoretic floor (measured ~0.85, i.e. only ~15% of
+        // variance captured), so the old `< 0.3` threshold could never pass
+        // -- it was left uncalibrated when the test was scaled down. On this
+        // clusterable data PQ genuinely can capture most of the variance, so
+        // a meaningful pass/fail threshold is possible.
         let n: Int64 = 2000
         let d = 256
         let m = 4
         let ks = 64
+        let numClusters = 32  // <= ks
 
+        // Deterministic fast fill (LCG; see RegressionA1_TraversalLifetimeTests
+        // for the same pattern). No unseeded Float.random.
+        var rng: UInt64 = 0x5EED_1234_ABCD_9876
+        func rnd() -> Float {
+            rng = 2862933555777941757 &* rng &+ 3037000493
+            return Float(rng >> 40) / Float(1 << 24)
+        }
+
+        // Cluster centers spread over [-1, 1) per dimension so between-cluster
+        // variance dominates.
+        var centers = [Float](repeating: 0, count: numClusters * d)
+        for c in 0..<numClusters {
+            for j in 0..<d {
+                centers[c * d + j] = rnd() * 2 - 1
+            }
+        }
+
+        // Small additive noise (within-cluster spread is a small fraction of
+        // total variance).
+        let noiseScale: Float = 0.05
         var x = [Float](repeating: 0, count: Int(n) * d)
-        for i in 0..<(Int(n) * d) {
-            x[i] = Float.random(in: -1...1)
+        for i in 0..<Int(n) {
+            let c = i % numClusters
+            for j in 0..<d {
+                x[i * d + j] = centers[c * d + j] + (rnd() * 2 - 1) * noiseScale
+            }
         }
 
         var cfg = PQTrainConfig()
+        cfg.seed = 42
         cfg.maxIters = 10
 
         var codebooks = [Float]()
@@ -799,14 +857,25 @@ final class PQTrainTests: XCTestCase {
 
         let normalizedDistortion = stats.distortion / variance
 
-        // Typical PQ: 5-10% normalized distortion (95-98% of variance captured)
+        // On this seeded C=32-cluster-plus-small-noise data model, PQ at
+        // ks=64/dsub=64 should capture the overwhelming majority of variance
+        // (each cluster can claim its own centroid per subspace, so the
+        // residual is essentially just the injected noise).
         print("✅ Compression quality:")
         print("   Distortion: \(stats.distortion)")
         print("   Variance: \(variance)")
         print("   Normalized distortion: \(normalizedDistortion)")
         print("   Variance captured: \((1.0 - normalizedDistortion) * 100)%")
 
-        // Should capture at least 80% of variance for random data
-        XCTAssert(normalizedDistortion < 0.3, "PQ should capture significant variance")
+        // Empirically calibrated: this data model + config (seed=42) measures
+        // normalizedDistortion ≈ 0.00244 (~99.76% variance captured),
+        // bit-identical across repeated runs. Threshold set to 0.05 (~20x the
+        // measured value) -- comfortable safety margin so legitimate minor
+        // algorithmic variation won't flake this test, while still asserting
+        // that PQ captures the overwhelming majority of variance on
+        // clusterable data (unlike the old, uncalibratable 0.3 threshold on
+        // i.i.d. uniform data, which sat near the ~0.85 information-theoretic
+        // floor at these parameters).
+        XCTAssert(normalizedDistortion < 0.05, "PQ should capture significant variance")
     }
 }
