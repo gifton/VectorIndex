@@ -669,43 +669,30 @@ public extension IndexOps.Rerank {
             }
         }
 
-        // Optionally elide missing candidates
+        // Select top-K using #05 TopK (deterministic tie-break by position).
+        // IMPORTANT: never narrow the Int64 candidate ids; run the heap on positional
+        // indices (ids: nil) and map winners back through candIDs to preserve full width.
         let useFiltered = opts.skipMissing
-        var filteredScores: [Float] = []
-        var filteredIDs32: [Int32] = []
-        var ids32All: [Int32] = []
-        if useFiltered {
-            filteredScores.reserveCapacity(C)
-            filteredIDs32.reserveCapacity(C)
-            for i in 0..<C where presentMask[i] != 0 {
-                filteredScores.append(scores[i])
-                filteredIDs32.append(Int32(truncatingIfNeeded: candIDs.advanced(by: i).pointee))
-            }
-        } else {
-            ids32All.reserveCapacity(C)
-            for i in 0..<C { ids32All.append(Int32(truncatingIfNeeded: candIDs.advanced(by: i).pointee)) }
-        }
-
-        // Select top-K using #05 TopK (deterministic tie-break by id)
         let ordering = IndexOps.Selection.ordering(for: metric)
+        // positions[i] is the original candIDs index for the i-th scored entry fed to the heap.
+        var positions: [Int32] = []
+        var heapScores: [Float] = []
+        if useFiltered {
+            positions.reserveCapacity(C)
+            heapScores.reserveCapacity(C)
+            for i in 0..<C where presentMask[i] != 0 {
+                heapScores.append(scores[i])
+                positions.append(Int32(i))
+            }
+        }
         let selHeap: IndexOps.Selection.TopKHeap = {
             if useFiltered {
-                guard !filteredScores.isEmpty else { return IndexOps.Selection.TopKHeap(capacity: K, ordering: ordering) }
+                guard !heapScores.isEmpty else { return IndexOps.Selection.TopKHeap(capacity: K, ordering: ordering) }
                 return IndexOps.Selection.selectTopK_streaming(
-                    scores: filteredScores,
-                    ids: filteredIDs32,
-                    count: filteredScores.count,
-                    k: K,
-                    ordering: ordering
-                )
+                    scores: heapScores, ids: nil, count: heapScores.count, k: K, ordering: ordering)
             } else {
                 return IndexOps.Selection.selectTopK_streaming(
-                    scores: scores,
-                    ids: ids32All,
-                    count: C,
-                    k: K,
-                    ordering: ordering
-                )
+                    scores: scores, ids: nil, count: C, k: K, ordering: ordering)
             }
         }()
 
@@ -713,8 +700,9 @@ public extension IndexOps.Rerank {
         let actual = min(K, pairs.count)
         // Emit results; pad if fewer than K present
         for i in 0..<actual {
+            let pos = useFiltered ? Int(positions[Int(pairs[i].id)]) : Int(pairs[i].id)
             topScores[i] = pairs[i].score
-            topIDs[i]    = Int64(pairs[i].id)
+            topIDs[i]    = candIDs.advanced(by: pos).pointee
         }
         if actual < K {
             let sentinel = _missingSentinel(metric)
