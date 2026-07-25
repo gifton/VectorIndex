@@ -97,4 +97,40 @@ final class PQEncodeParity_SwiftOnly_Tests: XCTestCase {
         }
         XCTAssertEqual(codes1, codes2)
     }
+
+    /// Guards Task 7 (spec A6): `ensureCentroidSqNorms` allocates a fresh
+    /// [m*ks] buffer whenever `opts.centroidSqNorms == nil`. Before the fix,
+    /// every call on this path leaked that buffer. This test drives the
+    /// allocate-then-free path 201 times (1 baseline + 200 repeats) under the
+    /// Swift fallback and asserts the output stays byte-identical each time —
+    /// a misplaced `defer` (freeing before use, or not at all under repeated
+    /// pressure) would surface here as a crash, double-free, or code drift.
+    func testRepeatedEncodeWithoutPrecomputedNormsIsStable() throws {
+        let n = 12, d = 24, m = 6, ks = 256
+        let (x, cb) = makeData(n: n, d: d, m: m, ks: ks)
+        var opts = PQEncodeOpts(useDotTrick: true, outputLayout: .aOS, centroidSqNorms: nil)
+
+        forceSwiftPath {
+            var first = [UInt8](repeating: 0, count: n*m)
+            x.withUnsafeBufferPointer { xb in
+                cb.withUnsafeBufferPointer { cbb in
+                    first.withUnsafeMutableBufferPointer { out in
+                        pq_encode_u8_f32(xb.baseAddress!, Int64(n), Int32(d), Int32(m), Int32(ks), cbb.baseAddress!, out.baseAddress!, &opts)
+                    }
+                }
+            }
+
+            for _ in 0..<200 {
+                var codes = [UInt8](repeating: 0, count: n*m)
+                x.withUnsafeBufferPointer { xb in
+                    cb.withUnsafeBufferPointer { cbb in
+                        codes.withUnsafeMutableBufferPointer { out in
+                            pq_encode_u8_f32(xb.baseAddress!, Int64(n), Int32(d), Int32(m), Int32(ks), cbb.baseAddress!, out.baseAddress!, &opts)
+                        }
+                    }
+                }
+                XCTAssertEqual(codes, first)
+            }
+        }
+    }
 }

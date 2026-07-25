@@ -85,9 +85,11 @@ public func pq_encode_u8_f32(
     if _useCPQEncode && layout == .aOS {
         var cOpts = opts._toC(ks: ks, layout: layout)
         if opts.useDotTrick {
+            let ownsCSq = (opts.centroidSqNorms == nil)
             let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
                 maybeSq: opts.centroidSqNorms, codebooks: codebooks, m: m, ks: ks, dsub: dsub
             )
+            defer { if ownsCSq { UnsafeMutablePointer(mutating: centroidSq).deallocate() } }
             CPQEncode.cpq_encode_u8_f32_with_csq(
                 x, n64, CInt(d), CInt(m), CInt(ks), codebooks, centroidSq, codes, &cOpts
             )
@@ -101,9 +103,11 @@ public func pq_encode_u8_f32(
     #endif
 
     // Prepare centroid squared-norms [m*ks] if needed (for dot trick).
+    let ownsCSq = (opts.centroidSqNorms == nil)
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: codebooks, m: m, ks: ks, dsub: dsub
     )
+    defer { if ownsCSq { UnsafeMutablePointer(mutating: centroidSq).deallocate() } }
 
     // Encode each vector.
     for i in 0..<n {
@@ -205,9 +209,11 @@ public func pq_encode_u4_f32(
     #endif
 
     // Prepare centroid squared-norms [m*ks] if needed.
+    let ownsCSq = (opts.centroidSqNorms == nil)
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: codebooks, m: m, ks: ks, dsub: dsub
     )
+    defer { if ownsCSq { UnsafeMutablePointer(mutating: centroidSq).deallocate() } }
 
     for i in 0..<n {
         let xRow = x + i*d
@@ -262,9 +268,11 @@ public func pq_encode_residual_u8_f32(
     if _useCPQEncode && layout == .aOS {
         var cOpts = opts._toC(ks: ks, layout: layout)
         if opts.useDotTrick {
+            let ownsCSq = (opts.centroidSqNorms == nil)
             let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
                 maybeSq: opts.centroidSqNorms, codebooks: residualCodebooks, m: m, ks: ks, dsub: dsub
             )
+            defer { if ownsCSq { UnsafeMutablePointer(mutating: centroidSq).deallocate() } }
             CPQEncode.cpq_encode_residual_u8_f32_with_csq(
                 x, n64, CInt(d), CInt(m), CInt(ks), residualCodebooks, centroidSq, coarseCentroids, assignments, codes, &cOpts
             )
@@ -278,9 +286,11 @@ public func pq_encode_residual_u8_f32(
     #endif
 
     // Centroid squared-norms [m*ks] (for residual codebooks).
+    let ownsCSq = (opts.centroidSqNorms == nil)
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: residualCodebooks, m: m, ks: ks, dsub: dsub
     )
+    defer { if ownsCSq { UnsafeMutablePointer(mutating: centroidSq).deallocate() } }
 
     // Per-subspace scratch buffer for residual r_j (no global materialization).
     let rBuf = UnsafeMutablePointer<Float>.allocate(capacity: dsub)
@@ -399,9 +409,11 @@ public func pq_encode_residual_u4_f32(
     }
     #endif
 
+    let ownsCSq = (opts.centroidSqNorms == nil)
     let centroidSq: UnsafePointer<Float> = ensureCentroidSqNorms(
         maybeSq: opts.centroidSqNorms, codebooks: residualCodebooks, m: m, ks: ks, dsub: dsub
     )
+    defer { if ownsCSq { UnsafeMutablePointer(mutating: centroidSq).deallocate() } }
 
     let rBuf = UnsafeMutablePointer<Float>.allocate(capacity: dsub)
     defer { rBuf.deallocate() }
