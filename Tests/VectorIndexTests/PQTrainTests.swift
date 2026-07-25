@@ -663,7 +663,12 @@ final class PQTrainTests: XCTestCase {
     // MARK: - Performance Validation Tests
 
     func testLargeScaleTraining() throws {
-        // Test with realistic production scale
+        // Scaled-down, seeded, deterministic exercise of the minibatch
+        // training path for debug builds -- NOT a realistic-production-scale
+        // benchmark. Realistic-scale behavior is covered by the Release-mode
+        // expectations (27.6s at n=50k/d=768, see below) and by sibling
+        // test testMiniBatchPQTraining (n=5000, batchSize=512).
+        //
         // (scaled down from n=50K d=768 to avoid debug-build timeouts: the
         // original 38.4M-scalar Float.random fill + minibatch training over
         // n=50k/d=768 passed in 27.6s in Release but ran >1h in Debug.
@@ -674,8 +679,15 @@ final class PQTrainTests: XCTestCase {
         // past that threshold; dsub (d/m) is what actually drives per-pass
         // cost. Two prior attempts (n=10_000/d=256: >10 min, killed;
         // n=4_000/d=16: 129s training alone) still weren't "well under 2
-        // minutes". Final: n=1_000 (below the 2000 clamp, so the full n is
-        // sampled each pass instead of a fixed 2000) and d=8 (dsub=1).
+        // minutes". Settled on n=1_000 (below the 2000 clamp, so the full n
+        // is sampled each pass instead of a fixed 2000) and d=8 (dsub=1).
+        //
+        // batchSize is set well below n (256, giving ~4 partial batches per
+        // pass) so the minibatch path's multi-batch-per-pass update logic is
+        // genuinely exercised: with the original batchSize=2048 > n=1000,
+        // the inner `while processed < limit` loop ran exactly one batch per
+        // pass, degenerating to a single-batch update and not covering
+        // minibatch semantics at all.)
         let n: Int64 = 1_000
         let d = 8
         let m = 8
@@ -697,7 +709,7 @@ final class PQTrainTests: XCTestCase {
         var cfg = PQTrainConfig()
         cfg.seed = 42
         cfg.algo = .minibatch
-        cfg.batchSize = 2048
+        cfg.batchSize = 256  // well below n=1000: ~4 partial batches/pass
         cfg.maxIters = 15
 
         let start = Date()
@@ -715,7 +727,9 @@ final class PQTrainTests: XCTestCase {
         XCTAssertEqual(codebooks.count, m * ks * (d/m))
         XCTAssert(stats.distortion > 0)
 
-        // Performance target check (should be fast with SIMD)
+        // Shape/positivity check only at this scale -- dsub=1 has no
+        // meaningful SIMD width, so this isn't a performance assertion.
+        // Timing is printed for visibility (debug-build sanity), not asserted.
         print("✅ Large scale: n=\(n), time=\(elapsed)s, distortion=\(stats.distortion)")
         print("   Per-subspace time: \(elapsed / Double(m))s")
     }
