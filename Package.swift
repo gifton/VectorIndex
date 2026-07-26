@@ -29,18 +29,10 @@ let package = Package(
             publicHeadersPath: "include"
         ),
         .target(
-            name: "CS2RNG",
-            publicHeadersPath: "include",
-            cSettings: [
-                .define("S2_ENABLE_TELEMETRY", to: "1")
-            ]
-        ),
-        .target(
             name: "VectorIndex",
             dependencies: [
                 "CAtomicsShim",
                 "CPQEncode",
-                "CS2RNG",
                 .product(name: "VectorCore", package: "VectorCore")
             ],
             swiftSettings: [
