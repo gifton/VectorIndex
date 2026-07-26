@@ -342,17 +342,15 @@ public final class IVFListHandle {
                     .info("valid_range", "0..<\(k_c)")
                     .build()
             }
-            guard let (descs, _) = mmap.mmapLists() else {
+            guard let desc = mmap.getListDescriptor(listID: Int(listID)) else {
                 throw ErrorBuilder(.contractViolation, operation: "get_list_stats_durable")
                     .message("mmap list descriptors unavailable (internal error)")
                     .build()
             }
-            let i = Int(listID)
-            let dsc = descs[i]
-            let len = mmap.snapshotListLength(listID: i)
+            let len = mmap.snapshotListLength(listID: Int(listID))
             var out = IVFListStats()
             out.length = len
-            out.capacity = dsc.capacityHost(mmap.fileEndianness)
+            out.capacity = desc.capacity
             out.bytesIDs = out.capacity * idStrideBytes(opts)
             switch format {
             case .pq8, .pq4: out.bytesCodesOrVecs = out.capacity * codeBytesPerVector

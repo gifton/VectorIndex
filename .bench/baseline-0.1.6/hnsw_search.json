@@ -1,0 +1,53 @@
+{
+  "config" : {
+    "dim" : "384",
+    "efc" : "200",
+    "efs" : "64",
+    "index" : "hnsw",
+    "k" : "10",
+    "m" : "16",
+    "metric" : "euclidean",
+    "n" : "5000",
+    "nlist" : "64",
+    "nprobe" : "4",
+    "q" : "200"
+  },
+  "results" : [
+    {
+      "buildSeconds" : 0.000802459,
+      "dim" : 384,
+      "indexType" : "Flat",
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 5000,
+      "optimizeSeconds" : 0,
+      "params" : {
+
+      },
+      "q" : 200,
+      "recallAvg" : 1,
+      "searchAvgMs" : 1.4118185200000004,
+      "searchP95Ms" : 1.1495419999999998,
+      "throughputQps" : 708.3063338763963
+    },
+    {
+      "buildSeconds" : 14.907674625,
+      "dim" : 384,
+      "indexType" : "HNSW",
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 5000,
+      "optimizeSeconds" : 0,
+      "params" : {
+        "efc" : "200",
+        "efs" : "64",
+        "m" : "16"
+      },
+      "q" : 200,
+      "recallAvg" : 0.41100000000000003,
+      "searchAvgMs" : 2.2877623000000016,
+      "searchP95Ms" : 6.406333999999999,
+      "throughputQps" : 437.108348188096
+    }
+  ]
+}

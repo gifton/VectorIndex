@@ -669,52 +669,76 @@ public extension IndexOps.Rerank {
             }
         }
 
-        // Optionally elide missing candidates
+        // Select top-K using #05 TopK. Tie-break is deterministic by score per the metric's
+        // ordering, with ties broken by the smallest full-width (Int64) candidate id --
+        // matching the #40 kernel spec. The heap itself only carries Int32 ids, and feeding it
+        // truncated Int64 candidate ids is exactly the width-corruption bug A4 fixed, so we
+        // cannot hand it candIDs directly. Instead we feed an id-*rank* permutation: rank[i] is
+        // the position of the i-th scored candidate within the ascending-by-candID order of the
+        // candidates in play (unfiltered: all C; filtered: the present subset). Ranks are
+        // 0..<count so they always fit Int32 -- no width hazard -- and because rank order tracks
+        // candID order exactly, the heap's native "smaller id wins" tie-break becomes "smaller
+        // candID wins", including at the K-selection boundary itself: a post-extract sort of only
+        // the K survivors could not fix the boundary case, since the wrong element may already
+        // have been evicted before extraction. Cost: O(C log C) for the argsort, atop the
+        // O(C log K) heap; Phase 3's perf pass may revisit if this shows up in profiles.
         let useFiltered = opts.skipMissing
-        var filteredScores: [Float] = []
-        var filteredIDs32: [Int32] = []
-        var ids32All: [Int32] = []
+        let ordering = IndexOps.Selection.ordering(for: metric)
+        // positions[i] is the original candIDs index for the i-th scored entry fed to the heap.
+        var positions: [Int32] = []
+        var heapScores: [Float] = []
         if useFiltered {
-            filteredScores.reserveCapacity(C)
-            filteredIDs32.reserveCapacity(C)
+            positions.reserveCapacity(C)
+            heapScores.reserveCapacity(C)
             for i in 0..<C where presentMask[i] != 0 {
-                filteredScores.append(scores[i])
-                filteredIDs32.append(Int32(truncatingIfNeeded: candIDs.advanced(by: i).pointee))
+                heapScores.append(scores[i])
+                positions.append(Int32(i))
+            }
+        }
+        let Cf = useFiltered ? heapScores.count : C
+        // order[r] = index (into positions/heapScores for the filtered path, or directly into
+        // candIDs for the unfiltered path) holding the r-th smallest candidate id in play.
+        // Tie-break on equal ids falls back to index order (== position order), which only
+        // matters for duplicate ids and stays fully deterministic.
+        var order = Array(0..<Cf)
+        if useFiltered {
+            order.sort { a, b in
+                let ia = candIDs[Int(positions[a])], ib = candIDs[Int(positions[b])]
+                return ia != ib ? ia < ib : a < b
             }
         } else {
-            ids32All.reserveCapacity(C)
-            for i in 0..<C { ids32All.append(Int32(truncatingIfNeeded: candIDs.advanced(by: i).pointee)) }
+            order.sort { a, b in
+                let ia = candIDs[a], ib = candIDs[b]
+                return ia != ib ? ia < ib : a < b
+            }
         }
+        // ranks is the inverse permutation of order: ranks[idx] = rank of idx's candidate id.
+        var ranks = [Int32](repeating: 0, count: Cf)
+        for r in 0..<Cf { ranks[order[r]] = Int32(r) }
 
-        // Select top-K using #05 TopK (deterministic tie-break by id)
-        let ordering = IndexOps.Selection.ordering(for: metric)
         let selHeap: IndexOps.Selection.TopKHeap = {
             if useFiltered {
-                guard !filteredScores.isEmpty else { return IndexOps.Selection.TopKHeap(capacity: K, ordering: ordering) }
+                guard !heapScores.isEmpty else { return IndexOps.Selection.TopKHeap(capacity: K, ordering: ordering) }
                 return IndexOps.Selection.selectTopK_streaming(
-                    scores: filteredScores,
-                    ids: filteredIDs32,
-                    count: filteredScores.count,
-                    k: K,
-                    ordering: ordering
-                )
+                    scores: heapScores, ids: ranks, count: heapScores.count, k: K, ordering: ordering)
             } else {
                 return IndexOps.Selection.selectTopK_streaming(
-                    scores: scores,
-                    ids: ids32All,
-                    count: C,
-                    k: K,
-                    ordering: ordering
-                )
+                    scores: scores, ids: ranks, count: C, k: K, ordering: ordering)
             }
         }()
+        // TopKHeap's storage is posix_memalign-backed (see TopK.swift _allocateAligned) and is
+        // not reclaimed automatically -- both branches above (the empty-guard heap and the
+        // streaming heap) must be freed on every path, including early returns below.
+        defer { selHeap.deallocate() }
 
         let pairs = selHeap.extractSorted()
         let actual = min(K, pairs.count)
         // Emit results; pad if fewer than K present
         for i in 0..<actual {
+            let idx = order[Int(pairs[i].id)]
+            let pos = useFiltered ? Int(positions[idx]) : idx
             topScores[i] = pairs[i].score
-            topIDs[i]    = Int64(pairs[i].id)
+            topIDs[i]    = candIDs.advanced(by: pos).pointee
         }
         if actual < K {
             let sentinel = _missingSentinel(metric)

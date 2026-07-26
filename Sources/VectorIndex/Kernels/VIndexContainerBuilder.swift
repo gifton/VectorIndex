@@ -87,8 +87,17 @@ internal enum VIndexContainerBuilder {
         precondition(group == 4 || group == 8)
         let page = UInt64(getpagesize())
         let headerSize: UInt64 = 256
-        var tocCount: Int = 3 // ListsDesc, IDs, Codes/Vecs (+ optional IDMap)
-        let tocSize = UInt64(tocCount * MemoryLayout<_TOCEntry>.stride)
+        // On-disk TOC entries are packed 36 bytes (see writeTOCEntry below); MemoryLayout.stride
+        // on the in-memory-only _TOCEntry mirror would over-reserve due to struct padding.
+        let DISK_TOC_ENTRY_SIZE: UInt64 = 36
+        // Determine the FINAL entry count (including the optional IDMap entry) up front, before
+        // computing tocSize. Previously tocCount was captured into tocSize at 3 and only bumped
+        // to 4 later (below, once includeIDMap was known to require an IDMap entry); the 4th
+        // 36-byte TOC entry (writeTOCEntry(3, ...) / writeCRC(at: 3, ...)) was then written past
+        // the reserved region, physically overlapping the start of ListsDesc and clobbering list
+        // 0's descriptor `capacity` field with the IDMap section's CRC32.
+        let tocCount: Int = 3 + (includeIDMap ? 1 : 0) // ListsDesc, IDs, Codes/Vecs (+ optional IDMap)
+        let tocSize = UInt64(tocCount) * DISK_TOC_ENTRY_SIZE
 
         // Compute strides
         let idStride = (idBits == 32) ? MemoryLayout<UInt32>.stride : MemoryLayout<UInt64>.stride
@@ -137,7 +146,6 @@ internal enum VIndexContainerBuilder {
         var idMapOffset: UInt64 = 0
         var idMapSize: UInt64 = 0
         if includeIDMap {
-            tocCount += 1
             idMapOffset = off
             idMapSize = 2048 // Sufficient for typical IDMap snapshots (~1000 IDs)
             off = alignUpU64(idMapOffset &+ idMapSize, 64)
@@ -226,8 +234,7 @@ internal enum VIndexContainerBuilder {
             storeLE32(recBase.advanced(by: 52), 0)                                                         // reserved1
         }
 
-        // Build TOC entries (packed 36 bytes per entry)
-        let DISK_TOC_ENTRY_SIZE: UInt64 = 36
+        // Build TOC entries (packed 36 bytes per entry; DISK_TOC_ENTRY_SIZE defined above)
         @inline(__always) func writeTOCEntry(_ idx: Int, type: UInt32, offset: UInt64, size: UInt64, align: UInt32, flags: UInt32, crc32: UInt32, reserved: UInt32) {
             let basePtr = UnsafeMutableRawPointer(base).advanced(by: Int(tocOffset &+ UInt64(idx) &* DISK_TOC_ENTRY_SIZE))
             // Packed layout (36 bytes): type@0 (u32), offset@4 (u64), size@12 (u64), align@20 (u32), flags@24 (u32), crc@28 (u32), reserved@32 (u32)

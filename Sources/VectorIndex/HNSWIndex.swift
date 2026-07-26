@@ -186,6 +186,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         return query.withUnsafeBufferPointer { qbp in
             vectorStorage.withUnsafeBufferPointer { xbbp in
                 allowBits.withUnsafeBufferPointer { allowBP in
+                  withExtendedLifetime(csrOffsetsCache) { withExtendedLifetime(csrNeighborsCache) {
                     // Build pointer arrays for layers from cached CSR
                     let offPtrsOpt = csrOffsetsCache.map { arr in arr.withUnsafeBufferPointer { Optional($0.baseAddress!) } }
                     let nbrPtrsOpt = csrNeighborsCache.map { arr in arr.withUnsafeBufferPointer { Optional($0.baseAddress!) } }
@@ -221,6 +222,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                             return results
                         }
                     }
+                  } }
                 }
             }
         }
@@ -321,6 +323,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         let written = query.withUnsafeBufferPointer { qbp in
             ctx.vectorStorage.withUnsafeBufferPointer { xbbp in
                 ctx.allowBits.withUnsafeBufferPointer { allowBP in
+                  withExtendedLifetime(ctx.csrOffsets) { withExtendedLifetime(ctx.csrNeighbors) {
                     // Build pointer arrays for CSR layers
                     var offPtrs = [UnsafePointer<Int32>?]()
                     var nbrPtrs = [UnsafePointer<Int32>?]()
@@ -363,6 +366,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                             }
                         }
                     }
+                  } }
                 }
             }
         }
@@ -480,9 +484,8 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
     public func batchRemove(_ ids: [VectorID]) async throws {
         for id in ids { try await remove(id: id) }
-        entryPoint = nil
-        maxLevel = 0
-        activeCount = 0
+        // `remove()` -> `internalRemove()` already maintains entryPoint/activeCount
+        // per id; only the CSR/invNorms caches need invalidating for the batch.
         markCSRDirty(); markInvNormsDirty()
     }
 
@@ -677,46 +680,46 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
+    // Reverse-edge shrink for `idx`'s neighbor list at `level`. Reuses the exact
+    // diversity-heuristic kernel that insertion calls (`hnsw_select_neighbors_f32_swift`,
+    // Kernels/HNSWNeighborSelection.swift:132), treating idx's own vector as the
+    // reference point ("x_new") and its current neighbor list as the candidate set.
+    // This mirrors insertion's neighbor selection exactly and prevents the pathology
+    // where naive closest-M pruning discards every long bridge edge between
+    // well-separated clusters, disconnecting the navigable graph (A9,
+    // docs/verification-gap-analysis-p0.md §6.1; hnswlib applies the heuristic on
+    // both the insert and prune paths for the same reason).
     private func pruneNeighbors(of idx: Int, level: Int) {
-        // Use Kernel #34 prune via ephemeral CSR buffers for this layer/node.
         guard idx >= 0 && idx < nodes.count else { return }
         guard level >= 0 && level < nodes[idx].neighbors.count else { return }
         let current = nodes[idx].neighbors[level]
         if current.isEmpty { nodes[idx].neighbors[level].removeAll(keepingCapacity: false); return }
 
-        // Build minimal CSR for this layer: only node idx has neighbors.
         let N = nodes.count
-        var offsets = [Int32](repeating: 0, count: N + 1)
-        var neighborsL = [Int32]()
-        neighborsL.reserveCapacity(current.count)
-        for v in current { neighborsL.append(Int32(v)) }
-        offsets[idx] = 0
-        offsets[idx + 1] = Int32(neighborsL.count)
-
+        let candidateIDs = current.map { Int32($0) }
         let metric34 = Self.toHNSWMetric(metric)
         let invPtr = (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
+        let anchorOffset = nodes[idx].vectorOffset
 
-        // Call #34 prune with contiguous vectorStorage
-        var pruned = [Int32](repeating: -1, count: config.m)
-        let kept: Int = vectorStorage.withUnsafeBufferPointer { xbbp in
-            offsets.withUnsafeBufferPointer { obp in
-                neighborsL.withUnsafeBufferPointer { nbp in
-                    pruned.withUnsafeMutableBufferPointer { pbp in
-                        hnsw_prune_neighbors_f32_swift(
-                            u: Int32(idx),
-                            xb: xbbp.baseAddress!, d: dimension,
-                            offsetsL: obp.baseAddress!, neighborsL: nbp.baseAddress!,
-                            M: config.m, metric: metric34,
-                            optionalInvNorms: invPtr,
-                            N: N,
-                            prunedOut: pbp.baseAddress!
-                        )
-                    }
+        var selected = [Int32](repeating: -1, count: config.m)
+        let written: Int = vectorStorage.withUnsafeBufferPointer { xbbp in
+            let xNewPtr = xbbp.baseAddress! + anchorOffset
+            return candidateIDs.withUnsafeBufferPointer { cbp in
+                selected.withUnsafeMutableBufferPointer { sbp in
+                    hnsw_select_neighbors_f32_swift(
+                        x_new: xNewPtr, d: dimension,
+                        candidates: cbp.baseAddress!, candCount: candidateIDs.count,
+                        xb: xbbp.baseAddress!, N: N,
+                        M: config.m, layer: level,
+                        metric: metric34,
+                        optionalInvNorms: invPtr,
+                        selectedOut: sbp.baseAddress!
+                    )
                 }
             }
         }
-        if kept > 0 {
-            nodes[idx].neighbors[level] = Array(pruned.prefix(kept)).map { Int($0) }
+        if written > 0 {
+            nodes[idx].neighbors[level] = Array(selected.prefix(written)).map { Int($0) }
         } else {
             nodes[idx].neighbors[level].removeAll(keepingCapacity: false)
         }
