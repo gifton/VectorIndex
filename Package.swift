@@ -43,22 +43,6 @@ let package = Package(
                 "CS2RNG",
                 .product(name: "VectorCore", package: "VectorCore")
             ],
-            exclude: [
-                // Exclude scratch files relative to Sources/VectorIndex
-                // Note: residual kernel docs moved to /docs; no longer under Sources.
-                "Kernels/PQTrain.swift.new"
-            ],
-            swiftSettings: [
-                .enableExperimentalFeature("StrictConcurrency"),
-                .enableUpcomingFeature("ExistentialAny")
-            ]
-        ),
-        .executableTarget(
-            name: "L2SqrMicrobench",
-            dependencies: [
-                "VectorIndex",
-                .product(name: "VectorCore", package: "VectorCore")
-            ],
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency"),
                 .enableUpcomingFeature("ExistentialAny")
@@ -78,10 +62,6 @@ let package = Package(
         .testTarget(
             name: "VectorIndexTests",
             dependencies: ["VectorIndex"],
-            exclude: [
-                // Exclude temporary scratch tests (relative to Tests/VectorIndexTests)
-                "PQTrainTests.swift.tmp"
-            ],
             swiftSettings: [ .enableExperimentalFeature("StrictConcurrency") ]
         ),
     ]
