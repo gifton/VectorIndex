@@ -555,9 +555,12 @@ internal func ensureCentroidSqNorms(
             out[k] = sqnorm(base + k*dsub, dsub)
         }
     }
-    // We intentionally leak this buffer by returning an UnsafePointer
-    // to keep the API zero-copy and avoid per-subspace deallocs. In practice,
-    // pass precomputed norms via opts.centroidSqNorms for long-running pipelines.
+    // Ownership contract: when maybeSq == nil (the branch reached here), this function
+    // allocates a fresh [m*ks] buffer and the CALLER owns it. Every call site is responsible
+    // for freeing it -- each currently does so via an ownership-aware
+    // `defer { if ownsCSq { ... .deallocate() } }` guarding only the case where it was this
+    // function (not the caller) that allocated (added in the A6 fix). Pass precomputed norms
+    // via opts.centroidSqNorms to skip this allocation entirely for long-running pipelines.
     return UnsafePointer(buf)
 }
 

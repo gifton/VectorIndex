@@ -205,8 +205,9 @@ final class HNSWKNNGraphTests: XCTestCase {
     }
 
     // (g) Deletions: compacted rows, removed ids absent, neighbors still accurate.
-    // NOTE: uses per-id remove(id:) — batchRemove has a pre-existing state-reset bug
-    // (HNSWIndex.swift batchRemove), flagged in the PR as a separate ticket.
+    // NOTE: uses per-id remove(id:). batchRemove's state-reset bug (HNSWIndex.swift
+    // batchRemove) was fixed on this branch (A5); per-id removal here is just this test's
+    // fixture style, not a workaround for an outstanding bug.
     func testDeletionsCompaction() async throws {
         let n = 500, k = 10
         let data = generateDataset(count: n, dim: 16, seed: 31)
