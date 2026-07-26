@@ -726,6 +726,10 @@ public extension IndexOps.Rerank {
                     scores: scores, ids: ranks, count: C, k: K, ordering: ordering)
             }
         }()
+        // TopKHeap's storage is posix_memalign-backed (see TopK.swift _allocateAligned) and is
+        // not reclaimed automatically -- both branches above (the empty-guard heap and the
+        // streaming heap) must be freed on every path, including early returns below.
+        defer { selHeap.deallocate() }
 
         let pairs = selHeap.extractSorted()
         let actual = min(K, pairs.count)

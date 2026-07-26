@@ -109,4 +109,90 @@ final class RegressionA4_RerankIDWidthTests: XCTestCase {
         let outIDs = runEqualScoreTie(candIDs: [900, 800, 7], K: 2)
         XCTAssertEqual(Set(outIDs), Set<Int64>([7, 800]), "K-boundary tie must keep the two smallest ids")
     }
+
+    /// Exercises the `skipMissing: false` path, which `RerankOpts`'s default (`true`) otherwise
+    /// leaves with zero coverage. Candidates: id 500 (position 0) and id 3 (position 1) are an
+    /// exact-match score tie whose id order reverses position order, proving the *unfiltered*
+    /// rank permutation (built over all C candidates, not just the present subset -- see the
+    /// `useFiltered == false` branch in `rerank_exact_topk`) still ties-break by smallest
+    /// candidate id. Id 999 (position 2) is reported missing by the reader.
+    ///
+    /// Missing-candidate convention on the unfiltered path (read from `scoreBlock` in
+    /// ExactRerank.swift before writing this): a missing candidate is *not* removed from the
+    /// candidate stream. It keeps its slot, and `scoreBlock` assigns it the metric's missing
+    /// sentinel score (`_missingSentinel`: +infinity for euclidean/minimize metrics) so it always
+    /// loses the heap competition against any present candidate. It is only emitted when K is
+    /// large enough that no present candidate is left to evict it from the heap -- here K == C
+    /// == 3, so all three (including the missing one) must survive. Its slot carries the *real*
+    /// candidate id (999) and the sentinel score, not -1/padding: the `actual < K` padding branch
+    /// only fires when fewer than K entries survive the heap at all, which is not this case.
+    func testUnfilteredRerankMissingCandidateConvention() {
+        let d = 2
+        let idHigh: Int64 = 500     // position 0
+        let idLow: Int64 = 3        // position 1 -- smaller id, tied score with idHigh
+        let idMissing: Int64 = 999  // position 2 -- reader reports this one missing
+        let vec: [Float] = [1, 0]
+
+        let reader = IndexOps.Rerank.CallbackReader(dim: d) { ids, count, dst, present in
+            var found = 0
+            for i in 0..<count {
+                if ids[i] == idMissing {
+                    present[i] = 0
+                } else {
+                    dst[i*d + 0] = vec[0]; dst[i*d + 1] = vec[1]
+                    present[i] = 1; found += 1
+                }
+            }
+            return found
+        }
+
+        let q: [Float] = [1, 0]
+        let candIDs: [Int64] = [idHigh, idLow, idMissing]
+        let K = 3
+        var scores = [Float](repeating: 0, count: K)
+        var outIDs = [Int64](repeating: -1, count: K)
+
+        q.withUnsafeBufferPointer { qb in
+            candIDs.withUnsafeBufferPointer { cb in
+                scores.withUnsafeMutableBufferPointer { sb in
+                    outIDs.withUnsafeMutableBufferPointer { ib in
+                        let opts = IndexOps.Rerank.RerankOpts(backend: .callback, skipMissing: false)
+                        IndexOps.Rerank.rerank_exact_topk(
+                            q: qb.baseAddress!, d: d, metric: .euclidean,
+                            candIDs: cb.baseAddress!, C: candIDs.count, K: K,
+                            reader: reader, opts: opts,
+                            topScores: sb.baseAddress!, topIDs: ib.baseAddress!)
+                    }
+                }
+            }
+        }
+
+        // Tie-break by smallest id, despite reversed position order.
+        XCTAssertEqual(outIDs[0], idLow, "unfiltered tie must break by smallest candidate id")
+        XCTAssertEqual(scores[0], 0)
+        XCTAssertEqual(outIDs[1], idHigh)
+        XCTAssertEqual(scores[1], 0)
+
+        // Missing-candidate convention: kept in its slot (not dropped, not padded with -1),
+        // carrying the real id and the metric's missing-sentinel score.
+        XCTAssertEqual(outIDs[2], idMissing, "missing candidate must still be emitted on the unfiltered path")
+        XCTAssertTrue(scores[2].isInfinite && scores[2] > 0,
+                      "missing candidate score must be the euclidean (minimize) sentinel, +inf")
+    }
+
+    /// Leak-path smoke guard (scaled-down A6 pattern; see
+    /// PQEncodeParity_SwiftOnly_Tests.testRepeatedEncodeWithoutPrecomputedNormsIsStable).
+    /// `rerank_exact_topk` builds a fresh `TopKHeap` (posix_memalign-backed storage, see
+    /// TopK.swift `_allocateAligned`) on every call via `selHeap`; before the fix, every call
+    /// leaked it (both the empty-guard heap and the streaming heap). Drives the
+    /// allocate-then-free path 100 times and asserts byte-identical output each time -- a
+    /// misplaced `defer` (double-free, use-after-free, or no free at all under repeated
+    /// allocator pressure) would surface here as a crash or output drift.
+    func testRepeatedRerankTopKIsStable() {
+        let baseline = runEqualScoreTie(candIDs: [900, 800, 7], K: 2)
+        for _ in 0..<100 {
+            let outIDs = runEqualScoreTie(candIDs: [900, 800, 7], K: 2)
+            XCTAssertEqual(outIDs, baseline)
+        }
+    }
 }
