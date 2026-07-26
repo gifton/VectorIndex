@@ -669,9 +669,19 @@ public extension IndexOps.Rerank {
             }
         }
 
-        // Select top-K using #05 TopK (deterministic tie-break by position).
-        // IMPORTANT: never narrow the Int64 candidate ids; run the heap on positional
-        // indices (ids: nil) and map winners back through candIDs to preserve full width.
+        // Select top-K using #05 TopK. Tie-break is deterministic by score per the metric's
+        // ordering, with ties broken by the smallest full-width (Int64) candidate id --
+        // matching the #40 kernel spec. The heap itself only carries Int32 ids, and feeding it
+        // truncated Int64 candidate ids is exactly the width-corruption bug A4 fixed, so we
+        // cannot hand it candIDs directly. Instead we feed an id-*rank* permutation: rank[i] is
+        // the position of the i-th scored candidate within the ascending-by-candID order of the
+        // candidates in play (unfiltered: all C; filtered: the present subset). Ranks are
+        // 0..<count so they always fit Int32 -- no width hazard -- and because rank order tracks
+        // candID order exactly, the heap's native "smaller id wins" tie-break becomes "smaller
+        // candID wins", including at the K-selection boundary itself: a post-extract sort of only
+        // the K survivors could not fix the boundary case, since the wrong element may already
+        // have been evicted before extraction. Cost: O(C log C) for the argsort, atop the
+        // O(C log K) heap; Phase 3's perf pass may revisit if this shows up in profiles.
         let useFiltered = opts.skipMissing
         let ordering = IndexOps.Selection.ordering(for: metric)
         // positions[i] is the original candIDs index for the i-th scored entry fed to the heap.
@@ -685,14 +695,35 @@ public extension IndexOps.Rerank {
                 positions.append(Int32(i))
             }
         }
+        let Cf = useFiltered ? heapScores.count : C
+        // order[r] = index (into positions/heapScores for the filtered path, or directly into
+        // candIDs for the unfiltered path) holding the r-th smallest candidate id in play.
+        // Tie-break on equal ids falls back to index order (== position order), which only
+        // matters for duplicate ids and stays fully deterministic.
+        var order = Array(0..<Cf)
+        if useFiltered {
+            order.sort { a, b in
+                let ia = candIDs[Int(positions[a])], ib = candIDs[Int(positions[b])]
+                return ia != ib ? ia < ib : a < b
+            }
+        } else {
+            order.sort { a, b in
+                let ia = candIDs[a], ib = candIDs[b]
+                return ia != ib ? ia < ib : a < b
+            }
+        }
+        // ranks is the inverse permutation of order: ranks[idx] = rank of idx's candidate id.
+        var ranks = [Int32](repeating: 0, count: Cf)
+        for r in 0..<Cf { ranks[order[r]] = Int32(r) }
+
         let selHeap: IndexOps.Selection.TopKHeap = {
             if useFiltered {
                 guard !heapScores.isEmpty else { return IndexOps.Selection.TopKHeap(capacity: K, ordering: ordering) }
                 return IndexOps.Selection.selectTopK_streaming(
-                    scores: heapScores, ids: nil, count: heapScores.count, k: K, ordering: ordering)
+                    scores: heapScores, ids: ranks, count: heapScores.count, k: K, ordering: ordering)
             } else {
                 return IndexOps.Selection.selectTopK_streaming(
-                    scores: scores, ids: nil, count: C, k: K, ordering: ordering)
+                    scores: scores, ids: ranks, count: C, k: K, ordering: ordering)
             }
         }()
 
@@ -700,7 +731,8 @@ public extension IndexOps.Rerank {
         let actual = min(K, pairs.count)
         // Emit results; pad if fewer than K present
         for i in 0..<actual {
-            let pos = useFiltered ? Int(positions[Int(pairs[i].id)]) : Int(pairs[i].id)
+            let idx = order[Int(pairs[i].id)]
+            let pos = useFiltered ? Int(positions[idx]) : idx
             topScores[i] = pairs[i].score
             topIDs[i]    = candIDs.advanced(by: pos).pointee
         }
