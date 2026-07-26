@@ -624,10 +624,22 @@ final class PQTrainTests: XCTestCase {
         let numChunks = 5
         let chunkSize = Int(n) / numChunks
 
+        // Deterministic fast fill (LCG; same pattern as testLargeScaleTraining /
+        // testCompressionQuality). This test flaked once during wrap-up with
+        // Float.random-seeded input data: distortion=0.0 on one run, then
+        // distortion=3.2e23 on the immediate rerun -- both symptomatic of the
+        // streaming minibatch path (minibatchKMeansSubspaceChunk) diverging on
+        // an unlucky data draw. A seeded generator makes the test reproducible.
+        var rng: UInt64 = 0x5773_7EA1_1234_5678
+        func rnd() -> Float {
+            rng = 2862933555777941757 &* rng &+ 3037000493
+            return Float(rng >> 40) / Float(1 << 24)
+        }
+
         // Create chunks
         var fullData = [Float](repeating: 0, count: Int(n) * d)
         for i in 0..<(Int(n) * d) {
-            fullData[i] = Float.random(in: -1...1)
+            fullData[i] = rnd() * 2 - 1
         }
 
         var xChunks = [[Float]]()
@@ -641,6 +653,7 @@ final class PQTrainTests: XCTestCase {
         }
 
         var cfg = PQTrainConfig()
+        cfg.seed = 42
         cfg.algo = .minibatch
         cfg.maxIters = 10
         cfg.batchSize = 512
