@@ -1,3 +1,7 @@
+> **Superseded:** releases from 0.1.7 onward are recorded in the root
+> [`CHANGELOG.md`](../CHANGELOG.md). This file is the historical record of
+> earlier releases.
+
 ## 0.1.0-alpha (2025-10-22)
 
 Initial alpha release to unblock downstream packages.
