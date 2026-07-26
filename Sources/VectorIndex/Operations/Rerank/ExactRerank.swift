@@ -9,7 +9,6 @@ import Dispatch
 // - Provides backend-agnostic vector readers (DenseArray, IVFListVecs, Callback)
 // - Supports metrics: L2 (minimize), IP (maximize), Cosine (maximize)
 // - Honors options from kernel-spec (#40) including gather tiling and locality reorder
-// - Emits telemetry counters/timers (#46) when compiled with VINDEX_TELEM
 
 public extension IndexOps {
     enum Rerank {}
@@ -641,13 +640,6 @@ public extension IndexOps.Rerank {
         reader: any VectorReader, opts: RerankOpts,
         scoresOut: UnsafeMutablePointer<Float>
     ) {
-        #if VINDEX_TELEM
-        _ = TELEM_TIMER_GUARD(.t_rerank)
-        TELEM_FLAG(.used_prefetch) // advisory; locality reorder acts as prefetch surrogate
-        if metric == .cosine { TELEM_FLAG(.used_cosine) }
-        TELEM_INC(.vecs_scored, UInt64(C))
-        TELEM_ADD_BYTES(.vecs, UInt64(C * d * MemoryLayout<Float>.stride))
-        #endif
         scoreBlock(q: q, d: d, metric: metric, ids: candIDs, C: C, reader: reader, opts: opts, scoresOut: scoresOut, presentMaskOut: nil)
     }
 
@@ -744,11 +736,6 @@ public extension IndexOps.Rerank {
             let sentinel = _missingSentinel(metric)
             for i in actual..<K { topScores[i] = sentinel; topIDs[i] = -1 }
         }
-
-        #if VINDEX_TELEM
-        TELEM_SET64(.candidates_kept, UInt64(actual))
-        TELEM_INC(.topk_selected, UInt64(K))
-        #endif
     }
 
     // MARK: - Batched Top-K

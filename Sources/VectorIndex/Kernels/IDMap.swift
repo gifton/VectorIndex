@@ -12,7 +12,6 @@ internal struct IDMapOpts: Sendable {
     public var maxLoadFactor: Double = 0.875
     public var concurrency: IDMapConcurrency = .singleWriter
     public var enableBloom: Bool = false
-    public var enableTelemetry: Bool = false
     public static var `default`: IDMapOpts { IDMapOpts() }
 }
 

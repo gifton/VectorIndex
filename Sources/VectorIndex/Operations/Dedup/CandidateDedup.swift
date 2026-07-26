@@ -46,6 +46,7 @@ public struct VisitedOpts: Sendable {
     public let concurrency: ConcurrencyMode
     public let pageBits: Int          // For SparsePaged (IDs per page = 1 << pageBits)
     public let epochBits: Int         // For DenseEpoch wrap testing (8..32)
+    @available(*, deprecated, message: "Never read anywhere in DefaultVisitedSet; gates nothing. Scheduled for removal in Phase 4.")
     public let enableTelemetry: Bool
 
     public init(
