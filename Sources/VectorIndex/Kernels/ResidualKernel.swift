@@ -112,14 +112,6 @@ internal func _storeSIMD4(_ v: SIMD4<Float>, _ base: UnsafeMutablePointer<Float>
     raw.storeBytes(of: v, as: SIMD4<Float>.self)
 }
 
-@usableFromInline
-@inline(__always)
-internal func _prefetchRead(_ ptr: UnsafeRawPointer?) {
-    // Swift does not expose a portable prefetch intrinsic.
-    // Left intentionally as a no-op to keep option parity with spec.
-    _ = ptr
-}
-
 // MARK: - Core residual kernels
 
 /// Materialized residuals: r_out[i] = x[i] - coarse_centroids[coarseIDs[i]]
@@ -181,23 +173,10 @@ public func residuals_f32(
     }
 
     // Ungrouped / original order
-    let pd = max(0, opts.prefetchDistance)
     let nInt = Int(n)
     let d8 = (d / 8) * 8
 
     for i in 0..<nInt {
-        // Prefetch next vector & centroid (advisory)
-        if pd > 0 {
-            let f = i + pd
-            if f < nInt {
-                _prefetchRead(UnsafeRawPointer(x.advanced(by: f * d)))
-                let fa = Int(coarseIDs[f])
-                if !opts.checkBounds || (fa >= 0 && fa < opts.kc) {
-                    _prefetchRead(UnsafeRawPointer(coarseCentroids.advanced(by: fa * d)))
-                }
-            }
-        }
-
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {
@@ -274,22 +253,10 @@ public func residuals_f32_inplace(
         return
     }
 
-    let pd = max(0, opts.prefetchDistance)
     let nInt = Int(n)
     let d8 = (d / 8) * 8
 
     for i in 0..<nInt {
-        if pd > 0 {
-            let f = i + pd
-            if f < nInt {
-                _prefetchRead(UnsafeRawPointer(x_io.advanced(by: f * d)))
-                let fa = Int(coarseIDs[f])
-                if !opts.checkBounds || (fa >= 0 && fa < opts.kc) {
-                    _prefetchRead(UnsafeRawPointer(coarseCentroids.advanced(by: fa * d)))
-                }
-            }
-        }
-
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {

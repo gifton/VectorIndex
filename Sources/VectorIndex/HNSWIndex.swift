@@ -1165,42 +1165,6 @@ extension HNSWIndex {
     }
 }
 
-// MARK: - Neighbor selection heuristic
-private extension HNSWIndex {
-    // Select up to maxM diverse neighbors among candidate node indices for a given vector at level.
-    // Implements a simple diversity heuristic from HNSW: candidates are considered in increasing
-    // distance order; a candidate is selected if it is closer to the new point than to any already
-    // selected neighbor, promoting angular diversity.
-    func selectNeighbors(for vec: [Float], among candidates: [Int], level: Int, maxM: Int) -> [Int] {
-        // Sort candidates by distance to vec
-        var sorted: [(Int, Float)] = candidates.map { ($0, distance(vec, vectorArray(at: $0), metric: metric)) }
-        sorted.sort { $0.1 < $1.1 }
-        var selected: [Int] = []
-        selected.reserveCapacity(min(maxM, sorted.count))
-        for (cand, _) in sorted {
-            var good = true
-            let candVec = vectorArray(at: cand)
-            for s in selected {
-                // If candidate is much closer to an already selected neighbor than to the new point,
-                // skip it (encourage spread). Criterion: d(cand, s) < d(cand, new)
-                let d_cs = distance(candVec, vectorArray(at: s), metric: metric)
-                let d_cx = distance(candVec, vec, metric: metric)
-                if d_cs < d_cx { good = false; break }
-            }
-            if good { selected.append(cand) }
-            if selected.count >= maxM { break }
-        }
-        // Fallback: if too few selected, fill with nearest remaining
-        if selected.count < maxM {
-            for (cand, _) in sorted where !selected.contains(cand) {
-                selected.append(cand)
-                if selected.count >= maxM { break }
-            }
-        }
-        return selected
-    }
-}
-
 // MARK: - AccelerableIndex Implementation
 extension HNSWIndex {
     public func getCandidates(

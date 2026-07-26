@@ -57,29 +57,6 @@ public enum L2SqrTelemetryRecorder {
     @inline(__always) public static func record(_ t: L2SqrTelemetry) { sink?(t) }
 }
 
-// MARK: - Helper: Alignment verification (performance hint)
-//
-// Note: 16-byte alignment enables optimal SIMD performance, but unaligned data
-// is handled correctly (just slower). We verify alignment in debug builds for
-// performance profiling, but don't enforce it since Swift [Float] arrays are
-// not guaranteed to be aligned. The SIMD4<Float> operations handle unaligned
-// loads correctly, they're just slightly slower due to extra memory ops.
-
-@inline(__always)
-func _verifyAlignment(_ ptr: UnsafeRawPointer?, _ label: String, alignment: Int = 16) {
-    // Alignment check removed - Swift arrays are not guaranteed to be aligned,
-    // and SIMD4 operations handle unaligned data correctly (with minor perf impact)
-    // For optimal performance, users can pre-align data using:
-    //   UnsafeMutableRawBufferPointer.allocate(byteCount:alignment:)
-}
-
-// MARK: - Helper: Prefetch (hint-only; no-op on Swift)
-
-@inline(__always)
-func _prefetchRow(_ base: UnsafeRawPointer, _ byteStride: Int) {
-    _ = base; _ = byteStride
-}
-
 // MARK: - SIMD helpers
 
 extension SIMD4 where Scalar == Float {
@@ -108,11 +85,6 @@ public func l2sqr_f32_block(
     _ q_norm: Float = .nan,
     _ opts: UnsafePointer<L2SqrOpts>? = nil
 ) {
-    _verifyAlignment(q, "q")
-    _verifyAlignment(xb, "xb")
-    _verifyAlignment(out, "out")
-    if let xbNorm = xb_norm { _verifyAlignment(xbNorm, "xb_norm") }
-
     guard n > 0, d > 0 else { return }
 
     let options = opts?.pointee ?? .default
@@ -274,11 +246,7 @@ func _l2sqr_direct_generic(
     _ strict: Bool,
     _ prefetchDistance: Int
 ) {
-    let rowBytes = d * MemoryLayout<Float>.stride
     for i in 0..<n {
-        // Prefetch next row (hint only)
-        let pfRow = i + prefetchDistance
-        if pfRow < n { _prefetchRow(UnsafeRawPointer(xb + pfRow * d), rowBytes) }
         let x = xb + i * d
         out[i] = _l2sqr_single_direct(q: q, x: x, d: d, kahan: strict)
     }

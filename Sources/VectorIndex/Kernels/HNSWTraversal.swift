@@ -96,7 +96,6 @@ private struct MinHeap {
     if count < ef { ids.insert(id, at: lo); dists.insert(dist, at: lo); count &+= 1 } else { ids.removeLast(); dists.removeLast(); let clamped = min(lo, ids.count); ids.insert(id, at: clamped); dists.insert(dist, at: clamped) }
 }
 
-@inline(__always) private func selectBatchSize(_ d: Int) -> Int { if d <= 256 { return 64 }; if d <= 1024 { return 32 }; return 16 }
 private func scoreNeighborsBatch_f32(
     q: UnsafePointer<Float>, d: Int,
     xb: UnsafePointer<Float>, N: Int,
