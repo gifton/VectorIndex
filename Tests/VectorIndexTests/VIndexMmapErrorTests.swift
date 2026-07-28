@@ -170,4 +170,110 @@ final class VIndexMmapErrorTests: XCTestCase {
         let p = mmap(nil, size, PROT_READ | PROT_WRITE, MAP_FILE | MAP_SHARED, fd, 0)
         return (p == MAP_FAILED) ? nil : p
     }
+
+    // MARK: - WAL replay (B13) — no prior coverage existed for mmap_wal_replay at all.
+
+    /// Locates the ListsDesc section's file offset by parsing the header + TOC directly
+    /// (same technique as testSectionCRCMismatchThrows above), then overwrites list
+    /// `listID`'s packed `length` field (record-relative offset +4) in place.
+    private func setListLength(path: String, listID: Int, newLength: UInt32) throws {
+        let fd = Darwin.open(path, O_RDWR | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { _ = Darwin.close(fd) }
+        var hdrBuf = [UInt8](repeating: 0, count: 256)
+        _ = hdrBuf.withUnsafeMutableBytes { pread(fd, $0.baseAddress, 256, 0) }
+        let tocOffset = hdrBuf.withUnsafeBytes { readUnalignedLE64($0.baseAddress!.advanced(by: 56)) }
+        let tocEntries = Int(hdrBuf.withUnsafeBytes { readUnalignedLE32($0.baseAddress!.advanced(by: 64)) })
+        let DISK_TOC_ENTRY_SIZE = 36
+        var tocAll = [UInt8](repeating: 0, count: tocEntries * DISK_TOC_ENTRY_SIZE)
+        let tocBytes = tocAll.count
+        _ = tocAll.withUnsafeMutableBytes { pread(fd, $0.baseAddress, tocBytes, off_t(tocOffset)) }
+        var listsDescOffset: UInt64 = 0
+        var found = false
+        tocAll.withUnsafeBytes { raw in
+            for i in 0..<tocEntries {
+                let base = raw.baseAddress!.advanced(by: i * DISK_TOC_ENTRY_SIZE)
+                if readUnalignedLE32(base) == SectionType.listsDesc.rawValue {
+                    listsDescOffset = readUnalignedLE64(base.advanced(by: 4))
+                    found = true
+                    break
+                }
+            }
+        }
+        XCTAssertTrue(found, "ListsDesc TOC entry not found")
+        var v = newLength.littleEndian
+        let fieldOffset = off_t(listsDescOffset) + off_t(listID * 64 + 4)
+        _ = withUnsafeBytes(of: &v) { pwrite(fd, $0.baseAddress, 4, fieldOffset) }
+    }
+
+    func testWalReplayAppliesLengthFromValidCommitRecord() throws {
+        let path = tempPath()
+        let m = 4
+        let mmap = try VIndexContainerBuilder.createMinimalContainer(path: path, format: .pq8, k_c: 1, m: m, d: 0, idCap: 16, payloadCap: 16, includeIDMap: false)
+        defer {
+            try? mmap.close()
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+
+        let n = 3
+        let ids: [UInt64] = [10, 11, 12]
+        let codes = [UInt8](repeating: 7, count: n * m)
+        let res = try mmap.mmap_append_begin(listID: 0, addLen: n)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap.mmap_append_commit(res, idsSrc: UnsafeRawPointer(idBuf.baseAddress!), codesSrc: UnsafeRawPointer(codeBuf.baseAddress!), vecsSrc: nil)
+            }
+        }
+        XCTAssertEqual(mmap.getListDescriptor(listID: 0)?.length, n)
+
+        // Simulate a crash where the fsync'd WAL made it to disk but the separate,
+        // synchronous listsDesc-length write did not: roll the on-disk length back to 0.
+        try setListLength(path: path, listID: 0, newLength: 0)
+        XCTAssertEqual(mmap.getListDescriptor(listID: 0)?.length, 0, "sanity: rollback landed")
+
+        try mmap.mmap_wal_replay()
+        XCTAssertEqual(mmap.getListDescriptor(listID: 0)?.length, n,
+                       "replay must restore length from the validated WAL commit record")
+    }
+
+    func testWalReplayStopsAtCorruptAppendRecordCRC() throws {
+        let path = tempPath()
+        let m = 4
+        let mmap = try VIndexContainerBuilder.createMinimalContainer(path: path, format: .pq8, k_c: 1, m: m, d: 0, idCap: 16, payloadCap: 16, includeIDMap: false)
+        defer {
+            try? mmap.close()
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+
+        let n = 3
+        let ids: [UInt64] = [10, 11, 12]
+        let codes = [UInt8](repeating: 7, count: n * m)
+        let res = try mmap.mmap_append_begin(listID: 0, addLen: n)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap.mmap_append_commit(res, idsSrc: UnsafeRawPointer(idBuf.baseAddress!), codesSrc: UnsafeRawPointer(codeBuf.baseAddress!), vecsSrc: nil)
+            }
+        }
+        try setListLength(path: path, listID: 0, newLength: 0)
+
+        // Flip a byte inside the WAL append record's CRC field. writeWalAppend runs before
+        // writeWalCommit, so this is the very first record in the .wal file: WalAppend is
+        // 44 bytes (tag4+listID4+oldLen4+delta4+idsOff8+codesOff8+vecsOff8+crc32(4)), so its
+        // crc32 field is at absolute file offset 40..43.
+        let walPath = path + ".wal"
+        let walFD = Darwin.open(walPath, O_RDWR | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(walFD, 0)
+        defer { _ = Darwin.close(walFD) }
+        var crcByte: UInt8 = 0
+        _ = withUnsafeMutableBytes(of: &crcByte) { pread(walFD, $0.baseAddress, 1, 40) }
+        crcByte ^= 0xFF
+        _ = withUnsafeBytes(of: &crcByte) { pwrite(walFD, $0.baseAddress, 1, 40) }
+
+        try mmap.mmap_wal_replay()
+
+        XCTAssertEqual(mmap.getListDescriptor(listID: 0)?.length, 0,
+                       "corrupt append record must halt replay before the commit record is ever applied")
+    }
 }

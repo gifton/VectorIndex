@@ -45,10 +45,6 @@ public enum Endian: UInt8 { case little = 1, big = 2 }
     ((fileEndian == .little) == hostIsLittleEndian()) ? v : v.byteSwapped
 }
 
-@inline(__always) private func fromHost<T: FixedWidthInteger>(_ v: T, fileEndian: Endian) -> T {
-    ((fileEndian == .little) == hostIsLittleEndian()) ? v : v.byteSwapped
-}
-
 internal struct CRC32 {
     private static let table: [UInt32] = {
         (0..<256).map { i -> UInt32 in
@@ -57,13 +53,26 @@ internal struct CRC32 {
             return c
         }
     }()
-    @inline(__always) static func hash(_ data: UnsafeRawPointer, _ len: Int) -> UInt32 {
-        var c: UInt32 = 0xFFFF_FFFF
+
+    /// Resumable CRC32 update: feeds `data`/`len` into a running `state` so callers can
+    /// compute one CRC32 over several non-contiguous byte ranges (e.g. "all of a struct
+    /// except one 4-byte field") without first copying them into one contiguous buffer.
+    /// Start a fresh computation with `state = 0xFFFF_FFFF`; call `finalize(_:)` on the
+    /// last state returned to get the standard CRC32 value.
+    @inline(__always) static func update(_ state: UInt32, _ data: UnsafeRawPointer, _ len: Int) -> UInt32 {
+        var c = state
         let p = data.bindMemory(to: UInt8.self, capacity: len)
         for i in 0..<len {
             c = CRC32.table[Int((c ^ UInt32(p[i])) & 0xFF)] ^ (c >> 8)
         }
-        return c ^ 0xFFFF_FFFF
+        return c
+    }
+
+    /// Applies CRC32's final XOR to a running `update(_:_:_:)` state.
+    @inline(__always) static func finalize(_ state: UInt32) -> UInt32 { state ^ 0xFFFF_FFFF }
+
+    @inline(__always) static func hash(_ data: UnsafeRawPointer, _ len: Int) -> UInt32 {
+        finalize(update(0xFFFF_FFFF, data, len))
     }
 }
 
@@ -143,15 +152,20 @@ internal struct VIndexHeader {
 }
 
 @inline(__always) private func computeHeaderCRC(_ raw: UnsafeRawPointer) -> UInt32 {
-    // Copy header and zero the CRC field using struct field access (same as builder)
-    var buf = [UInt8](repeating: 0, count: 256)
-    memcpy(&buf, raw, 256)
-    // Zero the CRC field at its actual offset (68-71) via struct overlay
-    return buf.withUnsafeMutableBytes { bufPtr in
-        let hdrPtr = bufPtr.baseAddress!.assumingMemoryBound(to: VIndexHeader.self)
-        hdrPtr.pointee.header_crc32 = 0
-        return CRC32.hash(bufPtr.baseAddress!, 256)
-    }
+    // Two-region hash directly against the mapped header bytes: no 256-byte copy, and no
+    // write access needed (the mapping may be PROT_READ-only when opts.readOnly is set, so
+    // we must never mutate it). Must stay byte-for-byte equivalent to "zero the CRC field,
+    // then CRC32 all 256 bytes" (what the builder computes at write time in
+    // VIndexContainerBuilder.swift) — the 4 zeroed bytes still have to be fed into the
+    // running CRC, just from a local zero value instead of the live memory.
+    let crcOffset = MemoryLayout<VIndexHeader>.offset(of: \.header_crc32)! // 68
+    let crcSize = 4
+    var state = CRC32.update(0xFFFF_FFFF, raw, crcOffset)
+    var zero: UInt32 = 0
+    state = withUnsafeBytes(of: &zero) { CRC32.update(state, $0.baseAddress!, crcSize) }
+    let tailOffset = crcOffset + crcSize
+    state = CRC32.update(state, raw.advanced(by: tailOffset), 256 - tailOffset)
+    return CRC32.finalize(state)
 }
 
 internal struct MmapOpts {
@@ -219,6 +233,11 @@ internal final class IndexMmap {
     private var walFD: Int32 = -1
     private var walPath: String
 
+    /// Reusable scratch buffer for staging WAL record bytes before CRC32 hashing. Sized to
+    /// the larger of the two records' CRC'd prefixes (WalAppend's 40 bytes: tag..vecsOff).
+    /// Avoids a fresh heap allocation on every append/commit call.
+    private var walScratch = [UInt8](repeating: 0, count: 40)
+
     public static func open(path: String, opts: MmapOpts = .init()) throws -> IndexMmap {
         let flags = opts.readOnly ? O_RDONLY : O_RDWR
         let fd = Darwin.open(path, flags | O_CLOEXEC)
@@ -282,6 +301,10 @@ internal final class IndexMmap {
         }
         // Version policy: require major == 1 for current reader; minor is backward-compatible
         let verMajor = Int(toHost(hdr.version_major, fileEndian: fileEndian))
+        // NOTE(Phase-2 B13): verMinor is read and reported in error diagnostics only; it does
+        // not gate any behavior under the current single-format-version policy. Left as-is
+        // intentionally — not a bug, not wired up. See PHASE4-ROUTING if minor-version gating
+        // is ever introduced.
         let verMinor = Int(toHost(hdr.version_minor, fileEndian: fileEndian))
         guard verMajor == 1 else {
             munmap(base, Int(fileSize))
@@ -850,7 +873,19 @@ internal final class IndexMmap {
             guard let tagBytes = readExact(4) else { break }
             let tag = tagBytes.withUnsafeBytes { UInt32(littleEndian: $0.load(as: UInt32.self)) }
             if tag == WAL_APPEND_TAG {
-                _ = readExact(recordSizeAppend - 4)
+                guard let rest = readExact(recordSizeAppend - 4) else { break }
+                // rest = listID(4) oldLen(4) delta(4) idsOff(8) codesOff(8) vecsOff(8) crc32(4) = 40 bytes
+                let storedCRC = rest.withUnsafeBytes { UInt32(littleEndian: $0.load(fromByteOffset: 36, as: UInt32.self)) }
+                var payload = [UInt8](repeating: 0, count: recordSizeAppend - 4) // tag + listID..vecsOff = 40 bytes
+                tagBytes.withUnsafeBytes { payload.replaceSubrange(0..<4, with: $0) }
+                payload.replaceSubrange(4..<(recordSizeAppend - 4), with: rest[0..<(recordSizeAppend - 8)])
+                let calc = payload.withUnsafeBytes { CRC32.hash($0.baseAddress!, payload.count) }
+                // A torn/corrupt append record means the log is unreliable from here on —
+                // stop replay, exactly like the WAL_COMMIT_TAG branch already does on its
+                // own CRC mismatch. Append records don't themselves drive recovered state
+                // (only WAL_COMMIT_TAG's newLen does); this CRC is validated purely to
+                // detect corruption and halt before trusting anything that follows it.
+                if calc != storedCRC { break }
             } else if tag == WAL_COMMIT_TAG {
                 guard let rest = readExact(recordSizeCommit - 4) else { break }
                 let listID = rest.withUnsafeBytes { UInt32(littleEndian: $0.load(fromByteOffset: 0, as: UInt32.self)) }
@@ -993,15 +1028,14 @@ internal final class IndexMmap {
 
     private func writeWalAppend(listID: Int, oldLen: Int, delta: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64) throws {
         var rec = WalAppend(tag: WAL_APPEND_TAG.littleEndian, listID: UInt32(listID).littleEndian, oldLen: UInt32(oldLen).littleEndian, delta: UInt32(delta).littleEndian, idsOff: idsOff.littleEndian, codesOff: codesOff.littleEndian, vecsOff: vecsOff.littleEndian, crc32: 0)
-        var tmp = [UInt8](repeating: 0, count: MemoryLayout<WalAppend>.size - 4)
-        withUnsafeBytes(of: rec.tag) { tmp.replaceSubrange(0..<4, with: $0) }
-        withUnsafeBytes(of: rec.listID) { tmp.replaceSubrange(4..<8, with: $0) }
-        withUnsafeBytes(of: rec.oldLen) { tmp.replaceSubrange(8..<12, with: $0) }
-        withUnsafeBytes(of: rec.delta) { tmp.replaceSubrange(12..<16, with: $0) }
-        withUnsafeBytes(of: rec.idsOff) { tmp.replaceSubrange(16..<24, with: $0) }
-        withUnsafeBytes(of: rec.codesOff) { tmp.replaceSubrange(24..<32, with: $0) }
-        withUnsafeBytes(of: rec.vecsOff) { tmp.replaceSubrange(32..<40, with: $0) }
-        let crc = tmp.withUnsafeBytes { CRC32.hash($0.baseAddress!, tmp.count) }
+        withUnsafeBytes(of: rec.tag) { walScratch.replaceSubrange(0..<4, with: $0) }
+        withUnsafeBytes(of: rec.listID) { walScratch.replaceSubrange(4..<8, with: $0) }
+        withUnsafeBytes(of: rec.oldLen) { walScratch.replaceSubrange(8..<12, with: $0) }
+        withUnsafeBytes(of: rec.delta) { walScratch.replaceSubrange(12..<16, with: $0) }
+        withUnsafeBytes(of: rec.idsOff) { walScratch.replaceSubrange(16..<24, with: $0) }
+        withUnsafeBytes(of: rec.codesOff) { walScratch.replaceSubrange(24..<32, with: $0) }
+        withUnsafeBytes(of: rec.vecsOff) { walScratch.replaceSubrange(32..<40, with: $0) }
+        let crc = walScratch.withUnsafeBytes { CRC32.hash($0.baseAddress!, 40) }
         rec.crc32 = crc.littleEndian
         var r = rec
         let wrote = withUnsafeBytes(of: &r) { write(walFD, $0.baseAddress!, $0.count) }
@@ -1023,10 +1057,9 @@ internal final class IndexMmap {
 
     private func writeWalCommit(listID: Int, newLen: Int) throws {
         var rec = WalCommit(tag: WAL_COMMIT_TAG.littleEndian, listID: UInt32(listID).littleEndian, newLen: UInt32(newLen).littleEndian, crc32: 0)
-        var tmp = [UInt8](repeating: 0, count: 8)
-        withUnsafeBytes(of: rec.listID) { tmp.replaceSubrange(0..<4, with: $0) }
-        withUnsafeBytes(of: rec.newLen) { tmp.replaceSubrange(4..<8, with: $0) }
-        let crc = tmp.withUnsafeBytes { CRC32.hash($0.baseAddress!, 8) }
+        withUnsafeBytes(of: rec.listID) { walScratch.replaceSubrange(0..<4, with: $0) }
+        withUnsafeBytes(of: rec.newLen) { walScratch.replaceSubrange(4..<8, with: $0) }
+        let crc = walScratch.withUnsafeBytes { CRC32.hash($0.baseAddress!, 8) }
         rec.crc32 = crc.littleEndian
         var r = rec
         let wrote = withUnsafeBytes(of: &r) { write(walFD, $0.baseAddress!, $0.count) }
