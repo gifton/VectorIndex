@@ -451,20 +451,5 @@ private func _l2sqr_block_dot_fused_serial(
 
 @inline(__always)
 func _normSquared(_ v: UnsafePointer<Float>, _ d: Int) -> Float {
-    var a0 = SIMD4<Float>.zero, a1 = SIMD4<Float>.zero, a2 = SIMD4<Float>.zero, a3 = SIMD4<Float>.zero
-    var j = 0
-    while j + 15 < d {
-        let v0 = SIMD4<Float>(v + j + 0)
-        let v1 = SIMD4<Float>(v + j + 4)
-        let v2 = SIMD4<Float>(v + j + 8)
-        let v3 = SIMD4<Float>(v + j + 12)
-        a0 += v0 * v0
-        a1 += v1 * v1
-        a2 += v2 * v2
-        a3 += v3 * v3
-        j += 16
-    }
-    var sum = (a0 + a1 + a2 + a3).sum()
-    for t in j..<d { let val = v[t]; sum += val * val }
-    return sum
+    IndexOps.Support.Norms.l2NormSquared(vector: v, dimension: d)
 }
