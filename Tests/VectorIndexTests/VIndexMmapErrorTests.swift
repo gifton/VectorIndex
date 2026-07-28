@@ -18,23 +18,6 @@ final class VIndexMmapErrorTests: XCTestCase {
         memcpy(&v, p, 8)
         return UInt64(littleEndian: v)
     }
-    // Local CRC32 for tests (matches builder logic)
-    private struct CRC32 {
-        static let table: [UInt32] = {
-            (0..<256).map { i -> UInt32 in
-                var c = UInt32(i)
-                for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1) }
-                return c
-            }
-        }()
-        @inline(__always) static func hash(_ data: UnsafeRawPointer, _ len: Int) -> UInt32 {
-            var c: UInt32 = 0xFFFF_FFFF
-            let p = data.bindMemory(to: UInt8.self, capacity: len)
-            for i in 0..<len { c = CRC32.table[Int((c ^ UInt32(p[i])) & 0xFF)] ^ (c >> 8) }
-            return c ^ 0xFFFF_FFFF
-        }
-    }
-
     private func tempPath(_ suffix: String = ".vindex") -> String {
         URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("vindex_test_\(UUID().uuidString)\(suffix)").path
     }

@@ -12,48 +12,12 @@ import Glibc
 
 @inline(__always) private func alignUpU64(_ x: UInt64, _ a: UInt64) -> UInt64 { let m = a &- 1; return (x &+ m) & ~m }
 
-// Local CRC32 for builder (duplicate of VIndexMmap.swift but self-contained)
-private struct _CRC32 {
-    private static let table: [UInt32] = {
-        (0..<256).map { i -> UInt32 in
-            var c = UInt32(i)
-            for _ in 0..<8 { c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1) }
-            return c
-        }
-    }()
-    @inline(__always) static func hash(_ data: UnsafeRawPointer, _ len: Int) -> UInt32 {
-        var c: UInt32 = 0xFFFF_FFFF
-        let p = data.bindMemory(to: UInt8.self, capacity: len)
-        for i in 0..<len {
-            c = _CRC32.table[Int((c ^ UInt32(p[i])) & 0xFF)] ^ (c >> 8)
-        }
-        return c ^ 0xFFFF_FFFF
-    }
-}
-
-// These mirror VIndexMmap.swift disk structs
-private struct _TOCEntry { var type: UInt32; var offset: UInt64; var size: UInt64; var align: UInt32; var flags: UInt32; var crc32: UInt32; var reserved: UInt32 }
-private struct _Header {
-    var magic: UInt64
-    var version_major: UInt16
-    var version_minor: UInt16
-    var endianness: UInt8
-    var arch: UInt8
-    var flags: UInt32
-    var d: UInt32
-    var m: UInt16
-    var ks: UInt16
-    var kc: UInt32
-    var id_bits: UInt8
-    var code_group_g: UInt8
-    var reservedA: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8)
-    var N_total: UInt64
-    var generation: UInt64
-    var toc_offset: UInt64
-    var toc_entries: UInt32
-    var header_crc32: UInt32
-    var reservedRest: (UInt64, UInt64, UInt64, UInt64, UInt64, UInt64, UInt64)
-}
+// CRC32 and the disk-layout structs (VIndexHeader, TOCEntry) are shared with
+// VIndexMmap.swift (Sources/VectorIndex/Kernels/VIndexMmap.swift) — both `internal` in
+// this module. Phase-2 (B11) dedup of what used to be byte-identical `_CRC32`/`_Header`/
+// `_TOCEntry` mirrors defined locally in this file. `ListDesc` has no builder-side mirror
+// to dedup (the builder writes ListsDesc records via raw packed offsets, never via a
+// named struct) — that is unchanged, out of scope for B11.
 
 // Public builder API
 internal enum VIndexContainerBuilder {
@@ -88,7 +52,10 @@ internal enum VIndexContainerBuilder {
         let page = UInt64(getpagesize())
         let headerSize: UInt64 = 256
         // On-disk TOC entries are packed 36 bytes (see writeTOCEntry below); MemoryLayout.stride
-        // on the in-memory-only _TOCEntry mirror would over-reserve due to struct padding.
+        // on an in-memory struct mirror would over-reserve due to struct padding, so entries
+        // are written via raw offsets rather than by binding memory to VIndexMmap.swift's
+        // `TOCEntry` (which is `internal` for read-side symmetry but not used here — see the
+        // file-header dedup note above).
         let DISK_TOC_ENTRY_SIZE: UInt64 = 36
         // Determine the FINAL entry count (including the optional IDMap entry) up front, before
         // computing tocSize. Previously tocCount was captured into tocSize at 3 and only bumped
@@ -260,7 +227,7 @@ internal enum VIndexContainerBuilder {
         // Compute CRCs over sections and write back into TOC entries
         func writeCRC(at index: Int, offset: UInt64, size: UInt64) {
             let p = UnsafeRawPointer(base).advanced(by: Int(offset))
-            let c = _CRC32.hash(p, Int(size))
+            let c = CRC32.hash(p, Int(size))
             let crcPtr = UnsafeMutableRawPointer(base).advanced(by: Int(tocOffset &+ UInt64(index) &* DISK_TOC_ENTRY_SIZE + 28))
             storeLE32(crcPtr, c)
         }
@@ -270,7 +237,7 @@ internal enum VIndexContainerBuilder {
         if includeIDMap { writeCRC(at: 3, offset: idMapOffset, size: idMapSize) }
 
         // Write header with CRC
-        let hdr = _Header(
+        let hdr = VIndexHeader(
             magic: UInt64(0x00585845444E4956),
             version_major: 1,
             version_minor: 0,
@@ -292,11 +259,11 @@ internal enum VIndexContainerBuilder {
             reservedRest: (0, 0, 0, 0, 0, 0, 0)
         )
         // Compute header CRC over 256 bytes with crc field zeroed
-        let hdrPtr = UnsafeMutableRawPointer(base).assumingMemoryBound(to: _Header.self)
+        let hdrPtr = UnsafeMutableRawPointer(base).assumingMemoryBound(to: VIndexHeader.self)
         hdrPtr.pointee = hdr
         // Zero CRC field in place then compute
         hdrPtr.pointee.header_crc32 = 0
-        let crc = _CRC32.hash(UnsafeRawPointer(hdrPtr), 256)
+        let crc = CRC32.hash(UnsafeRawPointer(hdrPtr), 256)
         hdrPtr.pointee.header_crc32 = crc
 
         // Sync to disk

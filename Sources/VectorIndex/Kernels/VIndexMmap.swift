@@ -101,7 +101,7 @@ internal struct ListDesc {
     @inline(__always) func vecsStrideHost(_ e: Endian) -> Int { Int(toHost(vecs_stride, fileEndian: e)) }
 }
 
-private struct TOCEntry {
+internal struct TOCEntry {
     var type: UInt32
     var offset: UInt64
     var size: UInt64
@@ -117,7 +117,7 @@ private struct TOCEntry {
     @inline(__always) func crcHost(_ e: Endian) -> UInt32 { toHost(crc32, fileEndian: e) }
 }
 
-private struct VIndexHeader {
+internal struct VIndexHeader {
     var magic: UInt64
     var version_major: UInt16
     var version_minor: UInt16
