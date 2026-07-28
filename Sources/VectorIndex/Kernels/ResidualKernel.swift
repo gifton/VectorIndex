@@ -260,12 +260,7 @@ public func residuals_f32_inplace(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < opts.kc else {
-                throw ErrorBuilder(.invalidRange, operation: "residuals_compute")
-                    .message("Coarse assignment ID out of valid range")
-                    .info("coarse_id", "\(a)")
-                    .info("valid_range", "0..<\(opts.kc)")
-                    .info("vector_index", "\(i)")
-                    .build()
+                throw ResidualError.invalidCoarseID
             }
         }
 
@@ -322,15 +317,10 @@ internal func _residuals_grouped(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < kc else {
-                throw ErrorBuilder(.invalidRange, operation: "residuals_grouped")
-                    .message("Coarse assignment ID out of valid range")
-                    .info("coarse_id", "\(a)")
-                    .info("valid_range", "0..<\(kc)")
-                    .info("vector_index", "\(i)")
-                    .build()
+                throw ResidualError.invalidCoarseID
             }
         }
-        counts[a] += 1  // ✅ Fixed: regular += instead of &+=
+        counts[a] += 1
     }
 
     // 2) offsets (prefix sum)
@@ -344,7 +334,7 @@ internal func _residuals_grouped(
         let a = Int(coarseIDs[i])
         let pos = offsets[a] + cursor[a]
         grouped[pos] = i
-        cursor[a] += 1  // ✅ Fixed: regular += instead of &+=
+        cursor[a] += 1
     }
 
     // 4) process group by group
@@ -407,15 +397,10 @@ internal func _residuals_grouped_inplace(
         let a = Int(coarseIDs[i])
         if opts.checkBounds {
             guard a >= 0 && a < kc else {
-                throw ErrorBuilder(.invalidRange, operation: "residuals_grouped_inplace")
-                    .message("Coarse assignment ID out of valid range")
-                    .info("coarse_id", "\(a)")
-                    .info("valid_range", "0..<\(kc)")
-                    .info("vector_index", "\(i)")
-                    .build()
+                throw ResidualError.invalidCoarseID
             }
         }
-        counts[a] += 1  // ✅ Fixed: regular += instead of &+=
+        counts[a] += 1
     }
     var offsets = [Int](repeating: 0, count: kc + 1)
     for c in 0..<kc { offsets[c + 1] = offsets[c] + counts[c] }
@@ -426,7 +411,7 @@ internal func _residuals_grouped_inplace(
         let a = Int(coarseIDs[i])
         let pos = offsets[a] + cursor[a]
         grouped[pos] = i
-        cursor[a] += 1  // ✅ Fixed: regular += instead of &+=
+        cursor[a] += 1
     }
 
     let d8 = (d / 8) * 8
@@ -465,13 +450,6 @@ internal func _residuals_grouped_inplace(
 }
 
 // MARK: - Notes / Integration
-//
-// ✅ **Fixed Issues**:
-// 1. Replaced &+= with += (no overflow expected)
-// 2. Added proper throws error handling
-// 3. Integrated Accelerate framework (vDSP) for d >= 256
-// 4. Removed hot-path allocations (fused functions now call existing PQ kernels)
-// 5. Mathematical documentation added
 //
 // **Integration with existing kernels**:
 // - For fused residual encoding, call `pq_encode_residual_u8_f32` from PQEncode.swift
