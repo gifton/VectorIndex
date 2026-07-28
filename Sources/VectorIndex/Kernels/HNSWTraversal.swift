@@ -39,36 +39,6 @@ public enum HNSWTelemetryRecorder { public nonisolated(unsafe) static var record
 }
 @inline(__always) private func clampID(_ v: Int32, N: Int) -> Int? { let x = Int(v); return (x >= 0 && x < N) ? x : nil }
 
-@inline(__always) private func dot_f32(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ d: Int) -> Float {
-    var acc: Float = 0; var i = 0; let u = d & ~3
-    while i < u { acc += a[i]*b[i] + a[i+1]*b[i+1] + a[i+2]*b[i+2] + a[i+3]*b[i+3]; i += 4 }
-    while i < d { acc += a[i] * b[i]; i += 1 }
-    return acc
-}
-@inline(__always) private func l2sq_f32(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ d: Int) -> Float {
-    var acc: Float = 0; var i = 0; let u = d & ~3
-    while i < u {
-        let d0 = a[i]-b[i], d1 = a[i+1]-b[i+1], d2 = a[i+2]-b[i+2], d3 = a[i+3]-b[i+3]
-        acc += d0*d0; acc += d1*d1; acc += d2*d2; acc += d3*d3; i += 4
-    }
-    while i < d { let dv = a[i]-b[i]; acc += dv*dv; i += 1 }
-    return acc
-}
-@inline(__always) private func invnorm_f32(_ a: UnsafePointer<Float>, _ d: Int) -> Float {
-    let n = sqrtf(max(1e-12, dot_f32(a, a, d))); return 1.0 / n
-}
-@inline(__always) private func distance_f32(q: UnsafePointer<Float>, d: Int, x: UnsafePointer<Float>, metric: HNSWMetric, qInv: Float?, xInv: Float?) -> Float {
-    switch metric {
-    case .L2: return l2sq_f32(q, x, d)
-    case .IP: return -dot_f32(q, x, d)
-    case .COSINE:
-        let qi = qInv ?? invnorm_f32(q, d)
-        let xi = xInv ?? invnorm_f32(x, d)
-        let sim = dot_f32(q, x, d) * qi * xi
-        return 1.0 - sim
-    }
-}
-
 private struct HeapNode { var dist: Float; var id: Int32 }
 private struct MinHeap {
     var dists: [Float] = []; var ids: [Int32] = []
@@ -175,7 +145,7 @@ private var scoringAccum_ns: UInt64 = 0
 private func greedyDescent_core(q: UnsafePointer<Float>, d: Int, entryPoint: Int32, maxLevel: Int32, offsetsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, neighborsPerLayer: UnsafePointer<UnsafePointer<Int32>?>, xb: UnsafePointer<Float>, N: Int, metric: HNSWMetric, invNorms: UnsafePointer<Float>?, qInvNorm: Float? = nil) -> Int32 {
     guard N > 0, d > 0, entryPoint >= 0, entryPoint < Int32(N) else { return -1 }
     var current = Int(entryPoint)
-    let qInv: Float? = (metric == .COSINE) ? (qInvNorm ?? invnorm_f32(q, d)) : nil
+    let qInv: Float? = (metric == .COSINE) ? (qInvNorm ?? ns_invnorm_f32(q, d)) : nil
     #if ENABLE_TELEMETRY
     let t0 = DispatchTime.now().uptimeNanoseconds
     #endif
@@ -184,7 +154,7 @@ private func greedyDescent_core(q: UnsafePointer<Float>, d: Int, entryPoint: Int
         while lvl >= 1 {
             guard let offsets = offsetsPerLayer.advanced(by: lvl).pointee, let neigh = neighborsPerLayer.advanced(by: lvl).pointee else { return -1 }
             var bestID = current
-            var bestDist = distance_f32(q: q, d: d, x: xb.advanced(by: current * d), metric: metric, qInv: qInv, xInv: (metric == .COSINE ? invNorms?.advanced(by: current).pointee : nil))
+            var bestDist = ns_distance_f32(a: q, b: xb.advanced(by: current * d), d: d, metric: metric, invA: qInv, invB: (metric == .COSINE ? invNorms?.advanced(by: current).pointee : nil))
             var improved = true
             while improved {
                 improved = false
@@ -220,7 +190,7 @@ private var candidatesPushedCount: Int = 0
 private func efSearch_core(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offsetsL0: UnsafePointer<Int32>, neighborsL0: UnsafePointer<Int32>, xb: UnsafePointer<Float>, N: Int, ef: Int, metric: HNSWMetric, allowBits: UnsafePointer<UInt64>?, allowN: Int, invNorms: UnsafePointer<Float>?, qInvNorm: Float? = nil, idsOut: UnsafeMutablePointer<Int32>, distsOut: UnsafeMutablePointer<Float>) -> Int {
     if N <= 0 || d <= 0 || ef <= 0 { return -1 }
     guard enterL0 >= 0 && enterL0 < Int32(N) else { return -1 }
-    let qInv: Float? = (metric == .COSINE) ? (qInvNorm ?? invnorm_f32(q, d)) : nil
+    let qInv: Float? = (metric == .COSINE) ? (qInvNorm ?? ns_invnorm_f32(q, d)) : nil
     let allowDomain = (allowBits != nil && allowN > 0) ? allowN : 0
     let visitedWords = (N + 63) >> 6
     let visited = UnsafeMutablePointer<UInt64>.allocate(capacity: visitedWords)
@@ -231,7 +201,7 @@ private func efSearch_core(q: UnsafePointer<Float>, d: Int, enterL0: Int32, offs
     var resCount = 0
     let enterIdx = Int(enterL0)
     let enterX = xb.advanced(by: enterIdx * d)
-    let enterDist = distance_f32(q: q, d: d, x: enterX, metric: metric, qInv: qInv, xInv: nil)
+    let enterDist = ns_distance_f32(a: q, b: enterX, d: d, metric: metric, invA: qInv, invB: nil)
     _ = visitedTestAndSet(visited, enterIdx)
     cand.push(HeapNode(dist: enterDist, id: enterL0))
     resultInsert(ids: &resIDs, dists: &resD, count: &resCount, capacity: ef, id: enterL0, dist: enterDist)
