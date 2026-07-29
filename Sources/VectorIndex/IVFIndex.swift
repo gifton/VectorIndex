@@ -262,7 +262,21 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
+    // Protocol witness: a defaulted-parameter method cannot satisfy the zero-arg
+    // VectorIndexProtocol.optimize() requirement, so this thin forwarder keeps the
+    // protocol (and every existential/generic call site) untouched while the
+    // parameterized overload below carries the real implementation. Direct calls
+    // to ivf.optimize() resolve here (exact match beats default-fill) — identical
+    // behavior either way.
     public func optimize() async throws {
+        try await optimize(maxIterations: 20)
+    }
+
+    // B18: maxIterations defaults to 20 (this method's previous hardcoded value),
+    // so every existing zero-argument call site (ivf.optimize()) is unaffected.
+    // optimizeKMeans(maxIterations:) below now delegates here instead of running
+    // its own divergent copy.
+    public func optimize(maxIterations: Int = 20) async throws {
         // Build centroids with CPU Lloyd's KMeans and assign points to lists
         // Use k = min(nlist, store.count)
         guard !store.isEmpty else {
@@ -270,8 +284,19 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
         let k = max(1, min(config.nlist, store.count))
         // Initialize centroids using deterministic k‑means++ (farthest‑point) seeding
+        //
+        // Phase-3 (P3) overlap note, not fixed here: kmeansPlusPlusInitRandom and
+        // kmeans each independently re-derive the same flat [Float] from store (two
+        // O(N*d) materializations where one shared buffer would do), and
+        // nearestCentroidIndex below re-scans every vector against every centroid
+        // (O(N*k)) even though kmeans's underlying kmeans_minibatch_f32 call already
+        // ran with computeAssignments: false -- flipping that to true and wiring
+        // assignOut: would eliminate the rescan entirely. Both are real perf
+        // opportunities the Phase-2 research brief flagged as overlapping Phase 3's
+        // mandate (behavior-neutral cleanup is Phase 2's job, perf is Phase 3's);
+        // left for Phase 3 to pick up under its benchmark gate.
         let initialCentroids = try kmeansPlusPlusInitRandom(k: k, seed: 42)
-        centroids = try await kmeans(centroids: initialCentroids, maxIterations: 20)
+        centroids = try await kmeans(centroids: initialCentroids, maxIterations: maxIterations)
         // Build inverted lists
         lists = Array(repeating: [], count: centroids.count)
         idToListIndex.removeAll(keepingCapacity: false)
@@ -283,16 +308,15 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-    // MARK: - KMeans scaffolding (to be implemented)
+    // MARK: - KMeans scaffolding
+    // B18: was a standalone copy that diverged non-cosmetically from optimize() --
+    // it never populated idToListIndex and never bounds-guarded the list-array
+    // write (lists[ci].append with no lists.indices.contains(ci) guard). Zero
+    // callers and zero test coverage existed for this method before this task (see
+    // the Phase-2 research brief, B18). Now a thin delegating wrapper, which fixes
+    // both bugs by construction since there's no separate body left to diverge in.
     public func optimizeKMeans(maxIterations: Int = 15) async throws {
-        guard !store.isEmpty else { centroids.removeAll(); lists.removeAll(); return }
-        let k = max(1, min(config.nlist, store.count))
-        let initC = try kmeansPlusPlusInitRandom(k: k, seed: 42)
-        centroids = try await kmeans(centroids: initC, maxIterations: maxIterations)
-        lists = Array(repeating: [], count: centroids.count)
-        for (id, (vec, _)) in store {
-            if let ci = nearestCentroidIndex(for: vec) { lists[ci].append(id) }
-        }
+        try await optimize(maxIterations: maxIterations)
     }
 
     // Assign a single vector to nearest centroid (to be implemented)
