@@ -139,9 +139,13 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
     @usableFromInline internal let pageBits: Int
     @usableFromInline internal let pageMask: Int64
     @usableFromInline internal static let wordsPerPage: Int = 512 // 32,768 / 64
-    @usableFromInline internal struct Page {
-        var bits: UnsafeMutablePointer<UInt64>  // 4 KiB bitset
-        var lastTouchedEpoch: UInt32            // dedup touched-pages per-query
+    @usableFromInline internal final class Page {
+        let bits: UnsafeMutablePointer<UInt64>  // 4 KiB bitset
+        var lastTouchedEpoch: UInt32             // dedup touched-pages per-query
+        init(bits: UnsafeMutablePointer<UInt64>, lastTouchedEpoch: UInt32) {
+            self.bits = bits
+            self.lastTouchedEpoch = lastTouchedEpoch
+        }
     }
     @usableFromInline internal var pageTable: [Int64: Page] = [:] // pageID -> Page
     @usableFromInline internal var touchedPages: [Int64] = []     // pageIDs touched this query
@@ -289,7 +293,10 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
                 touchedPages.removeAll(keepingCapacity: true)
             }
         } else if mode == .fixedBitset {
-            // Clear only touched words if sparse, else full clear is faster.
+            // FixedBitset: clear only the touched words when the touched set is sparse
+            // relative to total word count (< 25%, i.e. tc < wordCount / 4 below), else a
+            // full clear is cheaper. Also handles the A8 ring-saturation case (touchedOverflowed)
+            // by forcing a full clear, since the sparse touched-word list is then incomplete.
             let tc = touchedCount
             if touchedOverflowed, let bw = bitWords {
                 for i in 0..<wordCount { bw[i] = 0 }   // ring saturated: sparse set is incomplete
@@ -310,9 +317,8 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
         // SparsePaged epoch wrap handling (rare): if epoch wrapped to 0,
         // ensure page.lastTouchedEpoch == 0 for all pages to avoid stale equality.
         if mode == .sparsePaged, queryEpoch == 0 {
-            for (pid, var page) in pageTable {
+            for (_, page) in pageTable {
                 page.lastTouchedEpoch = 0
-                pageTable[pid] = page
                 let ptr = page.bits
                 for i in 0..<DefaultVisitedSet.wordsPerPage { ptr[i] = 0 }
             }
@@ -424,21 +430,22 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
         totalChecks &+= 1
 
         let pid = id >> Int64(pageBits)
-        var page = pageTable[pid]
-
-        // Allocate on demand
-        if page == nil {
+        let page: Page
+        if let existing = pageTable[pid] {
+            page = existing
+        } else {
             let p = UnsafeMutablePointer<UInt64>.allocate(capacity: DefaultVisitedSet.wordsPerPage)
             p.initialize(repeating: 0, count: DefaultVisitedSet.wordsPerPage)
-            page = Page(bits: p, lastTouchedEpoch: 0)
-            pageTable[pid] = page
+            let newPage = Page(bits: p, lastTouchedEpoch: 0)
+            pageTable[pid] = newPage
             pagesAllocatedThisQuery &+= 1
+            page = newPage
         }
 
-        // If first touch this query, record for later clear
-        if page!.lastTouchedEpoch != queryEpoch {
-            page!.lastTouchedEpoch = queryEpoch
-            pageTable[pid] = page
+        // If first touch this query, record for later clear (mutate in place; class Page
+        // needs no dictionary write-back since it is a reference type).
+        if page.lastTouchedEpoch != queryEpoch {
+            page.lastTouchedEpoch = queryEpoch
             touchedPages.append(pid)
         }
 
@@ -448,9 +455,9 @@ public final class DefaultVisitedSet: @unchecked Sendable, VisitedSet {
         let b = Int(inPage & 63)
         let mask: UInt64 = 1 &<< b
 
-        let word = page!.bits[w]
+        let word = page.bits[w]
         if (word & mask) == 0 {
-            page!.bits[w] = word | mask
+            page.bits[w] = word | mask
             uniqueCount &+= 1
             return true
         } else {
