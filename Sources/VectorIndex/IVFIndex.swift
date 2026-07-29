@@ -955,7 +955,6 @@ extension IVFIndex {
                                 reorderBySegment: true,
                                 haveInvNorms: false,
                                 haveSqNorms: false,
-                                returnSorted: true,
                                 skipMissing: true,
                                 prefetchDistance: 8,
                                 strictFP: false,

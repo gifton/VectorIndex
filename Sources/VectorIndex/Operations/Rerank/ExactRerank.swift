@@ -25,7 +25,19 @@ public extension IndexOps.Rerank {
         public var reorderBySegment: Bool          // locality grouping
         public var haveInvNorms: Bool              // cosine: base inv-norms [N]
         public var haveSqNorms: Bool               // l2: base ||x||^2 [N]
-        public var returnSorted: Bool              // outputs sorted best-first
+        // B17/returnSorted finding: never read by scoreBlock/rerank_exact_topk/
+        // rerank_exact_scores -- rerank_exact_topk unconditionally calls
+        // selHeap.extractSorted(), so output is always best-first regardless of
+        // this flag. Kept (not deleted) as public API; see PHASE4-ROUTING.
+        // Backed by a private stored field so this type's own init can still
+        // assign it without tripping its own deprecation warning (Swift warns on
+        // deprecated-member use even from within the declaring type's own init).
+        @available(*, deprecated, message: "Never honored; results are always emitted best-first. Removal scheduled for 0.2.0's breaking phase.")
+        public var returnSorted: Bool {
+            get { _returnSorted }
+            set { _returnSorted = newValue }
+        }
+        private var _returnSorted: Bool
         public var skipMissing: Bool               // ignore tombstoned/missing rows
         public var prefetchDistance: Int           // advisory
         public var strictFP: Bool                  // disable algebraic transforms when true
@@ -52,7 +64,7 @@ public extension IndexOps.Rerank {
             self.reorderBySegment = reorderBySegment
             self.haveInvNorms = haveInvNorms
             self.haveSqNorms = haveSqNorms
-            self.returnSorted = returnSorted
+            self._returnSorted = returnSorted
             self.skipMissing = skipMissing
             self.prefetchDistance = prefetchDistance
             self.strictFP = strictFP
@@ -299,12 +311,15 @@ public extension IndexOps.Rerank {
         let tiles = (C + tile - 1) / tile
         let workers = opts.maxConcurrency > 0 ? opts.maxConcurrency : max(1, min(tiles, ProcessInfo.processInfo.activeProcessorCount))
 
-        // Wrap non-Sendable references safely for capture
+        // Wrap non-Sendable references safely for capture. UnsafeSendablePtr/
+        // UnsafeSendableMutPtr already exist module-wide (ADCScan.swift:162-168);
+        // reused here instead of the previous UInt(bitPattern:) round-trip +
+        // force-unwrap.
         struct SendableBox<T>: @unchecked Sendable { let value: T }
         let readerBox = SendableBox(value: reader)
-        let qAddr = UInt(bitPattern: q)
-        let outAddr = UInt(bitPattern: scoresOut)
-        let maskAddr = presentMaskOut.map { UInt(bitPattern: $0) } ?? 0
+        let qBox = UnsafeSendablePtr(ptr: q)
+        let outBox = UnsafeSendableMutPtr(ptr: scoresOut)
+        let maskBox: UnsafeSendableMutPtr<UInt8>? = presentMaskOut.map { UnsafeSendableMutPtr(ptr: $0) }
 
         DispatchQueue.concurrentPerform(iterations: workers) { w in
             var t = w
@@ -333,12 +348,12 @@ public extension IndexOps.Rerank {
                     _ = readerLocal.fetchMany(ids: idPtr.baseAddress!, count: chunk, dst: scratch, present: present)
                 }
 
-                let qLocal = UnsafePointer<Float>(bitPattern: qAddr)!
+                let qLocal = qBox.ptr
                 scoreTile(q: qLocal, d: d, metric: metric, n: chunk, qNorm: qNorm, xb: scratch, out: tileScores, reader: readerLocal, opts: opts)
 
                 // Scatter back to global outputs (disjoint indices across tiles)
-                let scoresOutLocal = UnsafeMutablePointer<Float>(bitPattern: outAddr)!
-                let presentMaskLocal: UnsafeMutablePointer<UInt8>? = (maskAddr != 0) ? UnsafeMutablePointer<UInt8>(bitPattern: maskAddr)! : nil
+                let scoresOutLocal = outBox.ptr
+                let presentMaskLocal: UnsafeMutablePointer<UInt8>? = maskBox?.ptr
                 for j in 0..<chunk {
                     let dstIdx = origIdx[j]
                     if present[j] == 0 {
@@ -531,7 +546,18 @@ public extension IndexOps.Rerank {
         return (outScores, outIDs)
     }
 
-    // Array-based lists version (convenience)
+    // Array-based lists version (convenience).
+    //
+    // Phase-2 (B17b) finding: dead code -- zero callers besides
+    // IVFPostADC.rerankTopKFlat (Sources/VectorIndex/Operations/Quantization/
+    // IVFPostADC.swift:20), which itself has zero callers and zero test coverage
+    // anywhere in Sources/ or Tests/ (grep-verified). Its body's recursive
+    // `buildAndRun` closure (a latent stack-depth risk for large `nlist`) is left
+    // as-is rather than flattened, since the whole function is scheduled for
+    // deletion, not improvement. Kept (not deleted) because it is public API
+    // (implicit via `public extension IndexOps.Rerank`) and Phase 2 is
+    // non-breaking; see the PHASE4-ROUTING appendix.
+    @available(*, deprecated, message: "Dead code: no callers besides the equally-dead IVFPostADC.rerankTopKFlat. Scheduled for removal in 0.2.0's breaking phase.")
     static func topKIVF(
         q: [Float],
         d: Int,
@@ -584,6 +610,10 @@ public extension IndexOps.Rerank {
         return (outScores, outIDs)
     }
 
+    // Phase-2 (B17b) finding: dead code -- zero callers anywhere in Sources/ or
+    // Tests/ (grep-verified). Kept (not deleted) because it is public API
+    // (implicit via `public extension IndexOps.Rerank`); see PHASE4-ROUTING.
+    @available(*, deprecated, message: "Dead code: zero callers anywhere in the package. Scheduled for removal in 0.2.0's breaking phase.")
     static func scoresIVF(
         q: [Float],
         d: Int,

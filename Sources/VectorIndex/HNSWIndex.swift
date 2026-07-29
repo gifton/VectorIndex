@@ -641,9 +641,17 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                 }
 
                 connect(newIndex, with: selected, level: l)
-                // Update cur to closest among selected for next lower layer
-                if let best = selected.min(by: { distance(vector, vectorArray(at: $0), metric: metric) < distance(vector, vectorArray(at: $1), metric: metric) }) {
-                    cur = best
+                // Update cur to closest among selected for next lower layer.
+                // Precompute each candidate's vector + distance once (B17c): the
+                // previous min(by:) comparator called vectorArray(at:)/distance(...)
+                // twice per comparison for both operands, with zero caching across
+                // comparisons -- up to 2(M-1) redundant allocations and full-d
+                // distance recomputations for an M-candidate selection.
+                if !selected.isEmpty {
+                    let dists = selected.map { distance(vector, vectorArray(at: $0), metric: metric) }
+                    var bestIdx = 0
+                    for i in 1..<dists.count where dists[i] < dists[bestIdx] { bestIdx = i }
+                    cur = selected[bestIdx]
                 }
             }
 
@@ -1127,14 +1135,16 @@ extension HNSWIndex {
                 if mapped.count > config.m {
                     let nodeOffset = newNodes[i].vectorOffset
                     let nodeVec = Array(newVectorStorage[nodeOffset..<(nodeOffset + dim)])
-                    mapped.sort {
-                        let off0 = newNodes[$0].vectorOffset
-                        let off1 = newNodes[$1].vectorOffset
-                        let vec0 = Array(newVectorStorage[off0..<(off0 + dim)])
-                        let vec1 = Array(newVectorStorage[off1..<(off1 + dim)])
-                        return distance(nodeVec, vec0, metric: metric) < distance(nodeVec, vec1, metric: metric)
+                    // Precompute each candidate's distance once (B17c): the previous
+                    // sort comparator recomputed vec0/vec1 (fresh Array allocations)
+                    // on every pairwise comparison, O(mapped.count log mapped.count)
+                    // times, re-copying the same handful of candidates repeatedly.
+                    let withDist: [(id: Int, dist: Float)] = mapped.map { cand in
+                        let off = newNodes[cand].vectorOffset
+                        let vec = Array(newVectorStorage[off..<(off + dim)])
+                        return (cand, distance(nodeVec, vec, metric: metric))
                     }
-                    mapped = Array(mapped.prefix(config.m))
+                    mapped = withDist.sorted { $0.dist < $1.dist }.prefix(config.m).map { $0.id }
                 }
                 lvlLists.append(mapped)
             }
