@@ -44,6 +44,17 @@ internal let HNSWWAL_COMMIT_TAG: UInt32 = 0xC0DEDAD1
 
 // MARK: - Record types
 
+// B19 finding: .update and .clear are fully implemented, codec-complete record
+// kinds that no current write path emits. HNSWIndex.update(id:vector:metadata:)
+// logs itself as a .remove + .insert pair (see HNSWIndex.swift's update(...)), and
+// clear() does not touch the WAL at all -- applyReplayRecord already has
+// dedicated handling for both (HNSWIndex.swift, the .update/.clear cases), kept
+// for forward compatibility with a possible future single-frame update/batch-clear
+// format. Deliberately not deleted here: this is an on-disk format decision, out
+// of scope for this cleanup pass. .update previously had zero test coverage of any
+// kind (encode, decode, or replay-apply); see HNSWWALTests.swift's
+// testFrameRoundTripAllRecordTypes for its encode/decode round-trip coverage,
+// added in this task.
 internal enum HNSWWALRecordType: UInt32 {
     case insert = 1
     case remove = 2
