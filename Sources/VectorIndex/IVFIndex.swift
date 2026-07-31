@@ -441,6 +441,26 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         return out
     }
 
+    /// Deterministic tie-break for centroid-probe selection: primary key is
+    /// the score (ascending, "smaller is better"), secondary key is
+    /// centroid index (ascending).
+    ///
+    /// P3b NOTE: prior to this task, all three centroid-probe sort call
+    /// sites (`search`, `performIVFSearch`'s fallback, `getCandidates`)
+    /// used a bare `sort { $0.1 < $1.1 }` over an index-ascending-built
+    /// array. Swift's `sort` is documented as *not* guaranteed stable, so
+    /// tie-break behavior at exactly-equal centroid scores was already
+    /// unspecified pre-P3b, not a guarantee this change revokes. This
+    /// tuple comparator makes that tie-break deterministic and -- load-
+    /// bearing for this task -- identical to the ordering
+    /// `CentroidBatchScore`'s batch path uses when deriving precomputed
+    /// probe lists (see `batchSearch`), which is required for the
+    /// batch/single-query parity guarantee (`IVFBatchGEMMParityTests`).
+    @inline(__always)
+    private static func probeIsOrderedBefore(_ a: (Int, Float), _ b: (Int, Float)) -> Bool {
+        a.1 != b.1 ? a.1 < b.1 : a.0 < b.0
+    }
+
     /// Actor-isolated wrapper around `centroidScores` scoring every current
     /// `centroids` row (via `centroidsFlat`) against `query`. See
     /// `centroidScores` for the ordering-equivalence contract.
@@ -602,7 +622,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             let probe = min(config.nprobe, centroids.count)
             let dists = centroidDistances(for: query, queryIsNormalized: queryIsNormalized)
             var centroidDists = Array(dists.enumerated().map { ($0.offset, $0.element) })
-            centroidDists.sort { $0.1 < $1.1 }
+            centroidDists.sort(by: Self.probeIsOrderedBefore)
             var candidates = Set<VectorID>()
             for (ci, _) in centroidDists.prefix(probe) {
                 for id in lists[ci] { candidates.insert(id) }
@@ -651,6 +671,13 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         let nprobe: Int
         let k: Int
         let queryIsNormalized: Bool
+        // P3b: per-query probe centroid indices (best-first, already sliced
+        // to `nprobe`), precomputed once for the whole batch via a single
+        // `CentroidBatchScore.run` sgemm cross-term in `batchSearch`. `nil`
+        // when the metric has no GEMM form (manhattan/chebyshev) -- in that
+        // case `performIVFSearch` falls back to its old per-query
+        // `centroidScores` path, unchanged.
+        let precomputedProbes: [[Int]]?
     }
 
     public func batchSearch(queries: [[Float]], k: Int, filter: (@Sendable ([String: String]?) -> Bool)?) async throws -> [[StringSearchResult]] {
@@ -681,6 +708,52 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
 
         // For standard path, use parallel execution
         if !centroids.isEmpty && !lists.isEmpty {
+            // P3b: one sgemm cross-term for every query x centroid probe
+            // score in the batch, replacing what used to be `queries.count`
+            // separate `centroidScores` calls (one per worker task). Stays
+            // entirely synchronous (no `await`) so it reads a consistent
+            // actor-state snapshot alongside the `IVFBatchSearchContext`
+            // fields below -- same non-suspending discipline P3a established
+            // for building `ctx` itself.
+            let kc = centroids.count
+            let nprobeEff = min(config.nprobe, kc)
+            var precomputedProbes: [[Int]]? = nil
+            do {
+                let qCount = queries.count
+                let d = dimension
+                var flatQueries = [Float]()
+                flatQueries.reserveCapacity(qCount * d)
+                for q in queries { flatQueries.append(contentsOf: q) }
+                var scores = [Float](repeating: 0, count: qCount * kc)
+                let ok = flatQueries.withUnsafeBufferPointer { qb in
+                    centroidsFlat.withUnsafeBufferPointer { cb -> Bool in
+                        CentroidBatchScore.run(
+                            queries: qb.baseAddress!, q: qCount,
+                            centroids: cb.baseAddress!, kc: kc, d: d,
+                            metric: metric,
+                            centroidNormsSq: centroidNormsSq, centroidInvNorms: centroidInvNorms,
+                            queriesAreNormalized: queryIsNormalized,
+                            out: &scores)
+                    }
+                }
+                if ok {
+                    var probes = [[Int]]()
+                    probes.reserveCapacity(qCount)
+                    for qi in 0..<qCount {
+                        let base = qi * kc
+                        var row: [(Int, Float)] = []
+                        row.reserveCapacity(kc)
+                        for ci in 0..<kc { row.append((ci, scores[base + ci])) }
+                        row.sort(by: Self.probeIsOrderedBefore)
+                        probes.append(row.prefix(nprobeEff).map { $0.0 })
+                    }
+                    precomputedProbes = probes
+                }
+                // ok == false: metric has no GEMM form (manhattan/chebyshev);
+                // precomputedProbes stays nil and performIVFSearch falls back
+                // to its existing per-query centroidScores path below.
+            }
+
             // Snapshot data for parallel access
             let ctx = IVFBatchSearchContext(
                 centroidsFlat: centroidsFlat,
@@ -690,9 +763,10 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
                 store: store,
                 dimension: dimension,
                 metric: metric,
-                nprobe: min(config.nprobe, centroids.count),
+                nprobe: nprobeEff,
                 k: k,
-                queryIsNormalized: queryIsNormalized
+                queryIsNormalized: queryIsNormalized,
+                precomputedProbes: precomputedProbes
             )
 
             return try await withThrowingTaskGroup(of: (Int, [StringSearchResult]).self) { group in
@@ -743,22 +817,34 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         // state, so this scores via the flat cache snapshotted into `ctx`
         // rather than the actor-isolated `centroidDistances(for:)`.
         let kc = ctx.lists.count
-        let scores: [Float] = query.withUnsafeBufferPointer { qb in
-            ctx.centroidsFlat.withUnsafeBufferPointer { cb in
-                centroidScores(
-                    qPtr: qb.baseAddress!, flatPtr: cb.baseAddress!, kc: kc, d: ctx.dimension,
-                    metric: ctx.metric, centroidNormsSq: ctx.centroidNormsSq, centroidInvNorms: ctx.centroidInvNorms,
-                    queryIsNormalized: ctx.queryIsNormalized)
+        let probeIndices: [Int]
+        if let precomputed = ctx.precomputedProbes, precomputed.indices.contains(queryIndex) {
+            // P3b: probe selection already derived from the single sgemm
+            // cross-term batchSearch computed for the whole batch (see
+            // CentroidBatchScore) -- no per-query centroidScores call.
+            probeIndices = precomputed[queryIndex]
+        } else {
+            // Fallback: metric has no GEMM form (manhattan/chebyshev), or
+            // the precomputed pass was skipped -- identical to the pre-P3b
+            // per-query path, just with the deterministic tie-break.
+            let scores: [Float] = query.withUnsafeBufferPointer { qb in
+                ctx.centroidsFlat.withUnsafeBufferPointer { cb in
+                    centroidScores(
+                        qPtr: qb.baseAddress!, flatPtr: cb.baseAddress!, kc: kc, d: ctx.dimension,
+                        metric: ctx.metric, centroidNormsSq: ctx.centroidNormsSq, centroidInvNorms: ctx.centroidInvNorms,
+                        queryIsNormalized: ctx.queryIsNormalized)
+                }
             }
+            var centroidDists: [(Int, Float)] = []
+            centroidDists.reserveCapacity(kc)
+            for i in 0..<kc { centroidDists.append((i, scores[i])) }
+            centroidDists.sort(by: probeIsOrderedBefore)
+            probeIndices = centroidDists.prefix(ctx.nprobe).map { $0.0 }
         }
-        var centroidDists: [(Int, Float)] = []
-        centroidDists.reserveCapacity(kc)
-        for i in 0..<kc { centroidDists.append((i, scores[i])) }
-        centroidDists.sort { $0.1 < $1.1 }
 
         // Gather candidates from top nprobe lists
         var candidates = Set<VectorID>()
-        for (ci, _) in centroidDists.prefix(ctx.nprobe) {
+        for ci in probeIndices {
             for id in ctx.lists[ci] { candidates.insert(id) }
         }
 
@@ -941,7 +1027,7 @@ extension IVFIndex {
             let probe = min(config.nprobe, centroids.count)
             let dists = centroidDistances(for: query)
             var centroidDists = Array(dists.enumerated().map { ($0.offset, $0.element) })
-            centroidDists.sort { $0.1 < $1.1 }
+            centroidDists.sort(by: Self.probeIsOrderedBefore)
 
             // Collect candidates from probed lists
             var candidateSet = Set<VectorID>()
