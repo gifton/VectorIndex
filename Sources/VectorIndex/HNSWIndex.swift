@@ -851,6 +851,24 @@ extension HNSWIndex {
 
     /// Whether the inverse-norm cache is currently marked dirty.
     internal var _testInvNormsCacheIsDirty: Bool { invNormsDirty }
+
+    // Test-only structural snapshot (internal, reached via @testable): full
+    // adjacency so determinism failures diff meaningfully instead of hashing.
+    internal struct HNSWGraphSnapshot: Equatable, Sendable {
+        let entryPoint: Int?
+        let maxLevel: Int
+        let levels: [Int]
+        let adjacency: [[[Int]]]   // [node][level][neighbor]
+    }
+
+    internal func _testGraphSnapshot() -> HNSWGraphSnapshot {
+        HNSWGraphSnapshot(
+            entryPoint: entryPoint,
+            maxLevel: maxLevel,
+            levels: nodes.map { $0.level },
+            adjacency: nodes.map { $0.neighbors }
+        )
+    }
 }
 
 // MARK: - Kernel #33: Traversal caches and builders

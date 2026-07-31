@@ -1,0 +1,60 @@
+{
+  "config" : {
+    "dim" : "384",
+    "efc" : "200",
+    "efs" : "64",
+    "index" : "ivf",
+    "k" : "10",
+    "m" : "16",
+    "metric" : "euclidean",
+    "n" : "5000",
+    "nlist" : "64",
+    "nprobe" : "4",
+    "q" : "200"
+  },
+  "host" : {
+    "cpu" : "Apple M3 Max",
+    "device" : "Mac15,9",
+    "memoryGB" : "48",
+    "os" : "macOS 26.5.2"
+  },
+  "results" : [
+    {
+      "batchThroughputQps" : 3686.9361326617136,
+      "buildSeconds" : 0.001041125,
+      "dim" : 384,
+      "indexType" : "Flat",
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 5000,
+      "optimizeSeconds" : 0,
+      "params" : {
+
+      },
+      "q" : 200,
+      "recallAvg" : 1,
+      "searchAvgMs" : 2.0540721099999986,
+      "searchP95Ms" : 2.165542,
+      "throughputQps" : 486.83782576649685
+    },
+    {
+      "batchThroughputQps" : 678.528668664056,
+      "buildSeconds" : 0.000800208,
+      "dim" : 384,
+      "indexType" : "IVF",
+      "k" : 10,
+      "metric" : "euclidean",
+      "n" : 5000,
+      "optimizeSeconds" : 0.374044042,
+      "params" : {
+        "nlist" : "64",
+        "nprobe" : "4"
+      },
+      "q" : 200,
+      "recallAvg" : 0.9940000000000002,
+      "searchAvgMs" : 6.472821835000001,
+      "searchP95Ms" : 38.545292,
+      "throughputQps" : 154.49212499450786
+    }
+  ]
+}
