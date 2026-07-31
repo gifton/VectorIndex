@@ -35,6 +35,17 @@ convention: the minor digit signals breaking changes.
   `VectorIndexProtocol` witness, forwarding to it (protocol requirement unchanged);
   HNSW init/metric/context-storage tidy. (B17–B19)
 
+### Fixed
+
+- Reservoir `.adaptive` mode now actually works: `currentMode` no longer collapses to
+  the initial strategy at init (which made the block→heap switching logic structurally
+  unreachable and left default-constructed reservoirs in pure Block mode forever); the
+  adaptive block phase gained the same overflow-prune guard `.block` has (previously it
+  grew the buffer without bound via the defensive-grow path); filling the buffer now
+  completes the switch (the sampled occupancy check alone can miss for common shapes);
+  and `reset()` re-seeds the mode before sizing buffers. `adaptiveInitialMode ==
+  .adaptive` is now a precondition failure.
+
 ### Deprecated
 
 - Scheduled for removal in the 0.2.0 breaking phase: the entire `MIPSTransform` public

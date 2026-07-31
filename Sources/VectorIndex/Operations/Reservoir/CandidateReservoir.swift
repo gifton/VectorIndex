@@ -129,7 +129,16 @@ public final class CandidateReservoir: @unchecked Sendable {
     self.capacityC = capacity
     self.metric = metric
     self.opts = options
-    self.currentMode = (options.mode == .adaptive) ? options.adaptiveInitialMode : options.mode
+    // .adaptive previously collapsed to its initial *strategy* here
+    // (currentMode := adaptiveInitialMode), which made pushBatch's `.adaptive`
+    // case -- the only place the block→heap switching logic lives -- structurally
+    // unreachable: the mode never switched, and default-constructed reservoirs
+    // (options.mode defaults to .adaptive) silently ran pure Block forever.
+    // currentMode now stays .adaptive so the switching path engages;
+    // adaptiveInitialMode == .heap is honored as "skip the block phase entirely".
+    precondition(options.adaptiveInitialMode != .adaptive,
+                 "adaptiveInitialMode names the strategy .adaptive starts in; it must be .block or .heap")
+    self.currentMode = Self.startMode(for: options)
 
     let headroom = max(1, Int(ceil(Float(capacity) * max(0, options.reserveExtra))))
     self.bufferCapacity = (self.currentMode == .heap) ? capacity : capacity &+ headroom
@@ -147,6 +156,12 @@ public final class CandidateReservoir: @unchecked Sendable {
   /// O(1) when buffers are large enough (no reallocation).
   @inlinable
   public func reset(newCapacity: Int? = nil) {
+    // Re-seed the mode FIRST: the buffer-capacity policy below must size for the
+    // strategy the NEXT query starts in, not whatever a mid-query adaptive→heap
+    // switch left behind (sizing for .heap would strand the next adaptive block
+    // phase without its headroom and churn appendUnsorted's defensive-grow path).
+    currentMode = Self.startMode(for: opts)
+
     if let nc = newCapacity {
       precondition(nc > 0, "Reservoir capacity must be > 0")
       capacityC = nc
@@ -161,7 +176,6 @@ public final class CandidateReservoir: @unchecked Sendable {
     }
 
     size = 0
-    currentMode = (opts.mode == .adaptive) ? opts.adaptiveInitialMode : opts.mode
     // Reset tau
     tau = worstSentinel(for: metric)
     if opts.telemetry { telemetry = .init() }
@@ -247,12 +261,25 @@ public final class CandidateReservoir: @unchecked Sendable {
         }
 
       case .adaptive:
-        // In adaptive block phase until switch
+        // Adaptive block phase until switch.
         appendUnsorted(id: cid, score: s)
         acceptedInBatch &+= 1
 
-        // Check occupancy periodically to keep overhead low.
-        if (size & 63) == 0 {
+        if size >= bufferCapacity {
+          // Overflow guard (same invariant .block enforces): never let the block
+          // phase outgrow the preallocated buffer. A full buffer is also precisely
+          // where the block phase stops being cheap (every further batch would
+          // re-prune), and post-prune occupancy is 1.0 -- above every valid
+          // threshold -- so complete the adaptive switch here rather than waiting
+          // for the sampled check below, which can miss entirely (it only fires at
+          // multiples of 64, and the post-prune size range (C, C+headroom] may
+          // contain none).
+          pruneToTopC()
+          heapifyWorstRoot()
+          currentMode = .heap
+          telemetry.modeSwitches &+= 1
+        } else if (size & 63) == 0 {
+          // Sampled early-switch: check occupancy periodically to keep overhead low.
           let occ = Float(size) / Float(C)
           if occ > opts.adaptiveThreshold {
             // Switch to heap: ensure we have exactly top‑C, then heapify (worst-at-root).
@@ -337,6 +364,17 @@ public final class CandidateReservoir: @unchecked Sendable {
   }
 
   // MARK: - Internal helpers (inlinable-visible)
+
+  /// Strategy the reservoir starts a query in, for the configured options:
+  /// `.adaptive` stays `.adaptive` (block-phase behavior + switch logic) unless the
+  /// caller asked to start directly in `.heap`; concrete modes pass through.
+  @usableFromInline
+  internal static func startMode(for options: ReservoirOptions) -> ReservoirMode {
+    if options.mode == .adaptive {
+      return (options.adaptiveInitialMode == .heap) ? .heap : .adaptive
+    }
+    return options.mode
+  }
 
   /// Append element without ordering (Block/Adaptive Block).
   @usableFromInline

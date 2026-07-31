@@ -76,24 +76,15 @@ final class CandidateReservoirTests: XCTestCase {
         XCTAssertEqual(reservoir.count, 4, "extractTopK must not change reservoir size")
     }
 
-    // Regression test for the missing `.adaptive` overflow-prune guard (B15): with a small
-    // enough capacity, the periodic (every-64-pushes) occupancy check can miss the
-    // adaptiveThreshold crossing entirely before `size` reaches `bufferCapacity`, so
-    // appendUnsorted's defensive fallback silently *grows* the buffer instead of pruning —
-    // defeating the "no hot-path allocations" fixed-capacity design intent.
-    //
-    // capacity=100, reserveExtra=0.10 -> bufferCapacity = 100 + ceil(100*0.10) = 110.
-    // adaptiveThreshold=0.75 -> switch-trigger occupancy = 75. The periodic check only
-    // runs at size % 64 == 0, i.e. size=64 (occ 0.64, below threshold) then size=128
-    // (already past bufferCapacity=110). Pushing 111 single-item batches crosses
-    // bufferCapacity on push #111 without the periodic check ever tripping first.
-    //
-    // THIS TEST IS EXPECTED TO BE RED against the current, unmodified code (bufferCapacity
-    // grows past 110 via appendUnsorted's defensive-grow branch) and MUST turn GREEN once
-    // the `.adaptive` case gains the same `if size >= bufferCapacity { pruneToTopC() }`
-    // guard `.block` already has. This is a standard red-green bugfix test, not a
-    // characterization of current (buggy) behavior — do not "fix" the test to match the
-    // bug.
+    // Regression guard for the .adaptive overflow-prune + guaranteed switch (user
+    // decision 2026-07-30 making .adaptive a working mode). capacity=100,
+    // reserveExtra=0.10 -> bufferCapacity=110; adaptiveThreshold=0.75 -> the sampled
+    // check (size % 64 == 0) can only fire at size=64 (occupancy 0.64, below
+    // threshold), so the buffer-full guard -- not the sample -- must prune at 110,
+    // heapify, and flip to .heap. Before the fix pair (currentMode collapsing to
+    // .block at init; no guard in the .adaptive case) this config either never
+    // reached the .adaptive code at all or, once reachable, grew the buffer without
+    // bound via appendUnsorted's defensive-grow branch.
     func testAdaptiveModePrunesBeforeBufferOverflow() {
         let capacity = 100
         let reservoir = CandidateReservoir(
@@ -117,5 +108,71 @@ final class CandidateReservoirTests: XCTestCase {
 
         XCTAssertEqual(reservoir.bufferCapacity, expectedBufferCapacity,
                        "adaptive mode must prune at bufferCapacity instead of silently growing the buffer")
+        XCTAssertEqual(reservoir.telemetry.modeSwitches, 1,
+                       "filling the block-phase buffer must complete the adaptive switch")
+        XCTAssertEqual(reservoir.count, capacity)
+        // L2: smaller scores are better; ids 0..99 carry scores 0..99 -> exact top-100.
+        var outScores = [Float](repeating: 0, count: capacity)
+        var outIDs = [Int64](repeating: -1, count: capacity)
+        outScores.withUnsafeMutableBufferPointer { sb in
+            outIDs.withUnsafeMutableBufferPointer { ib in
+                reservoir.extractTopK(k: capacity, topScores: sb.baseAddress!, topIDs: ib.baseAddress!)
+            }
+        }
+        XCTAssertEqual(outIDs, Array(0..<Int64(capacity)),
+                       "post-switch reservoir must hold exactly the best C candidates, best-first")
+    }
+
+    /// Sampled-path switch: C=150, α=0.10 -> bufferCapacity=165; threshold 0.75 ->
+    /// trigger occupancy > 112.5. The periodic check samples at size % 64 == 0 and
+    /// size=128 lands inside (112.5, 165], so the SAMPLED check -- not the
+    /// buffer-full guard -- performs the switch here (complement of the test above).
+    /// Also proves end-to-end parity: adaptive must produce results identical to a
+    /// pure .heap reservoir fed the same stream (same top-C, best-first, ties by id).
+    func testAdaptiveSampledSwitchMatchesPureHeapResults() {
+        let capacity = 150
+        let adaptive = CandidateReservoir(
+            capacity: capacity, metric: .l2,
+            options: ReservoirOptions(mode: .adaptive, reserveExtra: 0.10, adaptiveThreshold: 0.75, adaptiveInitialMode: .block)
+        )
+        let pureHeap = CandidateReservoir(
+            capacity: capacity, metric: .l2,
+            options: ReservoirOptions(mode: .heap)
+        )
+
+        // 400 candidates with DESCENDING scores (L2: later is better), so the heap
+        // phase after the switch keeps accepting -- exercises replaceRoot, not just
+        // tau-rejection. One tie pair inside the winning range pins stable id order.
+        let n = 400
+        var ids = [Int64](repeating: 0, count: n)
+        var scores = [Float](repeating: 0, count: n)
+        for i in 0..<n { ids[i] = Int64(i); scores[i] = Float(n - i) }
+        scores[301] = scores[300] // tie pair (ids 300, 301), both inside the top-150
+
+        ids.withUnsafeBufferPointer { ip in
+            scores.withUnsafeBufferPointer { sp in
+                _ = adaptive.pushBatch(ids: ip.baseAddress!, scores: sp.baseAddress!, count: n)
+                _ = pureHeap.pushBatch(ids: ip.baseAddress!, scores: sp.baseAddress!, count: n)
+            }
+        }
+
+        XCTAssertEqual(adaptive.telemetry.modeSwitches, 1, "sampled occupancy check must switch exactly once")
+        XCTAssertEqual(adaptive.count, capacity)
+        XCTAssertEqual(pureHeap.count, capacity)
+
+        func topK(_ r: CandidateReservoir) -> (scores: [Float], ids: [Int64]) {
+            var s = [Float](repeating: 0, count: capacity)
+            var i = [Int64](repeating: -1, count: capacity)
+            s.withUnsafeMutableBufferPointer { sb in
+                i.withUnsafeMutableBufferPointer { ib in
+                    r.extractTopK(k: capacity, topScores: sb.baseAddress!, topIDs: ib.baseAddress!)
+                }
+            }
+            return (s, i)
+        }
+        let a = topK(adaptive)
+        let h = topK(pureHeap)
+        XCTAssertEqual(a.ids, h.ids, "adaptive must produce results identical to pure heap")
+        XCTAssertEqual(a.scores, h.scores)
     }
 }
