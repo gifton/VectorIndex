@@ -27,6 +27,14 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
 
     // Placeholder for centroids and inverted lists
     private var centroids: [[Float]] = []
+    // P3a: contiguous mirror of `centroids` + cached norms. Rebuilt whenever
+    // `centroids` is reassigned; single source for all centroid scoring.
+    // MUST be kept in sync: call rebuildCentroidCache() after every mutation
+    // of `centroids` (see grep -n "centroids = \|centroids\.removeAll" for
+    // the enumerated mutation sites).
+    private var centroidsFlat: ContiguousArray<Float> = []
+    private var centroidNormsSq: [Float] = []
+    private var centroidInvNorms: [Float] = []
     private var lists: [[VectorID]] = []
     private var idToListIndex: [VectorID: Int] = [:]
 
@@ -280,7 +288,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         // Build centroids with CPU Lloyd's KMeans and assign points to lists
         // Use k = min(nlist, store.count)
         guard !store.isEmpty else {
-            centroids.removeAll(); lists.removeAll(); return
+            centroids.removeAll(); lists.removeAll(); rebuildCentroidCache(); return
         }
         let k = max(1, min(config.nlist, store.count))
         // Initialize centroids using deterministic k‑means++ (farthest‑point) seeding
@@ -297,6 +305,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         // left for Phase 3 to pick up under its benchmark gate.
         let initialCentroids = try kmeansPlusPlusInitRandom(k: k, seed: 42)
         centroids = try await kmeans(centroids: initialCentroids, maxIterations: maxIterations)
+        rebuildCentroidCache()
         // Build inverted lists
         lists = Array(repeating: [], count: centroids.count)
         idToListIndex.removeAll(keepingCapacity: false)
@@ -319,16 +328,116 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         try await optimize(maxIterations: maxIterations)
     }
 
-    // Assign a single vector to nearest centroid (to be implemented)
-    private func nearestCentroidIndex(for vector: [Float]) -> Int? {
-        guard !centroids.isEmpty else { return nil }
-        var best = -1
-        var bestD = Float.infinity
-        for (i, c) in centroids.enumerated() {
-            let d = distance(vector, c, metric: metric)
-            if d < bestD { bestD = d; best = i }
+    // MARK: - P3a: contiguous centroid cache + batched coarse scoring
+
+    /// Rebuilds `centroidsFlat`/`centroidNormsSq`/`centroidInvNorms` from
+    /// `centroids`. Must be called after every reassignment of `centroids`
+    /// (optimize()'s kmeans assignment, the empty-store early-return path,
+    /// and clear()) so the cache never serves stale data.
+    private func rebuildCentroidCache() {
+        let d = dimension, kc = centroids.count
+        centroidsFlat.removeAll(keepingCapacity: true)
+        centroidsFlat.reserveCapacity(kc * d)
+        for c in centroids { centroidsFlat.append(contentsOf: c) }
+        centroidNormsSq = [Float](repeating: 0, count: kc)
+        centroidInvNorms = [Float](repeating: 0, count: kc)
+        centroidsFlat.withUnsafeBufferPointer { cb in
+            guard let base = cb.baseAddress else { return }
+            for i in 0..<kc {
+                let n2 = IndexOps.Support.Norms.l2NormSquared(vector: base + i * d, dimension: d)
+                centroidNormsSq[i] = n2
+                centroidInvNorms[i] = 1.0 / (n2.squareRoot() + 1e-12)
+            }
         }
-        return best >= 0 ? best : nil
+    }
+
+    /// Computes kc "smaller is better" scores from `qPtr` to every row of
+    /// `flatPtr` (kc×d row-major), ordering-equivalent to the old per-pair
+    /// `distance()` values for the same metric: euclidean is L2^2
+    /// (monotone in the old sqrt'd value), dotProduct negates the dot
+    /// product, cosine is `1 - similarity`. Callers must only use these
+    /// values for argmin / sort-and-slice -- they are not public distances.
+    ///
+    /// Not a nested closure/function on purpose: under this package's
+    /// StrictConcurrency setting, a local function capturing an
+    /// UnsafePointer-bearing optional (CosineNormsHandle?) across nested
+    /// withUnsafeBufferPointer scopes runs into spurious capture
+    /// diagnostics (see HNSWIndex.scoreBatch for the same discipline). This
+    /// is a plain static function taking explicit pointers instead, shared
+    /// by the actor-isolated `centroidDistances(for:queryIsNormalized:)`
+    /// and the static `performIVFSearch` batch-search path.
+    ///
+    /// POINTER-LIFETIME: `qPtr`/`flatPtr` are only valid for the duration of
+    /// this call (owned by the caller's withUnsafeBufferPointer scopes).
+    /// The CosineNormsHandle wrapping a pointer into `centroidInvNorms` is
+    /// constructed AND consumed entirely inside that array's own
+    /// withUnsafeBufferPointer scope below -- it is never stored.
+    private static func centroidScores(
+        qPtr: UnsafePointer<Float>,
+        flatPtr: UnsafePointer<Float>,
+        kc: Int,
+        d: Int,
+        metric: SupportedDistanceMetric,
+        centroidInvNorms: [Float],
+        queryIsNormalized: Bool
+    ) -> [Float] {
+        var out = [Float](repeating: 0, count: kc)
+        guard kc > 0 else { return out }
+        if metric == .cosine {
+            let qInv: Float = queryIsNormalized
+                ? 1.0
+                : 1.0 / (IndexOps.Support.Norms.l2NormSquared(vector: qPtr, dimension: d).squareRoot() + 1e-12)
+            centroidInvNorms.withUnsafeBufferPointer { ib in
+                out.withUnsafeMutableBufferPointer { ob in
+                    let handle = IndexOps.Scoring.ScoreBlock.CosineNormsHandle(
+                        dbInvNormsF32: ib.baseAddress, dbInvNormsF16: nil,
+                        queryInvNorm: qInv, epsilon: 1e-12)
+                    IndexOps.Scoring.ScoreBlock.run(
+                        q: qPtr, xb: flatPtr, n: kc, d: d,
+                        metric: metric, out: ob.baseAddress!, cosineNorms: handle)
+                    // cosine similarity -> "smaller is better" distance,
+                    // matching old distance()'s `1 - sim`.
+                    for i in 0..<kc { ob[i] = 1 - ob[i] }
+                }
+            }
+        } else {
+            out.withUnsafeMutableBufferPointer { ob in
+                IndexOps.Scoring.ScoreBlock.run(
+                    q: qPtr, xb: flatPtr, n: kc, d: d,
+                    metric: metric, out: ob.baseAddress!, cosineNorms: nil)
+                switch metric {
+                case .euclidean: break            // L2^2, monotone-equivalent
+                case .dotProduct: for i in 0..<kc { ob[i] = -ob[i] }
+                default: break                    // ScoreBlock fallback already returns distances
+                }
+            }
+        }
+        return out
+    }
+
+    /// Actor-isolated wrapper around `centroidScores` scoring every current
+    /// `centroids` row (via `centroidsFlat`) against `query`. See
+    /// `centroidScores` for the ordering-equivalence contract.
+    private func centroidDistances(for query: [Float], queryIsNormalized: Bool = false) -> [Float] {
+        let kc = centroids.count, d = dimension
+        guard kc > 0 else { return [] }
+        return query.withUnsafeBufferPointer { qb in
+            centroidsFlat.withUnsafeBufferPointer { cb in
+                Self.centroidScores(
+                    qPtr: qb.baseAddress!, flatPtr: cb.baseAddress!, kc: kc, d: d,
+                    metric: metric, centroidInvNorms: centroidInvNorms,
+                    queryIsNormalized: queryIsNormalized)
+            }
+        }
+    }
+
+    // Assign a single vector to nearest centroid
+    private func nearestCentroidIndex(for vector: [Float]) -> Int? {
+        let dists = centroidDistances(for: vector)
+        guard !dists.isEmpty else { return nil }
+        var best = 0
+        for i in 1..<dists.count where dists[i] < dists[best] { best = i }
+        return best
     }
 
     // MARK: - Lloyd's KMeans using Kernel #12
@@ -454,11 +563,8 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         if !centroids.isEmpty && !lists.isEmpty {
             // Find nprobe nearest centroids
             let probe = min(config.nprobe, centroids.count)
-            var centroidDists: [(Int, Float)] = []
-            centroidDists.reserveCapacity(centroids.count)
-            for (i, c) in centroids.enumerated() {
-                centroidDists.append((i, distance(query, c, metric: metric, queryIsNormalized: queryIsNormalized)))
-            }
+            let dists = centroidDistances(for: query, queryIsNormalized: queryIsNormalized)
+            var centroidDists = Array(dists.enumerated().map { ($0.offset, $0.element) })
             centroidDists.sort { $0.1 < $1.1 }
             var candidates = Set<VectorID>()
             for (ci, _) in centroidDists.prefix(probe) {
@@ -493,7 +599,13 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
 
     /// Context for parallel batch search - bundles immutable data for worker tasks
     private struct IVFBatchSearchContext: @unchecked Sendable {
-        let centroids: [[Float]]
+        // P3a: the flat cache + cached inverse norms replace the old `centroids:
+        // [[Float]]` field (its only uses were the per-centroid scalar distance
+        // loop in `performIVFSearch`, now routed through `centroidScores`).
+        // `lists.count` stands in for the old `centroids.count` (kc) below --
+        // `lists` is always sized to `centroids.count` at every mutation site.
+        let centroidsFlat: ContiguousArray<Float>
+        let centroidInvNorms: [Float]
         let lists: [[VectorID]]
         let store: [VectorID: ([Float], [String: String]?)]
         let dimension: Int
@@ -533,7 +645,8 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         if !centroids.isEmpty && !lists.isEmpty {
             // Snapshot data for parallel access
             let ctx = IVFBatchSearchContext(
-                centroids: centroids,
+                centroidsFlat: centroidsFlat,
+                centroidInvNorms: centroidInvNorms,
                 lists: lists,
                 store: store,
                 dimension: dimension,
@@ -587,12 +700,21 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         ctx: IVFBatchSearchContext,
         filter: (@Sendable ([String: String]?) -> Bool)?
     ) -> (Int, [StringSearchResult]) {
-        // Find nprobe nearest centroids
-        var centroidDists: [(Int, Float)] = []
-        centroidDists.reserveCapacity(ctx.centroids.count)
-        for (i, c) in ctx.centroids.enumerated() {
-            centroidDists.append((i, distance(query, c, metric: ctx.metric, queryIsNormalized: ctx.queryIsNormalized)))
+        // Find nprobe nearest centroids. Static context carries no actor
+        // state, so this scores via the flat cache snapshotted into `ctx`
+        // rather than the actor-isolated `centroidDistances(for:)`.
+        let kc = ctx.lists.count
+        let scores: [Float] = query.withUnsafeBufferPointer { qb in
+            ctx.centroidsFlat.withUnsafeBufferPointer { cb in
+                centroidScores(
+                    qPtr: qb.baseAddress!, flatPtr: cb.baseAddress!, kc: kc, d: ctx.dimension,
+                    metric: ctx.metric, centroidInvNorms: ctx.centroidInvNorms,
+                    queryIsNormalized: ctx.queryIsNormalized)
+            }
         }
+        var centroidDists: [(Int, Float)] = []
+        centroidDists.reserveCapacity(kc)
+        for i in 0..<kc { centroidDists.append((i, scores[i])) }
         centroidDists.sort { $0.1 < $1.1 }
 
         // Gather candidates from top nprobe lists
@@ -642,6 +764,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
 
     public func clear() async {
         centroids.removeAll()
+        rebuildCentroidCache()
         lists.removeAll()
         idToListIndex.removeAll()
         store.removeAll()
@@ -777,13 +900,10 @@ extension IVFIndex {
         if !centroids.isEmpty && !lists.isEmpty {
             // Find nprobe nearest centroids
             let probe = min(config.nprobe, centroids.count)
-            var centroidDists: [(Int, Float)] = []
-            centroidDists.reserveCapacity(centroids.count)
-            for (i, c) in centroids.enumerated() {
-                centroidDists.append((i, distance(query, c, metric: metric)))
-            }
+            let dists = centroidDistances(for: query)
+            var centroidDists = Array(dists.enumerated().map { ($0.offset, $0.element) })
             centroidDists.sort { $0.1 < $1.1 }
-            
+
             // Collect candidates from probed lists
             var candidateSet = Set<VectorID>()
             candidateSet.reserveCapacity(estimatedCandidates)
@@ -906,9 +1026,22 @@ extension IVFIndex {
             var ids: [Int32] = []
             var scores: [Float]?
             let metricSel: IVFMetric = (metric == .euclidean) ? .l2 : (metric == .dotProduct ? .ip : .cosine)
-            // Flatten centroids [[Float]] -> [Float]
-            let flatC = centroids.flatMap { $0 }
-            ivf_select_nprobe_f32(q: query, d: dimension, centroids: flatC, kc: kc, metric: metricSel, nprobe: min(config.nprobe, kc), listIDsOut: &ids, listScoresOut: &scores)
+            // P3a: centroidsFlat is the maintained contiguous mirror of
+            // `centroids` (kept in sync by rebuildCentroidCache()) -- one
+            // less O(kc*d) `flatMap` materialization per search versus
+            // reflattening `centroids` here. ivf_select_nprobe_f32 requires
+            // a plain [Float], so this is still a single contiguous copy
+            // (Array(ContiguousArray) memcpy) rather than the old
+            // nested-array flatMap.
+            let flatC = Array(centroidsFlat)
+            // Wire the cached norms into the kernel's already-implemented
+            // dot-trick (L2) / precomputed-inv-norm (cosine) branches --
+            // previously this call used default IVFSelectOpts() with no
+            // norms, so those branches never activated.
+            var opts = IVFSelectOpts()
+            opts.centroidNorms = centroidNormsSq
+            opts.centroidInvNorms = centroidInvNorms
+            ivf_select_nprobe_f32(q: query, d: dimension, centroids: flatC, kc: kc, metric: metricSel, nprobe: min(config.nprobe, kc), opts: opts, listIDsOut: &ids, listScoresOut: &scores)
             probeLists = ids
         } else {
             // Fallback: probe all lists
