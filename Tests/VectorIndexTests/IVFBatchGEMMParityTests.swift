@@ -73,6 +73,31 @@ final class IVFBatchGEMMParityTests: XCTestCase {
         XCTAssertGreaterThanOrEqual(exact, 57, "≥95% of queries must match exactly")
     }
 
+    /// Fix round 1, Finding 1: the fixture above (d=24) never crosses
+    /// `L2Sqr`'s d>=256 branch threshold, where the scalar per-query path
+    /// (`ScoreBlock` -> `L2Sqr`) uses its own on-the-fly dot-trick while the
+    /// GEMM path always computes `||c||^2 - 2<q,c>` -- two different
+    /// algorithms with different rounding, so near-boundary probe-rank
+    /// flips at d>=256 were a residual risk no prior test covered.
+    /// Production's benchmark config uses dim=384, so this fixture exercises
+    /// that exact regime (kept small: n=600, kc=16, q=40, to run in seconds).
+    func testBatchMatchesSingleQuerySearchHighDimensional() async throws {
+        let idx = try await makeOptimizedIVF(n: 600, dim: 384, nlist: 16, seed: 5151)
+        let queries = generateDataset(count: 40, dim: 384, seed: 606)
+        let batch = try await idx.batchSearch(queries: queries, k: 5, filter: nil)
+        var exact = 0
+        for (qi, q) in queries.enumerated() {
+            let single = try await idx.search(query: q, k: 5, filter: nil)
+            let bIDs = batch[qi].map(\.id), sIDs = single.map(\.id)
+            if bIDs == sIDs { exact += 1 }
+            else {
+                XCTAssertGreaterThanOrEqual(Set(bIDs).intersection(sIDs).count, 4,
+                    "query \(qi): batch/single may differ only at FP-margin probe ties (k=5, so >=k-1=4 overlap)")
+            }
+        }
+        XCTAssertGreaterThanOrEqual(exact, 38, "≥95% of queries must match exactly (40*0.95=38)")
+    }
+
     // MARK: - Direct CentroidBatchScore correctness (scalar reference)
 
     /// Scalar reference matching CentroidBatchScore's documented ordering
@@ -181,6 +206,53 @@ final class IVFBatchGEMMParityTests: XCTestCase {
             }
             // Degenerate centroid must be forced to exactly 1 (max distance), matching centroidScores.
             XCTAssertEqual(out[qi * kc + 2], 1.0, accuracy: 1e-6, "degenerate centroid must be forced to distance 1")
+        }
+    }
+
+    /// Fix round 1, Finding 2: `queriesAreNormalized: true` in the cosine
+    /// branch (`CentroidBatchScore.swift`, the `qInv`/`qNormSq` fast path)
+    /// had zero direct coverage. It IS a reachable production path --
+    /// `IVFIndex.batchSearch<V: IndexableVector>` (TypedOverloads.swift)
+    /// passes `queryIsNormalized: true` for cosine whenever the input
+    /// vector reports `isNormalized`. This test uses genuinely unit-norm
+    /// queries (via `generateDataset`, which L2-normalizes), so the
+    /// `queriesAreNormalized: true` fast path (qNormSq forced to 1.0,
+    /// skipping recomputation) must agree both with a scalar reference
+    /// computed the same way, AND with the `queriesAreNormalized: false`
+    /// path recomputing the norm from the same (already-normalized) data --
+    /// which is the whole correctness contract the hint relies on. A
+    /// degenerate-norm centroid row pins the near-zero-norm guard's
+    /// collapse specifically under the qNormSq=1.0-forced code path (not
+    /// just the recomputed-qNormSq path already covered above).
+    func testCentroidBatchScoreCosineQueriesAreNormalizedTrue() throws {
+        var rng = LCG(state: 789)
+        let d = 12, kc = 6, nq = 5
+        let queries = generateDataset(count: nq, dim: d, seed: 789) // unit-norm by construction
+        var centroids = (0..<kc).map { _ in (0..<d).map { _ in rng.nextInRange(-1...1) } }
+        // Force one centroid to a degenerate near-zero norm so the guard's
+        // qNormSq=1.0-forced collapse is exercised.
+        centroids[3] = [Float](repeating: 0, count: d)
+
+        guard let outNormTrue = runGEMM(queries: queries, centroids: centroids, metric: .cosine, queriesAreNormalized: true) else {
+            return XCTFail("expected GEMM path to support cosine")
+        }
+        guard let outNormFalse = runGEMM(queries: queries, centroids: centroids, metric: .cosine, queriesAreNormalized: false) else {
+            return XCTFail("expected GEMM path to support cosine")
+        }
+
+        for qi in 0..<nq {
+            let refTrue = scalarReferenceScores(query: queries[qi], centroids: centroids, metric: .cosine, queryIsNormalized: true)
+            for ci in 0..<kc {
+                XCTAssertEqual(outNormTrue[qi * kc + ci], refTrue[ci], accuracy: 1e-3,
+                    "cosine queriesAreNormalized=true qi=\(qi) ci=\(ci) vs scalar reference")
+                XCTAssertEqual(outNormTrue[qi * kc + ci], outNormFalse[qi * kc + ci], accuracy: 1e-3,
+                    "cosine qi=\(qi) ci=\(ci): normalized-hint fast path must match recomputed-norm path on already-normalized data")
+            }
+            // Degenerate centroid must still be forced to exactly 1 (max
+            // distance) even under the queriesAreNormalized=true guard,
+            // where qNormSq is forced to 1.0 rather than recomputed.
+            XCTAssertEqual(outNormTrue[qi * kc + 3], 1.0, accuracy: 1e-6,
+                "degenerate centroid must be forced to distance 1 even with queriesAreNormalized=true")
         }
     }
 
