@@ -335,23 +335,92 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         let n = orderedIDs.count
         // Initialize centroids using deterministic k‑means++ (farthest‑point) seeding
         let initialCentroids = try kmeansPlusPlusInitRandom(k: k, seed: 42, flatData: flatData, count: n)
+
+        // FIX ROUND 1, CRITICAL: kmeans_minibatch_f32's own final-assignment
+        // pass is unconditionally L2-squared (see `kmeans(...)`'s doc
+        // comment) -- behavior-identical to the old per-vector rescan ONLY
+        // for metric == .euclidean. Every other membership/probe path in
+        // this actor (`insert`, `compact`, `update`, `search`) is
+        // metric-aware via `nearestCentroidIndex`/`centroidDistances`, so
+        // consuming the kernel's L2 `assignOut` unconditionally here would
+        // make list membership silently disagree with probing for
+        // non-euclidean indexes (recall degradation whenever nprobe <
+        // nlist, and `compact()` could reshuffle lists with zero store
+        // changes). Only ask the kernel for assignments when the metric
+        // matches what it actually computes.
+        let useKernelAssignments = (metric == .euclidean)
         var assignments = [Int32](repeating: -1, count: n)
         centroids = try await kmeans(
             centroids: initialCentroids, maxIterations: maxIterations,
-            flatData: flatData, count: n, assignOut: &assignments)
+            flatData: flatData, count: n,
+            computeAssignments: useKernelAssignments, assignOut: &assignments)
         rebuildCentroidCache()
-        // Build inverted lists directly from kmeans_minibatch_f32's own
-        // final-centroid assignment pass (see `kmeans(...)` below for why
-        // this is safe to consume directly rather than re-deriving via
-        // nearestCentroidIndex). Preserve the old rescan's edge behavior:
-        // an assignment outside `lists`' bounds is skipped, not force-fit.
+
         lists = Array(repeating: [], count: centroids.count)
         idToListIndex.removeAll(keepingCapacity: false)
-        for (i, id) in orderedIDs.enumerated() {
-            let ci = Int(assignments[i])
-            guard lists.indices.contains(ci) else { continue }
-            lists[ci].append(id)
-            idToListIndex[id] = ci
+
+        switch metric {
+        case .euclidean:
+            // kmeans_minibatch_f32's own final-centroid assignment pass --
+            // proven (Step 1 fact-check, see `kmeans(...)`'s doc comment) to
+            // be a dedicated post-training L2 argmin scan, behavior-identical
+            // to `nearestCentroidIndex`'s semantics for this metric. Preserve
+            // the old rescan's edge behavior: an assignment outside `lists`'
+            // bounds is skipped, not force-fit.
+            for (i, id) in orderedIDs.enumerated() {
+                let ci = Int(assignments[i])
+                guard lists.indices.contains(ci) else { continue }
+                lists[ci].append(id)
+                idToListIndex[id] = ci
+            }
+        case .cosine, .dotProduct:
+            // CentroidBatchScore (Task 7) is metric-aware and GEMM-batched:
+            // one sgemm cross-term for every (point, final-centroid) pair in
+            // a single call, replacing both the L2-only kernel path (wrong
+            // metric) and a per-vector nearestCentroidIndex rescan (right
+            // metric, but N separate scalar calls) with one batched pass.
+            let kc = centroids.count
+            var scores = [Float](repeating: 0, count: n * kc)
+            let ok = flatData.withUnsafeBufferPointer { qb in
+                centroidsFlat.withUnsafeBufferPointer { cb -> Bool in
+                    CentroidBatchScore.run(
+                        queries: qb.baseAddress!, q: n,
+                        centroids: cb.baseAddress!, kc: kc, d: d,
+                        metric: metric,
+                        centroidNormsSq: centroidNormsSq, centroidInvNorms: centroidInvNorms,
+                        queriesAreNormalized: false,
+                        out: &scores)
+                }
+            }
+            precondition(ok, "CentroidBatchScore must support cosine/dotProduct")
+            for (i, id) in orderedIDs.enumerated() {
+                let base = i * kc
+                var best = -1
+                var bestScore = Float.infinity
+                for ci in 0..<kc {
+                    let s = scores[base + ci]
+                    // Index-ascending first-min-wins (strict `<`, ascending
+                    // ci), matching nearestCentroidIndex's tie-break.
+                    if s < bestScore { bestScore = s; best = ci }
+                }
+                guard best >= 0, lists.indices.contains(best) else { continue }
+                lists[best].append(id)
+                idToListIndex[id] = best
+            }
+        default:
+            // manhattan/chebyshev: CentroidBatchScore has no GEMM form for
+            // these metrics (returns false) -- fall back to the pre-P3c
+            // per-vector nearestCentroidIndex rescan, unchanged, for these
+            // two rare metrics only. Correctness over throughput here;
+            // there is no batched path for them anywhere else in this file
+            // either (see `centroidScores`'s `default: break` case).
+            for id in orderedIDs {
+                let vec = store[id]!.0
+                if let ci = nearestCentroidIndex(for: vec), lists.indices.contains(ci) {
+                    lists[ci].append(id)
+                    idToListIndex[id] = ci
+                }
+            }
         }
     }
 
@@ -539,24 +608,30 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     //
     // P3c: `flatData`/`count` are now threaded in from the caller's single
     // store materialization (see `optimize`) instead of re-flattening
-    // `store` here. `computeAssignments: true` + `assignOut` wire up
-    // kmeans_minibatch_f32's own final-centroid assignment pass (see
-    // KMeansMiniBatchKernel.swift:687-706: this block runs AFTER the epoch
-    // training loop completes, scanning every one of the `n` input points
-    // against `centroidsOut` -- which at that point already holds the
-    // post-training final centroids -- via `_vi_km12_assignAOS`. That is a
-    // genuine final-pass assignment, not a stale pre-update one, and
-    // `_vi_km12_assignAOS`'s tie-break ("prefer lower centroid index",
-    // KMeansMiniBatchKernel.swift:341-359) is index-ascending first-min-wins
-    // over an ascending `c` scan -- behavior-identical to
-    // `nearestCentroidIndex`'s strict-`<` argmin. `cBest` is always in
-    // `0..<kc` (the assign loop never emits -1 or an out-of-range index),
-    // so the old rescan's `lists.indices.contains(ci)` guard is preserved
-    // in `optimize` purely as defensive belt-and-suspenders, not because
-    // this kernel is known to emit invalid indices.
+    // `store` here.
+    //
+    // FIX ROUND 1, CRITICAL: kmeans_minibatch_f32 has no metric parameter at
+    // all (KMeansMiniBatchKernel.swift:401-411) -- both its training loop
+    // AND its optional final-assignment pass are unconditionally
+    // L2-squared (`_vi_km12_assignAOS` / `_vi_km12_l2sq_aos`,
+    // KMeansMiniBatchKernel.swift:341-359 / :198). The doc comment
+    // previously here claimed the kernel's `assignOut` was safe to consume
+    // directly for list-building in general; that is true ONLY for
+    // `metric == .euclidean`, where the kernel's L2 argmin against final
+    // centroids is exactly what `nearestCentroidIndex` would also compute
+    // (see the Step-1 fact-check in the P3c task report for the detailed
+    // trace). For `.cosine`/`.dotProduct`/`.manhattan`/`.chebyshev` indexes,
+    // using the kernel's L2 `assignOut` for list membership would silently
+    // disagree with every other metric-aware membership/probe path
+    // (`nearestCentroidIndex`, `centroidDistances`, search probing) --
+    // `optimize` below now makes `computeAssignments` conditional on
+    // `metric == .euclidean` and derives non-euclidean assignments
+    // separately (metric-aware), so this kernel call's `assignOut` is only
+    // ever consumed by the caller when the metric is euclidean.
     private func kmeans(
         centroids initial: [[Float]], maxIterations: Int,
-        flatData: [Float], count: Int, assignOut: inout [Int32]
+        flatData: [Float], count: Int,
+        computeAssignments: Bool, assignOut: inout [Int32]
     ) async throws -> [[Float]] {
         precondition(!initial.isEmpty)
         let k = initial.count
@@ -576,12 +651,30 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             prefetchDistance: 8,
             layout: .aos,
             aosoaRegisterBlock: 0,
-            computeAssignments: true
+            computeAssignments: computeAssignments
         )
 
-        // Run kernel
-        let status = assignOut.withUnsafeMutableBufferPointer { ab in
-            kmeans_minibatch_f32(
+        // Run kernel. `computeAssignments` is only true for metric ==
+        // .euclidean (see caller) -- when false, `assignOut` is not wired
+        // in, so we don't pay for the kernel's O(N*k*d) L2 assignment scan
+        // just to discard it in favor of a metric-aware pass in `optimize`.
+        let status: KMeansMBStatus
+        if computeAssignments {
+            status = assignOut.withUnsafeMutableBufferPointer { ab in
+                kmeans_minibatch_f32(
+                    x: flatData,
+                    n: Int64(count),
+                    d: d,
+                    kc: k,
+                    initCentroids: flatCentroids,
+                    cfg: cfg,
+                    centroidsOut: &flatCentroids,
+                    assignOut: ab.baseAddress,
+                    statsOut: nil
+                )
+            }
+        } else {
+            status = kmeans_minibatch_f32(
                 x: flatData,
                 n: Int64(count),
                 d: d,
@@ -589,7 +682,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
                 initCentroids: flatCentroids,
                 cfg: cfg,
                 centroidsOut: &flatCentroids,
-                assignOut: ab.baseAddress,
+                assignOut: nil,
                 statsOut: nil
             )
         }
@@ -1412,11 +1505,25 @@ extension IVFIndex {
     /// batched scoring path -- both must agree to within that tolerance,
     /// not bit-for-bit, since they take different code paths to the same
     /// quantity.
+    /// FIX ROUND 1, IMPORTANT: previously iterated `idToListIndex`, which
+    /// made ids silently dropped by `optimize()`'s `lists.indices.contains`
+    /// guard invisible to this check -- a store id that never made it into
+    /// any list would simply be absent from `idToListIndex` and never
+    /// examined. Now iterates `store` (the full set of ids that must end up
+    /// assigned) and treats a missing `idToListIndex` entry as a mismatch in
+    /// its own right, plus an explicit `idToListIndex.count == store.count`
+    /// check, in addition to the existing per-id nearest-centroid distance
+    /// check (which is metric-aware via `centroidDistances`, since it
+    /// dispatches on `self.metric`).
     internal func _testAssignmentConsistency() -> (mismatches: Int, detail: String) {
         var mismatches = 0
         var details: [String] = []
-        for (id, ci) in idToListIndex {
-            guard let (vec, _) = store[id] else { continue }
+        for (id, (vec, _)) in store {
+            guard let ci = idToListIndex[id] else {
+                mismatches += 1
+                details.append("id=\(id) missing from idToListIndex")
+                continue
+            }
             let dists = centroidDistances(for: vec)
             guard !dists.isEmpty, dists.indices.contains(ci) else {
                 mismatches += 1
@@ -1429,6 +1536,10 @@ extension IVFIndex {
                 mismatches += 1
                 details.append("id=\(id) list=\(ci) assignedDist=\(assigned) minDist=\(minDist)")
             }
+        }
+        if idToListIndex.count != store.count {
+            mismatches += 1
+            details.append("count mismatch: idToListIndex=\(idToListIndex.count) store=\(store.count)")
         }
         let detail = details.isEmpty ? "" : details.prefix(5).joined(separator: "; ")
         return (mismatches, detail)
