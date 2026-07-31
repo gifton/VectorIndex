@@ -1464,47 +1464,60 @@ private func streamingKMeansppSeed(
         for u in 0..<dsub { outC[u] = x0[base0 + u] }
     }
 
+    // dminChunks[c][i]: running min distance^2 of point i (chunk c) to any chosen
+    // centroid so far. Seeded against centroid 0 below; each iteration folds in
+    // only the newest centroid (one l2Sq per point) instead of rescanning all
+    // 0..<k previously-chosen centroids from scratch (twice) as the prior
+    // O(n*ks^2) version did. Because min-folding is order/grouping-invariant and
+    // every l2Sq call below is against the exact same (point, centroid) operand
+    // pairs the old code used, the sum-pass and weighted-pick-pass values read
+    // from dmin here are bit-identical to the old full-recompute -- this is a
+    // pure restructuring, not a numerical change.
+    var dminChunks: [[Float]] = nChunks.map { [Float](repeating: .infinity, count: Int($0)) }
+    for (c, nc) in nChunks.enumerated() where nc > 0 {
+        var xc = xChunks[c]  // var required for &xc[index] syntax
+        for i in 0..<Int(nc) {
+            let base = i * d + j * dsub
+            dminChunks[c][i] = l2Sq(&xc[base], &outC[0], dsub)
+        }
+    }
+
     for k in 1..<ks {
         var sum: Double = 0
         for (c, nc) in nChunks.enumerated() where nc > 0 {
-            var xc = xChunks[c]  // var required for &xc[index] syntax
-            for i in 0..<Int(nc) {
-                let base = i * d + j * dsub
-                var md: Float = .infinity
-                for kk in 0..<k {
-                    let di = l2Sq(&xc[base], &outC[kk*dsub], dsub)
-                    if di < md { md = di }
-                }
-                sum += Double(md)
-            }
+            for i in 0..<Int(nc) { sum += Double(dminChunks[c][i]) }
         }
         if !(sum > 0) {
             let base = 0 * d + j * dsub
             for u in 0..<dsub { outC[k*dsub + u] = xChunks[0][base + u] }
-            continue
+        } else {
+            var r = rng.uniformF64() * sum
+            var chosen = false
+            outer: for (c, nc) in nChunks.enumerated() where nc > 0 {
+                let xc = xChunks[c]  // plain read here -- no &xc[index] pointer call in this loop
+                for i in 0..<Int(nc) {
+                    r -= Double(dminChunks[c][i])
+                    if r <= 0 {
+                        let base = i * d + j * dsub
+                        for u in 0..<dsub { outC[k*dsub + u] = xc[base + u] }
+                        chosen = true
+                        break outer
+                    }
+                }
+            }
+            if !chosen {
+                for u in 0..<dsub { outC[k*dsub + u] = outC[u] }
+            }
         }
 
-        var r = rng.uniformF64() * sum
-        var chosen = false
-        outer: for (c, nc) in nChunks.enumerated() where nc > 0 {
+        // Fold the newly chosen centroid k into the running dmin for every point.
+        for (c, nc) in nChunks.enumerated() where nc > 0 {
             var xc = xChunks[c]  // var required for &xc[index] syntax
             for i in 0..<Int(nc) {
                 let base = i * d + j * dsub
-                var md: Float = .infinity
-                for kk in 0..<k {
-                    let di = l2Sq(&xc[base], &outC[kk*dsub], dsub)
-                    if di < md { md = di }
-                }
-                r -= Double(md)
-                if r <= 0 {
-                    for u in 0..<dsub { outC[k*dsub + u] = xc[base + u] }
-                    chosen = true
-                    break outer
-                }
+                let di = l2Sq(&xc[base], &outC[k*dsub], dsub)
+                if di < dminChunks[c][i] { dminChunks[c][i] = di }
             }
-        }
-        if !chosen {
-            for u in 0..<dsub { outC[k*dsub + u] = outC[u] }
         }
     }
 }

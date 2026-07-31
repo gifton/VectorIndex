@@ -673,6 +673,93 @@ final class PQTrainTests: XCTestCase {
         print("✅ Streaming training: distortion=\(stats.distortion)")
     }
 
+    func testStreamingSeederSmallNTakesStreamingBranch() throws {
+        var nilNorms: [Float]?
+        // totalN <= 4*ks forces streamingKMeansppSeed (PQTrain.swift seedingCap):
+        // this is the O(ks^2) seeder's only test coverage.
+        let ks = 16, d = 16, m = 2, n = 40    // 40 <= 64 = 4*16
+        let dsub = d / m
+        let numChunks = 2
+        let chunkSize = n / numChunks
+
+        // Deterministic fast fill (LCG; same pattern/constant as testStreamingPQTraining).
+        var rng: UInt64 = 0x5773_7EA1_1234_5678
+        func rnd() -> Float {
+            rng = 2862933555777941757 &* rng &+ 3037000493
+            return Float(rng >> 40) / Float(1 << 24)
+        }
+
+        var fullData = [Float](repeating: 0, count: n * d)
+        for i in 0..<(n * d) {
+            fullData[i] = rnd() * 2 - 1
+        }
+
+        var xChunks = [[Float]]()
+        var nChunks = [Int64]()
+        for i in 0..<numChunks {
+            let start = i * chunkSize
+            let end = min(start + chunkSize, n)
+            let size = end - start
+            nChunks.append(Int64(size))
+            xChunks.append(Array(fullData[start*d..<end*d]))
+        }
+
+        var cfg = PQTrainConfig()
+        cfg.seed = 42
+        cfg.algo = .minibatch
+        cfg.maxIters = 10
+        cfg.batchSize = 512
+
+        var codebooks = [Float]()
+        let stats = try pq_train_streaming_f32(
+            xChunks: xChunks, nChunks: nChunks,
+            d: d, m: m, ks: ks,
+            cfg: cfg,
+            codebooksOut: &codebooks,
+            centroidNormsOut: &nilNorms
+        )
+
+        XCTAssertEqual(codebooks.count, m * ks * dsub)
+        for v in codebooks {
+            XCTAssertTrue(v.isFinite, "every output centroid component must be finite")
+        }
+        XCTAssertTrue(stats.distortion.isFinite, "distortion must be finite")
+
+        // Trivial all-zero-centroid distortion computed inline over the same data,
+        // aggregated the same way stats.distortion is (sum of per-subspace means).
+        var trivialDistortion: Double = 0
+        for j in 0..<m {
+            var sub: Double = 0
+            var cnt = 0
+            for c in 0..<numChunks {
+                let nc = Int(nChunks[c])
+                let xc = xChunks[c]
+                for i in 0..<nc {
+                    let base = i * d + j * dsub
+                    var ssq: Double = 0
+                    for u in 0..<dsub {
+                        let v = Double(xc[base + u])
+                        ssq += v * v
+                    }
+                    sub += ssq
+                    cnt += 1
+                }
+            }
+            if cnt > 0 { trivialDistortion += sub / Double(cnt) }
+        }
+        XCTAssertLessThan(stats.distortion, trivialDistortion, "trained distortion should beat the trivial all-zero-centroid baseline")
+
+        // SNAPSHOT: centroids[0..<4] harvested from the pre-fix O(ks^2) full-recompute
+        // seeder (swift test --filter PQTrainTests/testStreamingSeederSmallNTakesStreamingBranch
+        // against commit 40c02bb). The O(ks) restructure (Step 2) reads the same l2Sq
+        // distances via a running min instead of rescanning 0..<k each time, so these
+        // must survive unchanged -- that identity IS the parity gate for the rewrite.
+        XCTAssertEqual(codebooks[0], 0.38221052, accuracy: 1e-6)
+        XCTAssertEqual(codebooks[1], 0.09950597, accuracy: 1e-6)
+        XCTAssertEqual(codebooks[2], 0.09419185, accuracy: 1e-6)
+        XCTAssertEqual(codebooks[3], -0.17333749, accuracy: 1e-6)
+    }
+
     // MARK: - Performance Validation Tests
 
     func testLargeScaleTraining() throws {
