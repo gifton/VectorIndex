@@ -171,6 +171,120 @@ final class VIndexMmapErrorTests: XCTestCase {
         return (p == MAP_FAILED) ? nil : p
     }
 
+    /// Shared fixture for the P4 deferred-CRC tests below: a small, writable, pre-sized PQ8
+    /// container (mirrors the pattern in Kernel30AppendTests.testDurablePQ8AppendWithRemap /
+    /// RegressionA2 — `VIndexContainerBuilder.createMinimalContainer` then use directly).
+    /// `idCap`/`payloadCap` are sized generously relative to the tests' commit counts so the
+    /// (pre-existing, out-of-scope) growth-path limitations documented in MmapAppendBenchmark
+    /// never engage.
+    private func makeFixtureContainer(idCap: Int = 4096, payloadCap: Int = 4096, m: Int = 8) throws -> (IndexMmap, String) {
+        let path = tempPath()
+        let mmap = try VIndexContainerBuilder.createMinimalContainer(
+            path: path, format: .pq8, k_c: 1, m: m, d: 0,
+            idBits: 64, group: 4, idCap: idCap, payloadCap: payloadCap, includeIDMap: false)
+        return (mmap, path)
+    }
+
+    // MARK: - P4: deferred section CRCs (quadratic -> linear ingestion)
+
+    /// Failing-first test for the P4 design: `mmap_append_commit` must not hash any section
+    /// bytes (that was the O(N^2) driver — each commit re-hashed the *entire* IDs/Codes/Vecs/
+    /// ListsDesc sections). CRC freshness moves to `flush()` (and, transitively, `close()`).
+    func testCommitPathDefersSectionCRCs() throws {
+        let (mmap, path) = try makeFixtureContainer()
+        defer {
+            try? mmap.close()
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+        let m = 8
+        let addLen = 4
+        let before = mmap.crcBytesHashed
+        for c in 0..<50 {
+            let ids: [UInt64] = (0..<addLen).map { UInt64(c * addLen + $0) }
+            let codes = [UInt8](repeating: UInt8(truncatingIfNeeded: c), count: addLen * m)
+            let res = try mmap.mmap_append_begin(listID: 0, addLen: addLen)
+            try ids.withUnsafeBufferPointer { idBuf in
+                try codes.withUnsafeBufferPointer { codeBuf in
+                    try mmap.mmap_append_commit(res,
+                        idsSrc: UnsafeRawPointer(idBuf.baseAddress!),
+                        codesSrc: UnsafeRawPointer(codeBuf.baseAddress!),
+                        vecsSrc: nil)
+                }
+            }
+        }
+        XCTAssertEqual(mmap.crcBytesHashed - before, 0,
+            "commits must not hash section bytes; CRCs are deferred to flush/close")
+        try mmap.flush()
+        XCTAssertGreaterThan(mmap.crcBytesHashed - before, 0,
+            "flush recomputes and persists section CRCs")
+    }
+
+    /// Crash-window test: an unclean shutdown (handle dropped without `close()`, so section CRCs
+    /// are stale and the WAL is non-empty) must not make a reopen throw a spurious section-CRC
+    /// mismatch. Reopening applies WAL replay (unchanged algorithm — see
+    /// testWalReplayAppliesLengthFromValidCommitRecord), recomputes+persists CRCs, and truncates
+    /// the WAL; a *second* reopen (now clean) verifies CRCs strictly, exactly as before P4.
+    func testUncleanCloseThenReopenRecomputesCRCsViaWAL() throws {
+        let path = tempPath()
+        let m = 4
+        var mmap: IndexMmap? = try VIndexContainerBuilder.createMinimalContainer(
+            path: path, format: .pq8, k_c: 1, m: m, d: 0, idCap: 16, payloadCap: 16, includeIDMap: false)
+        defer {
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+
+        let n = 3
+        let ids: [UInt64] = [10, 11, 12]
+        let codes = [UInt8](repeating: 7, count: n * m)
+        let res = try mmap!.mmap_append_begin(listID: 0, addLen: n)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap!.mmap_append_commit(res,
+                    idsSrc: UnsafeRawPointer(idBuf.baseAddress!),
+                    codesSrc: UnsafeRawPointer(codeBuf.baseAddress!),
+                    vecsSrc: nil)
+            }
+        }
+        XCTAssertEqual(mmap!.getListDescriptor(listID: 0)?.length, n, "sanity: commit landed")
+        XCTAssertEqual(mmap!.crcBytesHashed, 0,
+            "sanity: the commit above must not have hashed any section bytes")
+
+        // Simulate a crash: drop the handle WITHOUT close(), so flush() never runs. Section CRCs
+        // on disk are now stale relative to the (already-durable, per-commit-msync'd) payload
+        // bytes and ListsDesc length; the WAL still holds the append+commit records.
+        mmap!._abandonWithoutClose()
+        mmap = nil
+
+        // Reopen (writable, so the repair branch can run): must NOT throw a section-CRC
+        // mismatch despite the stale on-disk CRCs, because the non-empty WAL marks the
+        // container unclean and strict verification is skipped in favor of replay + repair.
+        var reopenOpts = MmapOpts(); reopenOpts.readOnly = false
+        let reopened = try IndexMmap.open(path: path, opts: reopenOpts)
+        XCTAssertEqual(reopened.getListDescriptor(listID: 0)?.length, n,
+            "replay must restore the committed length")
+
+        // Data reads back correctly through the repaired handle.
+        let desc = try XCTUnwrap(reopened.getListDescriptor(listID: 0))
+        let idsBase = try XCTUnwrap(reopened.idsBase())
+        var gotIDs: [UInt64] = []
+        for i in 0..<n {
+            var v: UInt64 = 0
+            memcpy(&v, idsBase.advanced(by: Int(desc.idsOff) + i * desc.idsStride), 8)
+            gotIDs.append(v)
+        }
+        XCTAssertEqual(gotIDs, ids)
+        try reopened.close()
+
+        // Second reopen: the repair above truncated the WAL, so the container is now clean and
+        // strict section-CRC verification must pass (exactly as it did pre-P4).
+        var reopenOpts2 = MmapOpts(); reopenOpts2.readOnly = true
+        let reopened2 = try IndexMmap.open(path: path, opts: reopenOpts2)
+        XCTAssertEqual(reopened2.getListDescriptor(listID: 0)?.length, n)
+        try reopened2.close()
+    }
+
     // MARK: - WAL replay (B13) — no prior coverage existed for mmap_wal_replay at all.
 
     /// Locates the ListsDesc section's file offset by parsing the header + TOC directly
