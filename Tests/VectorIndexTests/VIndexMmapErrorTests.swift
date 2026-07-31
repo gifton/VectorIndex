@@ -390,4 +390,205 @@ final class VIndexMmapErrorTests: XCTestCase {
         XCTAssertEqual(mmap.getListDescriptor(listID: 0)?.length, 0,
                        "corrupt append record must halt replay before the commit record is ever applied")
     }
+
+    // MARK: - Fix round 1 (review of commit bf9566e): C1, I2, I3
+
+    /// C1 (Critical), REQUIRED covering test per the reviewer's finding: a failed *writable*
+    /// `open()` used to have deinit's `close()` call `flush()`, which recomputed CRCs from
+    /// whatever (corrupt) bytes were on disk and persisted them — silently "repairing" the
+    /// checksum over the corruption and destroying detectability on every future open. Reuses
+    /// `testSectionCRCMismatchThrows`'s corruption technique but (a) opens `readOnly = false`
+    /// (the vulnerable path — `testSectionCRCMismatchThrows` itself only exercises the default
+    /// `readOnly = true`, which never called `flush()` even pre-fix) and (b) pins the on-disk TOC
+    /// bytes byte-for-byte across the failed open, not just the thrown error.
+    func testFailedWritableOpenDoesNotRewriteSectionCRCs() throws {
+        let path = tempPath()
+        let mmap = try VIndexContainerBuilder.createMinimalContainer(path: path, format: .pq8, k_c: 1, m: 8, d: 0, includeIDMap: false)
+        try mmap.close()
+        defer { _ = try? FileManager.default.removeItem(atPath: path); _ = try? FileManager.default.removeItem(atPath: path + ".wal") }
+
+        let fd = Darwin.open(path, O_RDWR | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { _ = Darwin.close(fd) }
+        let hdrSize = 256
+        var hdrBuf = [UInt8](repeating: 0, count: hdrSize)
+        _ = hdrBuf.withUnsafeMutableBytes { pread(fd, $0.baseAddress, hdrSize, 0) }
+        let tocOffset = hdrBuf.withUnsafeBytes { readUnalignedLE64($0.baseAddress!.advanced(by: 56)) }
+        let tocEntries = Int(hdrBuf.withUnsafeBytes { readUnalignedLE32($0.baseAddress!.advanced(by: 64)) })
+        XCTAssertGreaterThanOrEqual(tocEntries, 2)
+        let DISK_TOC_ENTRY_SIZE = 36
+        var tocAll = [UInt8](repeating: 0, count: tocEntries * DISK_TOC_ENTRY_SIZE)
+        let tocBytes = tocAll.count
+        XCTAssertEqual(tocAll.withUnsafeMutableBytes { pread(fd, $0.baseAddress, tocBytes, off_t(tocOffset)) }, tocBytes)
+        var idsOffset: UInt64 = 0
+        var foundIDs = false
+        tocAll.withUnsafeBytes { raw in
+            for i in 0..<tocEntries {
+                let base = raw.baseAddress!.advanced(by: i * DISK_TOC_ENTRY_SIZE)
+                if readUnalignedLE32(base) == SectionType.ids.rawValue {
+                    idsOffset = readUnalignedLE64(base.advanced(by: 4))
+                    foundIDs = true
+                    break
+                }
+            }
+        }
+        XCTAssertTrue(foundIDs, "IDs TOC entry not found")
+        var one = [UInt8](repeating: 0, count: 1)
+        _ = one.withUnsafeMutableBytes { pread(fd, $0.baseAddress, 1, off_t(idsOffset)) }
+        one[0] ^= 0xFF
+        _ = one.withUnsafeBytes { pwrite(fd, $0.baseAddress, 1, off_t(idsOffset)) }
+
+        // Snapshot the ENTIRE on-disk TOC (every entry's offset/size/align/flags/crc32) right
+        // after corrupting, before the vulnerable open.
+        var tocBefore = [UInt8](repeating: 0, count: tocBytes)
+        XCTAssertEqual(tocBefore.withUnsafeMutableBytes { pread(fd, $0.baseAddress, tocBytes, off_t(tocOffset)) }, tocBytes)
+
+        var opts = MmapOpts(); opts.readOnly = false; opts.verifyCRCs = true
+        do {
+            _ = try IndexMmap.open(path: path, opts: opts)
+            XCTFail("Expected section CRC mismatch to throw on a writable open")
+        } catch let e as VectorIndexError {
+            XCTAssertEqual(e.kind, .corruptedData)
+            XCTAssertTrue(e.message.lowercased().contains("section"))
+        }
+
+        var tocAfter = [UInt8](repeating: 0, count: tocBytes)
+        XCTAssertEqual(tocAfter.withUnsafeMutableBytes { pread(fd, $0.baseAddress, tocBytes, off_t(tocOffset)) }, tocBytes)
+        XCTAssertEqual(tocBefore, tocAfter,
+            "a failed writable open must not rewrite ANY on-disk TOC bytes (CRCs included) -- " +
+            "doing so would self-certify the corrupt section and permanently destroy detectability")
+
+        // Re-open readOnly (deinit's close() never calls flush() for readOnly handles either
+        // way) to confirm the corruption is still detected -- i.e. genuinely not repaired.
+        var reopenOpts = MmapOpts(); reopenOpts.readOnly = true; reopenOpts.verifyCRCs = true
+        do {
+            _ = try IndexMmap.open(path: path, opts: reopenOpts)
+            XCTFail("Expected the corruption to still be detected on a subsequent open")
+        } catch let e as VectorIndexError {
+            XCTAssertEqual(e.kind, .corruptedData)
+        }
+    }
+
+    /// I2 (Important): the growth branch of `mmap_append_begin` mutates IDs/Codes sections
+    /// directly (relocation memcpys) and refreshes only ListsDesc's own CRC, entirely outside
+    /// the commit/WAL protocol. Without a pessimistic WAL write *before* that mutation, a crash
+    /// between `mmap_append_begin` (growth done) and the matching `mmap_append_commit` would
+    /// leave an empty WAL (the clean marker) next to stale IDs/Codes CRCs, and the next open
+    /// would strict-verify and throw a false-positive corruption error.
+    ///
+    /// The growth branch always attempts IDs first, and — per the pre-existing, documented,
+    /// out-of-scope defect ("only the last-by-offset section can grow, so IDs can never grow";
+    /// see MmapAppendBenchmark's fixture comment) — that attempt always eventually fails its own
+    /// "offset/capacity exceed section size" sanity check, because the IDs section's on-disk size
+    /// is frozen at build time while growth always requests at least double the current capacity.
+    /// That failure happens *after* the relocation memcpys, so it is actually the sharper version
+    /// of the scenario I2 describes: real payload mutation happened, then the call unwound via a
+    /// thrown error instead of continuing on into a matching `mmap_append_commit` at all. This
+    /// test therefore expects `mmap_append_begin` to throw, and checks the WAL/reopen behavior
+    /// around that.
+    func testGrowthWritesWalSentinelBeforeMutatingPayloadSections() throws {
+        let path = tempPath()
+        let m = 4
+        var mmap: IndexMmap? = try VIndexContainerBuilder.createMinimalContainer(
+            path: path, format: .pq8, k_c: 1, m: m, d: 0, idCap: 2, payloadCap: 2, includeIDMap: false)
+        defer {
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+        let walPath = path + ".wal"
+
+        var st = stat()
+        XCTAssertEqual(stat(walPath, &st), 0)
+        XCTAssertEqual(st.st_size, 0, "sanity: WAL starts empty on a freshly built container")
+
+        // addLen=5 > idCap/payloadCap(=2) forces the growth branch, entirely inside begin -- no
+        // commit has happened yet. Expected to throw once it reaches the IDs sanity check (see
+        // doc comment above); the sentinel write and the relocation memcpys both happen first.
+        do {
+            _ = try mmap!.mmap_append_begin(listID: 0, addLen: 5)
+            XCTFail("Expected the pre-existing IDs-cannot-grow limitation to throw here")
+        } catch is VectorIndexError {
+            // Expected -- see doc comment.
+        }
+
+        XCTAssertEqual(stat(walPath, &st), 0)
+        XCTAssertGreaterThan(st.st_size, 0,
+            "growth must pessimistically mark the WAL non-empty before mutating payload sections, " +
+            "even when the growth attempt itself later fails")
+
+        // Simulate a crash right after the failed growth attempt.
+        mmap!._abandonWithoutClose()
+        mmap = nil
+
+        // Reopen (writable, so the unclean-repair branch can run) must not throw a spurious
+        // section-CRC mismatch despite the growth branch having already mutated section bytes
+        // before failing. List length must still be 0 -- no commit ever completed, so WAL replay
+        // has nothing to apply.
+        var reopenOpts = MmapOpts(); reopenOpts.readOnly = false
+        let reopened = try IndexMmap.open(path: path, opts: reopenOpts)
+        XCTAssertEqual(reopened.getListDescriptor(listID: 0)?.length, 0)
+        try reopened.close()
+    }
+
+    /// I3 (Important): `ensureFileCapacity`'s remap `munmap()`s the old mapping before attempting
+    /// the replacement `mmap()`; if that `mmap()` fails, `base` is left dangling for the rest of
+    /// the handle's life. `close()`/`flush()` must detect that (via `mappingValid`) and skip all
+    /// `base`-touching work instead of reading/writing through a dangling pointer (which would at
+    /// best crash the process and at worst corrupt unrelated memory if the address range was
+    /// since reused). A real remap failure is OS/environment-dependent and not reliably
+    /// reproducible (see `testEnsureCapacityGrowOrRemapFailure`'s own `XCTSkip` for the same
+    /// reason), so this uses the `_simulateDanglingMapping()` test hook to set the exact
+    /// post-failed-remap flag state deterministically -- it flips `mappingValid` WITHOUT actually
+    /// unmapping anything, so "close() doesn't crash" alone can't distinguish the guard being
+    /// present from absent (the underlying memory stays perfectly valid either way in this
+    /// simulation). The meaningful, guard-sensitive assertion instead: P4 already means the
+    /// on-disk TOC CRCs are stale relative to the just-committed payload the moment this test
+    /// simulates the dangle, so if `close()`'s flush() actually ran, it would rewrite those CRC
+    /// bytes to match; if the `mappingValid` guard correctly skips it, they stay exactly as they
+    /// were.
+    func testCloseAfterDanglingMappingLeavesOnDiskTOCUntouched() throws {
+        let (mmap, path) = try makeFixtureContainer()
+        defer {
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+        let m = 8, addLen = 4
+        let ids: [UInt64] = (0..<addLen).map { UInt64($0) }
+        let codes = [UInt8](repeating: 1, count: addLen * m)
+        let res = try mmap.mmap_append_begin(listID: 0, addLen: addLen)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap.mmap_append_commit(res,
+                    idsSrc: UnsafeRawPointer(idBuf.baseAddress!),
+                    codesSrc: UnsafeRawPointer(codeBuf.baseAddress!),
+                    vecsSrc: nil)
+            }
+        }
+        XCTAssertEqual(mmap.crcBytesHashed, 0, "sanity: the commit above deferred all CRC hashing")
+
+        // Snapshot the on-disk TOC right after the commit -- these CRC bytes are already stale
+        // relative to the just-written payload (that staleness is the whole point of P4), so a
+        // real flush() here would visibly change them.
+        let fd = Darwin.open(path, O_RDONLY | O_CLOEXEC)
+        XCTAssertGreaterThanOrEqual(fd, 0)
+        defer { _ = Darwin.close(fd) }
+        var hdrBuf = [UInt8](repeating: 0, count: 256)
+        _ = hdrBuf.withUnsafeMutableBytes { pread(fd, $0.baseAddress, 256, 0) }
+        let tocOffset = hdrBuf.withUnsafeBytes { readUnalignedLE64($0.baseAddress!.advanced(by: 56)) }
+        let tocEntries = Int(hdrBuf.withUnsafeBytes { readUnalignedLE32($0.baseAddress!.advanced(by: 64)) })
+        let DISK_TOC_ENTRY_SIZE = 36
+        let tocBytes = tocEntries * DISK_TOC_ENTRY_SIZE
+        var tocBefore = [UInt8](repeating: 0, count: tocBytes)
+        XCTAssertEqual(tocBefore.withUnsafeMutableBytes { pread(fd, $0.baseAddress, tocBytes, off_t(tocOffset)) }, tocBytes)
+
+        mmap._simulateDanglingMapping()
+        XCTAssertNoThrow(try mmap.close(),
+            "close() must not crash or throw when the mapping is marked invalid")
+
+        var tocAfter = [UInt8](repeating: 0, count: tocBytes)
+        XCTAssertEqual(tocAfter.withUnsafeMutableBytes { pread(fd, $0.baseAddress, tocBytes, off_t(tocOffset)) }, tocBytes)
+        XCTAssertEqual(tocBefore, tocAfter,
+            "close() must skip flush() entirely once mappingValid is false -- it must not " +
+            "recompute/persist CRCs (or touch the mapping in any other way)")
+    }
 }

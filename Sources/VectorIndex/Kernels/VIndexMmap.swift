@@ -225,6 +225,28 @@ internal final class IndexMmap {
     /// `Darwin.close(fd)`/`munmap` (the `fd` value can be reused by an unrelated open by then).
     private var released = false
 
+    /// Set to `true` only at the very end of a fully-successful `indexInit()` (fix round 1, C1).
+    /// If `indexInit()` throws partway through (corrupt-CRC, misaligned section, unknown
+    /// section type, ...), `open()`'s local `idx` reference count drops to zero and `deinit`
+    /// runs `try? close()` on the half-initialized instance. Without this gate, a writable
+    /// `close()` would call `flush()` → `recomputeAllSectionCRCs()`, which recomputes CRCs from
+    /// whatever bytes are currently on disk — including the *corrupt* bytes that just failed
+    /// verification — and persists them, self-certifying the corruption and permanently
+    /// destroying detectability on every future open. `close()` only calls `flush()` when this
+    /// is `true`, i.e. only for handles that actually completed `indexInit()`.
+    private var initialized = false
+
+    /// `false` exactly while `base` is dangling: `ensureFileCapacity`'s remap clears this right
+    /// before `munmap`-ing the old mapping, and only sets it back once the replacement `mmap()`
+    /// call succeeds (fix round 1, I3). If that `mmap()` fails, `ensureFileCapacity` throws with
+    /// this still `false`, and `base` stays dangling for the rest of this handle's life (the
+    /// growth path itself is out of scope for that repair — see the task-3 brief). `flush()` and
+    /// `close()`'s own msync/munmap both check this before touching `base`, so a later `close()`
+    /// (including the one `deinit` runs) degrades to releasing just the file descriptors instead
+    /// of dereferencing/rewriting through a pointer into unmapped (possibly since-reused) address
+    /// space.
+    private var mappingValid = true
+
     private var secCentroids: UnsafePointer<Float>?
     private var secCodebooks: UnsafePointer<Float>?
     private var secCentroidNorms: UnsafePointer<Float>?
@@ -383,6 +405,9 @@ internal final class IndexMmap {
         // to 0 bytes *before* unmapping. An empty WAL is this format's clean/unclean marker
         // (see indexInit's walDirty branch) — only writable handles hold a WAL fd, so this is
         // a no-op for read-only handles (flush() itself also guards on opts.readOnly).
+        // `initialized` (C1) additionally gates this: a handle whose indexInit() never finished
+        // must not self-certify whatever bytes are currently on disk. flush() independently
+        // re-checks `mappingValid` (I3) before touching `base`.
         //
         // flush()'s error (if any) is captured rather than propagated immediately: `released`
         // is already latched above, so an early `throw` here would skip the munmap/fd cleanup
@@ -391,12 +416,19 @@ internal final class IndexMmap {
         // Resources are always released; a flush failure is still surfaced to the caller, just
         // after cleanup has run.
         var flushError: Error?
-        if !opts.readOnly {
+        if !opts.readOnly && initialized {
             do { try flush() } catch { flushError = error }
         }
         if walFD >= 0 { _ = Darwin.close(walFD); walFD = -1 }
-        _ = msync(base, Int(fileSize), MS_SYNC)
-        _ = munmap(base, Int(fileSize))
+        // I3: `base` is dangling whenever a growth-triggered remap's `mmap()` call failed after
+        // its `munmap()` of the old mapping already ran (see ensureFileCapacity). Touching `base`
+        // in that state — even via msync/munmap — is unsafe (undefined behavior; on some
+        // platforms these can also fail loudly rather than silently). Skip both and still release
+        // the file descriptors below.
+        if mappingValid {
+            _ = msync(base, Int(fileSize), MS_SYNC)
+            _ = munmap(base, Int(fileSize))
+        }
         _ = Darwin.close(fd)
         if let flushError { throw flushError }
     }
@@ -412,8 +444,19 @@ internal final class IndexMmap {
         guard !released else { return }
         released = true
         if walFD >= 0 { _ = Darwin.close(walFD); walFD = -1 }
-        _ = munmap(base, Int(fileSize))
+        if mappingValid { _ = munmap(base, Int(fileSize)) }
         _ = Darwin.close(fd)
+    }
+
+    /// Test-only (fix round 1, I3): marks the mapping invalid WITHOUT actually unmapping it, so
+    /// tests can verify `close()`/`flush()` skip all `base`-touching work when this invariant is
+    /// violated — exactly what `ensureFileCapacity` leaves behind after `munmap()` succeeds but
+    /// the replacement `mmap()` fails — without needing to force a real remap failure (OS/
+    /// environment-dependent, not reliably reproducible in a portable unit test). The real
+    /// mapping underneath is untouched; if the caller wants a fully clean teardown after this,
+    /// it must not rely on the (now `mappingValid`-gated) msync/munmap in `close()`.
+    internal func _simulateDanglingMapping() {
+        mappingValid = false
     }
 
     private func slice(_ e: HostTOCEntry) -> UnsafeMutableRawPointer {
@@ -549,6 +592,11 @@ internal final class IndexMmap {
                 try truncateWAL()
             }
         }
+        // C1: only reached if every step above succeeded. Gates close()'s flush() call so a
+        // handle whose indexInit() threw (corrupt section CRC, misaligned section, ...) never
+        // has its (corrupt) on-disk bytes "repaired" into self-certified CRCs by the deinit ->
+        // close() path that runs when open()'s failed-init `idx` reference is released.
+        initialized = true
     }
 
     public func mmapCentroids() -> (ptr: UnsafePointer<Float>, kc: Int, d: Int)? {
@@ -714,10 +762,13 @@ internal final class IndexMmap {
 
     /// Recomputes+persists all section CRCs, syncs the mapping, then truncates the WAL to mark
     /// the container clean (P4). Internal class, so this is zero public-surface-area impact.
-    /// No-op for read-only handles (nothing to write back). Called by `close()` before unmapping,
-    /// and by `indexInit()`'s unclean-reopen repair branch after WAL replay.
+    /// No-op for read-only handles (nothing to write back) and — fix round 1, I3 — no-op whenever
+    /// `mappingValid` is `false`, since `recomputeAllSectionCRCs()`/`msyncPageAligned` both
+    /// dereference `base`, which is left dangling by a failed growth-triggered remap (see
+    /// `ensureFileCapacity`). Called by `close()` before unmapping, and by `indexInit()`'s
+    /// unclean-reopen repair branch after WAL replay.
     public func flush() throws {
-        guard !opts.readOnly else { return }
+        guard !opts.readOnly, mappingValid else { return }
         try recomputeAllSectionCRCs()
         msyncPageAligned(base, Int(fileSize))
         try truncateWAL()
@@ -749,6 +800,18 @@ internal final class IndexMmap {
     private struct WalCommit { var tag: UInt32; var listID: UInt32; var newLen: UInt32; var crc32: UInt32 }
     private let WAL_APPEND_TAG: UInt32 = 0xAABBCCDD
     private let WAL_COMMIT_TAG: UInt32 = 0xDDCCBBAA
+    /// Fix round 1, I2: written (4 raw bytes, no payload) as the very first on-disk mutation of
+    /// `mmap_append_begin`'s growth branch, before `ensureFileCapacity`/the relocation memcpys
+    /// touch IDs/Codes/Vecs. Growth mutates those sections directly (outside the commit/WAL
+    /// protocol — `writeListDescOffsets` only refreshes ListsDesc's own CRC), so without this a
+    /// crash between a growth event and its still-pending `mmap_append_commit` would leave an
+    /// *empty* WAL (this format's clean marker) next to now-stale IDs/Codes CRCs, and the next
+    /// open would strict-verify and throw a false-positive corruption error on an otherwise-fine
+    /// container. Writing this sentinel first makes the WAL pessimistically non-empty for the
+    /// whole duration of the growth+append+commit sequence, so an unclean reopen always routes
+    /// through replay+recompute instead of strict verification. `mmap_wal_replay` recognizes and
+    /// skips it (does not `break` — real records may still follow).
+    private let WAL_GROWTH_SENTINEL_TAG: UInt32 = 0x53454E54 // ASCII "SENT", arbitrary/distinct from the tags above
 
     public func mmap_append_begin(listID: Int, addLen: Int) throws -> AppendReservation {
         guard !opts.readOnly, listID >= 0, listID < kc else {
@@ -778,6 +841,13 @@ internal final class IndexMmap {
         if addLen <= 0 { return AppendReservation(listID: listID, oldLen: oldLen, addLen: 0, idsFileOffset: currIDsOff, codesFileOffset: currCodesOff, vecsFileOffset: currVecsOff, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride) }
 
         if need > cap {
+            // I2: pessimistically mark the WAL non-empty *before* any on-disk mutation below
+            // (ensureFileCapacity's ftruncate/remap, the IDs/Codes/Vecs relocation memcpys, and
+            // writeListDescOffsets, which only refreshes ListsDesc's own CRC). None of that is
+            // covered by the append/commit WAL protocol below — it happens here, in begin, not
+            // commit — so without this a crash before the matching mmap_append_commit call would
+            // leave an empty WAL (this format's clean marker) next to stale IDs/Codes CRCs.
+            try writeWalSentinel()
             guard mapSection(.ids) != nil else {
                 throw ErrorBuilder(.capacityExceeded, operation: "mmap_append_begin")
                     .message("Cannot grow IDs section")
@@ -997,7 +1067,12 @@ internal final class IndexMmap {
         while true {
             guard let tagBytes = readExact(4) else { break }
             let tag = tagBytes.withUnsafeBytes { UInt32(littleEndian: $0.load(as: UInt32.self)) }
-            if tag == WAL_APPEND_TAG {
+            if tag == WAL_GROWTH_SENTINEL_TAG {
+                // I2: no payload beyond the tag — skip and keep replaying. Unlike an unrecognized
+                // tag, this must NOT stop replay: real append/commit records for the growth's
+                // eventual commit (or from unrelated later commits) can follow it in the log.
+                continue
+            } else if tag == WAL_APPEND_TAG {
                 guard let rest = readExact(recordSizeAppend - 4) else { break }
                 // rest = listID(4) oldLen(4) delta(4) idsOff(8) codesOff(8) vecsOff(8) crc32(4) = 40 bytes
                 let storedCRC = rest.withUnsafeBytes { UInt32(littleEndian: $0.load(fromByteOffset: 36, as: UInt32.self)) }
@@ -1086,6 +1161,11 @@ internal final class IndexMmap {
             // Remap
             _ = msync(base, Int(fileSize), MS_SYNC)
             _ = munmap(base, Int(fileSize))
+            // I3: `base` is dangling from this point until the remap below succeeds. If `mmap()`
+            // fails, this stays `false` for the rest of the handle's life — flush()/close() check
+            // it before ever dereferencing `base` again. Deliberately not attempting any repair
+            // of the wider growth path here (out of scope for this fix — see the task-3 brief).
+            mappingValid = false
             let newMap = mmap(nil, Int(newSize), prot, MAP_SHARED, fd, 0)
             if newMap == MAP_FAILED {
                 throw ErrorBuilder(.mmapError, operation: "ensure_file_capacity")
@@ -1096,6 +1176,7 @@ internal final class IndexMmap {
             }
             base = newMap!
             fileSize = newSize
+            mappingValid = true
             // Rebuild TOC map (packed)
             tocByType.removeAll(keepingCapacity: true)
             let tocOff = Int(toHost(header.toc_offset, fileEndian: fileEndian))
@@ -1199,6 +1280,31 @@ internal final class IndexMmap {
         if fsync(walFD) != 0 {
             throw ErrorBuilder(.fileIOError, operation: "wal_write_commit")
                 .message("Failed to fsync WAL file")
+                .info("errno", "\(errno)")
+                .build()
+        }
+    }
+
+    /// Fix round 1, I2: writes the 4-byte growth sentinel (see `WAL_GROWTH_SENTINEL_TAG`) and
+    /// fsyncs. No payload, no CRC of its own — its only job is to make `st_size > 0` true before
+    /// `mmap_append_begin`'s growth branch mutates IDs/Codes/Vecs directly. Guards on `walFD >= 0`
+    /// defensively; callers only reach this from an already-writable append path, where
+    /// `indexInit()` guarantees the WAL fd is open.
+    private func writeWalSentinel() throws {
+        guard walFD >= 0 else { return }
+        var tag = WAL_GROWTH_SENTINEL_TAG.littleEndian
+        let wrote = withUnsafeBytes(of: &tag) { write(walFD, $0.baseAddress!, $0.count) }
+        if wrote != MemoryLayout<UInt32>.size {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_sentinel")
+                .message("Failed to write WAL growth sentinel record")
+                .info("expected_bytes", "\(MemoryLayout<UInt32>.size)")
+                .info("written_bytes", "\(wrote)")
+                .info("errno", "\(errno)")
+                .build()
+        }
+        if fsync(walFD) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_sentinel")
+                .message("Failed to fsync WAL file after growth sentinel")
                 .info("errno", "\(errno)")
                 .build()
         }
