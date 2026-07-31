@@ -6,7 +6,45 @@ convention: the minor digit signals breaking changes.
 ## [Unreleased] — 0.2.0
 
 ### Changed
-<!-- cleanup / perf appended per task -->
+
+- Telemetry consolidated onto the push-callback recorders and the dedup pull API,
+  now accuracy-tested; the never-compiled `VINDEX_TELEM` histogram singleton and the
+  internal `IDMapOpts.enableTelemetry` flag are gone outright. The public
+  `VisitedOpts.enableTelemetry` flag (never read, gates nothing) is deprecated rather
+  than deleted, since it's genuinely public API — non-breaking constraint. (B1, re-scoped)
+- `CS2RNG` C target removed; its unique test coverage ported to the pure-Swift RNG API. (B2)
+- `L2SqrMicrobench` dev target and stray `PQTrain.swift.new`/`.tmp` files removed. (B4)
+- Dead/no-op internals deleted across kernels: `DispatchBK`, alignment/prefetch no-ops,
+  the tiled-assign wrapper, unused `selectNeighbors`/`selectBatchSize`, unreachable
+  `sumSquares`. (B5–B7, B10, B20)
+- One sum-of-squares implementation (`Norms.l2NormSquared`); scalar distance-kernel
+  families unified. (B8, B10)
+- MIPSTransform internals routed to the canonical scoring kernels; its dead public
+  surface is deprecated pending the 0.2.0 breaking phase. (B3)
+- mmap tidy: single `CRC32`, shared disk-layout structs, in-place header hashing,
+  WAL append-record CRC validated on replay. (B11, B13)
+- `IDMap` keeps only the SwissTable backend. (B12)
+- `IDFilter`/`CandidateReservoir`/sparse-paged dedup refactored under new
+  characterization tests (previously untested); `BoundedTopKHeap` replaces the
+  duplicated min/max heaps. (B14–B16)
+- Rerank pointer smuggling now uses the shared `UnsafeSendable` box; HNSW neighbor
+  selection and compaction stop reallocating distance arrays per comparison; IVF's
+  `optimize`/`optimizeKMeans` are unified behind a new `optimize(maxIterations: Int = 20)`
+  overload that carries the single real implementation (fixing `optimizeKMeans`'s
+  missing `idToListIndex` population), with the zero-arg `optimize()` kept as the
+  `VectorIndexProtocol` witness, forwarding to it (protocol requirement unchanged);
+  HNSW init/metric/context-storage tidy. (B17–B19)
+
+### Deprecated
+
+- Scheduled for removal in the 0.2.0 breaking phase: the entire `MIPSTransform` public
+  surface (9 symbols; dead, zero callers); `hnsw_prune_neighbors_f32_swift` and its
+  `@_cdecl` shim; `IDMap`'s `.robinHood`/`.linearProbing` cases (now silently resolve to
+  SwissTable); the array-based `topKIVF` overload, `scoresIVF`, and
+  `IVFPostADC.rerankTopKFlat`; `RerankOpts.returnSorted`; `VisitedOpts.enableTelemetry`;
+  and the 9 dead `Telemetry` public shells (`QueryCtx`, `TelemetryConfig`,
+  `TelemetryGlobal`, `TelemetryCounter`, `TelemetryBytes`, `TelemetryDoubleField`,
+  `TelemetryU64Field`, `TelemetryTimerGuard`, `TelemetryTimerToken`).
 
 ### Removed
 <!-- breaking removals appended per task -->
