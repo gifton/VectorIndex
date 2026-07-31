@@ -190,13 +190,21 @@ struct VectorIndexBenchmarks {
                 row += strideStep
             }
             let recall = totalRecall / Double(sampled)
-            print("""
-            {"benchmark": "hnsw_knn_graph", "n": \(config.n), "dim": \(config.dim), "k": \(config.k), \
-            "m": \(config.m), "efc": \(config.efc), "efs": \(config.efs), "seed": \(config.seed), \
-            "insert_sec": \(insertSec), "build_sec": \(buildSec), \
-            "points_per_sec": \(Double(config.n) / buildSec), "edges": \(graph.edgeCount), \
-            "recall_at_\(config.k)_sample\(sampled)": \(recall)}
-            """)
+            let pointsPerSec = Double(config.n) / buildSec
+            let payload: [String: Any] = [
+                "benchmark": "hnsw_knn_graph",
+                "n": config.n, "dim": config.dim, "k": config.k,
+                "m": config.m, "efc": config.efc, "efs": config.efs,
+                "seed": config.seed,
+                "knn_clusters": config.knnClusters,
+                "insert_sec": insertSec, "build_sec": buildSec,
+                "points_per_sec": pointsPerSec, "edges": graph.edgeCount,
+                "recall_at_k": recall, "recall_sample": sampled,
+                "host": ["device": HostInfo.machineModel, "os": HostInfo.osVersion,
+                         "cpu": HostInfo.cpuBrand, "memoryGB": HostInfo.memoryGB]
+            ]
+            let data = try JSONSerialization.data(withJSONObject: payload, options: [.prettyPrinted, .sortedKeys])
+            try VectorIndexBenchmarks.outputData(data, to: config.output)
         } catch {
             fputs("knn-graph benchmark failed: \(error)\n", stderr)
             exit(1)
@@ -283,7 +291,10 @@ struct Benchmark {
             try VectorIndexBenchmarks.outputData(data, to: config.output)
         }
 
-        return BenchSuiteResult(config: encodeConfig(), results: results)
+        return BenchSuiteResult(config: encodeConfig(), results: results, host: [
+            "device": HostInfo.machineModel, "os": HostInfo.osVersion,
+            "cpu": HostInfo.cpuBrand, "memoryGB": String(HostInfo.memoryGB)
+        ])
     }
 
     func encodeConfig() -> [String:String] {
@@ -329,7 +340,7 @@ struct Benchmark {
                 emitProgress(config.progressFormat, event: ProgressEvent(phase: "search", suite: "Flat", completed: qi+1, total: config.q))
             }
         }
-        return BenchResult(
+        var result = BenchResult(
             indexType: "Flat",
             metric: config.metric.rawValue,
             n: config.n, q: config.q, dim: config.dim, k: config.k,
@@ -341,6 +352,11 @@ struct Benchmark {
             recallAvg: 1.0,
             throughputQps: Double(config.q) / times.reduce(0,+) * 1000.0
         )
+        let batchStart = DispatchTime.now()
+        _ = try await idx.batchSearch(queries: queries, k: config.k, filter: nil)
+        let batchSec = Double(DispatchTime.now().uptimeNanoseconds - batchStart.uptimeNanoseconds) / 1e9
+        result.batchThroughputQps = batchSec > 0 ? Double(config.q) / batchSec : 0
+        return result
     }
 
     func benchHNSW(data: [[Float]], ids: [String], queries: [[Float]], baseline: BenchResult) async throws -> BenchResult {
@@ -368,7 +384,7 @@ struct Benchmark {
                 emitProgress(config.progressFormat, event: ProgressEvent(phase: "search", suite: "HNSW", completed: qi+1, total: config.q))
             }
         }
-        return BenchResult(
+        var result = BenchResult(
             indexType: "HNSW",
             metric: config.metric.rawValue,
             n: config.n, q: config.q, dim: config.dim, k: config.k,
@@ -380,6 +396,11 @@ struct Benchmark {
             recallAvg: avg(recs),
             throughputQps: Double(config.q) / times.reduce(0,+) * 1000.0
         )
+        let batchStart = DispatchTime.now()
+        _ = try await idx.batchSearch(queries: queries, k: config.k, filter: nil)
+        let batchSec = Double(DispatchTime.now().uptimeNanoseconds - batchStart.uptimeNanoseconds) / 1e9
+        result.batchThroughputQps = batchSec > 0 ? Double(config.q) / batchSec : 0
+        return result
     }
 
     func benchIVF(data: [[Float]], ids: [String], queries: [[Float]], baseline: BenchResult) async throws -> BenchResult {
@@ -411,7 +432,7 @@ struct Benchmark {
                 emitProgress(config.progressFormat, event: ProgressEvent(phase: "search", suite: "IVF", completed: qi+1, total: config.q))
             }
         }
-        return BenchResult(
+        var result = BenchResult(
             indexType: "IVF",
             metric: config.metric.rawValue,
             n: config.n, q: config.q, dim: config.dim, k: config.k,
@@ -423,6 +444,11 @@ struct Benchmark {
             recallAvg: avg(recs),
             throughputQps: Double(config.q) / times.reduce(0,+) * 1000.0
         )
+        let batchStart = DispatchTime.now()
+        _ = try await idx.batchSearch(queries: queries, k: config.k, filter: nil)
+        let batchSec = Double(DispatchTime.now().uptimeNanoseconds - batchStart.uptimeNanoseconds) / 1e9
+        result.batchThroughputQps = batchSec > 0 ? Double(config.q) / batchSec : 0
+        return result
     }
 
     func truthTopK(q: [Float], data: [[Float]], ids: [String]) async throws -> [String] {
@@ -487,7 +513,7 @@ struct Benchmark {
 }
 
 // MARK: - Result Types
-struct BenchSuiteResult: Codable { let config: [String:String]; let results: [BenchResult] }
+struct BenchSuiteResult: Codable { let config: [String:String]; let results: [BenchResult]; let host: [String:String] }
 struct BenchResult: Codable {
     let indexType: String
     let metric: String
@@ -502,6 +528,7 @@ struct BenchResult: Codable {
     let searchP95Ms: Double
     let recallAvg: Double
     let throughputQps: Double
+    var batchThroughputQps: Double = 0
 }
 
 // MARK: - Utilities
