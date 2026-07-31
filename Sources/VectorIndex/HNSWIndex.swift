@@ -880,7 +880,20 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                         q: qPtr, xb: gb.baseAddress!, n: n, d: d,
                         metric: metric, out: sb.baseAddress!, cosineNorms: nil)
                     switch metric {
-                    case .euclidean: break                  // L2^2, monotone in old sqrt(L2^2)
+                    case .euclidean:
+                        // L2^2 via IndexOps.Scoring.L2Sqr, which at d>=256
+                        // (this call site: d=384) selects the dot-trick
+                        // expansion ||q||^2 + ||x||^2 - 2<q,x> rather than a
+                        // direct sum-of-squared-differences reduction.
+                        // Ordering-equivalent to the old sqrt'd per-pair
+                        // distance() in exact arithmetic only -- not
+                        // bit-for-bit; FP cancellation is possible for
+                        // near-duplicate vectors. This is also the same
+                        // kernel the query path (HNSWTraversal) and the #34
+                        // neighbor-selection kernel already use, so this
+                        // rewrite makes construction numerically consistent
+                        // with them rather than introducing a new algorithm.
+                        break
                     case .dotProduct: for i in 0..<n { sb[i] = -sb[i] }
                     case .cosine:     for i in 0..<n { sb[i] = 1 - sb[i] }
                     default: break   // ScoreBlock fallback already returns distances
