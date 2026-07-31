@@ -284,6 +284,33 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     // so every existing zero-argument call site (ivf.optimize()) is unaffected.
     // optimizeKMeans(maxIterations:) below now delegates here instead of running
     // its own divergent copy.
+    //
+    // P3c (Task 8): restructured from the old double-materialization +
+    // O(N*k) scalar rescan shape (see git history for the pre-P3c body) to
+    // a single store flatten shared by seeding/training/list-build, plus
+    // reuse of kmeans_minibatch_f32's own final-centroid assignment pass
+    // (see `kmeans(...)` below) instead of re-deriving every assignment via
+    // `nearestCentroidIndex`.
+    //
+    // DETERMINISM (controller addition, supersedes the old "dictionary
+    // iteration order is stable within an unmutated instance" framing):
+    // `orderedIDs`/`flatData` are built from `store.keys.sorted()`, not raw
+    // `for (id, ...) in store` iteration. Swift's Dictionary iteration
+    // order is randomized *per process* (seeded at process launch, not by
+    // content), so the old dictionary-order pass fed k-means a different
+    // point ordering on every process invocation even for byte-identical
+    // store content. k-means' mini-batch updates and empty-cluster repair
+    // are order-sensitive (batch composition depends on index order), so
+    // different orderings produced different centroids -- this is what
+    // made IVF recall swing ~0.72-1.0 across repeated runs of identical
+    // code (measured and adjudicated in Tasks 6-7). Sorting by VectorID
+    // makes optimize() deterministic across processes for the same store
+    // content, which is what makes recall benchmarks meaningful going
+    // forward. This intentionally changes which specific centroids any
+    // given run produces relative to the old unsorted behavior -- they
+    // were arbitrary before, so there is no compatibility concern; the
+    // fixed seed (42) together with the fixed sort order now yields a
+    // fixed, reproducible result.
     public func optimize(maxIterations: Int = 20) async throws {
         // Build centroids with CPU Lloyd's KMeans and assign points to lists
         // Use k = min(nlist, store.count)
@@ -291,29 +318,40 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             centroids.removeAll(); lists.removeAll(); rebuildCentroidCache(); return
         }
         let k = max(1, min(config.nlist, store.count))
+        let d = dimension
+        // ONE store materialization shared by seeding, training, and list
+        // build (previously: kmeansPlusPlusInitRandom and kmeans each
+        // independently re-derived the same flat [Float] from `store`).
+        let sortedIDs = store.keys.sorted()
+        var orderedIDs: [VectorID] = []
+        orderedIDs.reserveCapacity(sortedIDs.count)
+        var flatData = [Float]()
+        flatData.reserveCapacity(sortedIDs.count * d)
+        for id in sortedIDs {
+            let vec = store[id]!.0
+            orderedIDs.append(id)
+            flatData.append(contentsOf: vec)
+        }
+        let n = orderedIDs.count
         // Initialize centroids using deterministic k‑means++ (farthest‑point) seeding
-        //
-        // Phase-3 (P3) overlap note, not fixed here: kmeansPlusPlusInitRandom and
-        // kmeans each independently re-derive the same flat [Float] from store (two
-        // O(N*d) materializations where one shared buffer would do), and
-        // nearestCentroidIndex below re-scans every vector against every centroid
-        // (O(N*k)) even though kmeans's underlying kmeans_minibatch_f32 call already
-        // ran with computeAssignments: false -- flipping that to true and wiring
-        // assignOut: would eliminate the rescan entirely. Both are real perf
-        // opportunities the Phase-2 research brief flagged as overlapping Phase 3's
-        // mandate (behavior-neutral cleanup is Phase 2's job, perf is Phase 3's);
-        // left for Phase 3 to pick up under its benchmark gate.
-        let initialCentroids = try kmeansPlusPlusInitRandom(k: k, seed: 42)
-        centroids = try await kmeans(centroids: initialCentroids, maxIterations: maxIterations)
+        let initialCentroids = try kmeansPlusPlusInitRandom(k: k, seed: 42, flatData: flatData, count: n)
+        var assignments = [Int32](repeating: -1, count: n)
+        centroids = try await kmeans(
+            centroids: initialCentroids, maxIterations: maxIterations,
+            flatData: flatData, count: n, assignOut: &assignments)
         rebuildCentroidCache()
-        // Build inverted lists
+        // Build inverted lists directly from kmeans_minibatch_f32's own
+        // final-centroid assignment pass (see `kmeans(...)` below for why
+        // this is safe to consume directly rather than re-deriving via
+        // nearestCentroidIndex). Preserve the old rescan's edge behavior:
+        // an assignment outside `lists`' bounds is skipped, not force-fit.
         lists = Array(repeating: [], count: centroids.count)
         idToListIndex.removeAll(keepingCapacity: false)
-        for (id, (vec, _)) in store {
-            if let ci = nearestCentroidIndex(for: vec), lists.indices.contains(ci) {
-                lists[ci].append(id)
-                idToListIndex[id] = ci
-            }
+        for (i, id) in orderedIDs.enumerated() {
+            let ci = Int(assignments[i])
+            guard lists.indices.contains(ci) else { continue }
+            lists[ci].append(id)
+            idToListIndex[id] = ci
         }
     }
 
@@ -498,20 +536,37 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     // MARK: - Lloyd's KMeans using Kernel #12
-    private func kmeans(centroids initial: [[Float]], maxIterations: Int) async throws -> [[Float]] {
+    //
+    // P3c: `flatData`/`count` are now threaded in from the caller's single
+    // store materialization (see `optimize`) instead of re-flattening
+    // `store` here. `computeAssignments: true` + `assignOut` wire up
+    // kmeans_minibatch_f32's own final-centroid assignment pass (see
+    // KMeansMiniBatchKernel.swift:687-706: this block runs AFTER the epoch
+    // training loop completes, scanning every one of the `n` input points
+    // against `centroidsOut` -- which at that point already holds the
+    // post-training final centroids -- via `_vi_km12_assignAOS`. That is a
+    // genuine final-pass assignment, not a stale pre-update one, and
+    // `_vi_km12_assignAOS`'s tie-break ("prefer lower centroid index",
+    // KMeansMiniBatchKernel.swift:341-359) is index-ascending first-min-wins
+    // over an ascending `c` scan -- behavior-identical to
+    // `nearestCentroidIndex`'s strict-`<` argmin. `cBest` is always in
+    // `0..<kc` (the assign loop never emits -1 or an out-of-range index),
+    // so the old rescan's `lists.indices.contains(ci)` guard is preserved
+    // in `optimize` purely as defensive belt-and-suspenders, not because
+    // this kernel is known to emit invalid indices.
+    private func kmeans(
+        centroids initial: [[Float]], maxIterations: Int,
+        flatData: [Float], count: Int, assignOut: inout [Int32]
+    ) async throws -> [[Float]] {
         precondition(!initial.isEmpty)
         let k = initial.count
         let d = dimension
-        let items: [[Float]] = store.map { $0.value.0 }
-
-        // Flatten data for kernel
-        let flatData = items.flatMap { $0 }
         var flatCentroids = initial.flatMap { $0 }
 
         // Configure mini-batch k-means
         let cfg = KMeansMBConfig(
             algo: .lloydMiniBatch,
-            batchSize: min(1024, items.count),  // Adaptive batch size
+            batchSize: min(1024, count),  // Adaptive batch size
             epochs: maxIterations,
             subsampleN: 0,  // Use all data
             tol: 1e-4,
@@ -521,21 +576,23 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             prefetchDistance: 8,
             layout: .aos,
             aosoaRegisterBlock: 0,
-            computeAssignments: false
+            computeAssignments: true
         )
 
         // Run kernel
-        let status = kmeans_minibatch_f32(
-            x: flatData,
-            n: Int64(items.count),
-            d: d,
-            kc: k,
-            initCentroids: flatCentroids,
-            cfg: cfg,
-            centroidsOut: &flatCentroids,
-            assignOut: nil,
-            statsOut: nil
-        )
+        let status = assignOut.withUnsafeMutableBufferPointer { ab in
+            kmeans_minibatch_f32(
+                x: flatData,
+                n: Int64(count),
+                d: d,
+                kc: k,
+                initCentroids: flatCentroids,
+                cfg: cfg,
+                centroidsOut: &flatCentroids,
+                assignOut: ab.baseAddress,
+                statsOut: nil
+            )
+        }
 
         guard status == .success else {
             throw VectorError(.operationFailed)
@@ -554,11 +611,13 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     // Seeded k-means++ (D²) sampling using Kernel #11
-    private func kmeansPlusPlusInitRandom(k: Int, seed: UInt64) throws -> [[Float]] {
-        precondition(!store.isEmpty)
+    //
+    // P3c: `flatData`/`count` threaded in from the caller's single store
+    // materialization (see `optimize`) instead of re-flattening `store`
+    // here.
+    private func kmeansPlusPlusInitRandom(k: Int, seed: UInt64, flatData: [Float], count: Int) throws -> [[Float]] {
+        precondition(count > 0)
         let d = dimension
-        let items: [[Float]] = store.map { $0.value.0 }
-        let flatData = items.flatMap { $0 }
 
         // Allocate output buffer
         var flatCentroids = [Float](repeating: 0, count: k * d)
@@ -576,11 +635,11 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             rounds: 5
         )
 
-        // store.isEmpty precondition ensures n >= 1,
+        // count > 0 precondition ensures n >= 1,
         // and k is validated by caller to be reasonable
         _ = try kmeansPlusPlusSeed(
             data: flatData,
-            count: items.count,
+            count: count,
             dimension: d,
             k: k,
             config: cfg,
@@ -1330,9 +1389,48 @@ extension IVFIndex {
         centroidDistances(for: query, queryIsNormalized: queryIsNormalized)
     }
 
+    /// Snapshot of the current trained `centroids` (P3c determinism test).
+    internal func _testCentroids() -> [[Float]] {
+        centroids
+    }
+
     /// Passthrough to the private nearest-centroid argmin
     /// (`nearestCentroidIndex(for:)`).
     internal func _testNearestCentroidIndex(for vector: [Float]) -> Int? {
         nearestCentroidIndex(for: vector)
+    }
+
+    /// P3c (Task 8) determinism/correctness pin: for every id currently
+    /// recorded in `idToListIndex`, compares the (ordering-equivalent)
+    /// distance to its assigned list's centroid against the minimum
+    /// distance over all centroids. A mismatch means `optimize()`'s
+    /// post-kmeans list build (which now consumes `kmeans_minibatch_f32`'s
+    /// own final-centroid `assignOut` directly instead of re-deriving
+    /// assignments via `nearestCentroidIndex`) placed an id in a list that
+    /// is not its nearest final centroid. `1e-5` absorbs FP noise between
+    /// the kernel's L2-squared assignment scan and `centroidDistances`'
+    /// batched scoring path -- both must agree to within that tolerance,
+    /// not bit-for-bit, since they take different code paths to the same
+    /// quantity.
+    internal func _testAssignmentConsistency() -> (mismatches: Int, detail: String) {
+        var mismatches = 0
+        var details: [String] = []
+        for (id, ci) in idToListIndex {
+            guard let (vec, _) = store[id] else { continue }
+            let dists = centroidDistances(for: vec)
+            guard !dists.isEmpty, dists.indices.contains(ci) else {
+                mismatches += 1
+                details.append("id=\(id) invalid list index \(ci) (centroids=\(dists.count))")
+                continue
+            }
+            let assigned = dists[ci]
+            let minDist = dists.min()!
+            if assigned > minDist + 1e-5 {
+                mismatches += 1
+                details.append("id=\(id) list=\(ci) assignedDist=\(assigned) minDist=\(minDist)")
+            }
+        }
+        let detail = details.isEmpty ? "" : details.prefix(5).joined(separator: "; ")
+        return (mismatches, detail)
     }
 }
