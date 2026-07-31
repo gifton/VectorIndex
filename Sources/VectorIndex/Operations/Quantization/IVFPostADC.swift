@@ -17,6 +17,10 @@ public enum IVFPostADC {
     ///   - K: number of results
     ///   - opts: rerank options (tiling/parallel/norm caches)
     /// - Returns: best-first (scores, internal IDs)
+    // Phase-2 (B17b) finding: zero callers anywhere in Sources/ or Tests/
+    // (grep-verified). Kept (not deleted) -- public API, non-breaking
+    // constraint; see PHASE4-ROUTING.
+    @available(*, deprecated, message: "Dead code: no callers found anywhere in the package. Scheduled for removal in 0.2.0's breaking phase.")
     public static func rerankTopKFlat(
         q: [Float],
         d: Int,

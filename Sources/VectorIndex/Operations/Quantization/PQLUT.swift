@@ -32,15 +32,6 @@ internal func _verifyAlignment(_ ptr: UnsafeRawPointer?, _ alignment: Int, _ lab
 #endif
 }
 
-@inline(__always)
-@usableFromInline
-internal func _prefetch(_ ptr: UnsafeRawPointer?) {
-    // Advisory only; left as a no-op in portable Swift.
-    // On Apple Silicon, compilers often auto-prefetch. Spec includes the
-    // knob for tuning, so we keep the API for future inline asm if desired.
-    _ = ptr
-}
-
 // MARK: - Options
 
 /// Configuration options for PQ LUT construction (mirrors spec).
@@ -243,9 +234,6 @@ public func pq_lut_l2_f32(
                     let dot = _scalar_dot(qj, c, dsub)
                     let dist = (includeQ ? qjNorm : 0.0) + cNormBase[k] - 2.0 * dot
                     lutJ[k] = dist
-                    if inOpts.prefetchDistance > 0 && k + inOpts.prefetchDistance < ks {
-                        _prefetch(UnsafeRawPointer(cbJ + (k + inOpts.prefetchDistance) * dsub))
-                    }
                 }
             } else {
                 for k in 0..<ks {
@@ -253,9 +241,6 @@ public func pq_lut_l2_f32(
                     let dot = _simd_dot(qj, c, dsub)
                     let dist = (includeQ ? qjNorm : 0.0) + cNormBase[k] - 2.0 * dot
                     lutJ[k] = dist
-                    if inOpts.prefetchDistance > 0 && k + inOpts.prefetchDistance < ks {
-                        _prefetch(UnsafeRawPointer(cbJ + (k + inOpts.prefetchDistance) * dsub))
-                    }
                 }
             }
         } else {
@@ -264,17 +249,11 @@ public func pq_lut_l2_f32(
                 for k in 0..<ks {
                     let c = cbJ + k * dsub
                     lutJ[k] = _scalar_l2sqr(qj, c, dsub)
-                    if inOpts.prefetchDistance > 0 && k + inOpts.prefetchDistance < ks {
-                        _prefetch(UnsafeRawPointer(cbJ + (k + inOpts.prefetchDistance) * dsub))
-                    }
                 }
             } else {
                 for k in 0..<ks {
                     let c = cbJ + k * dsub
                     lutJ[k] = _simd_l2sqr(qj, c, dsub)
-                    if inOpts.prefetchDistance > 0 && k + inOpts.prefetchDistance < ks {
-                        _prefetch(UnsafeRawPointer(cbJ + (k + inOpts.prefetchDistance) * dsub))
-                    }
                 }
             }
         }
@@ -359,9 +338,6 @@ public func pq_lut_residual_l2_f32(
                     dot +=     acc1[0] + acc1[1] + acc1[2] + acc1[3]
                     while i < dsub { dot += (qj[i] - cj[i]) * c[i]; i &+= 1 }
                     lutJ[k] = rNorm + cNormBase[k] - 2.0 * dot
-                    if inOpts.prefetchDistance > 0 && k + inOpts.prefetchDistance < ks {
-                        _prefetch(UnsafeRawPointer(cbJ + (k + inOpts.prefetchDistance) * dsub))
-                    }
                 }
             }
         } else {
@@ -403,9 +379,6 @@ public func pq_lut_residual_l2_f32(
                         i &+= 1
                     }
                     lutJ[k] = sum
-                    if inOpts.prefetchDistance > 0 && k + inOpts.prefetchDistance < ks {
-                        _prefetch(UnsafeRawPointer(cbJ + (k + inOpts.prefetchDistance) * dsub))
-                    }
                 }
             }
         }

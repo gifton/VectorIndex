@@ -15,6 +15,7 @@ import simd
 // MARK: - Transform Mode
 
 /// How MIPS-to-L2 transform is applied
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @frozen
 public enum MIPSTransformMode: Sendable {
     case explicit       // Materialized augmented dimensions
@@ -27,6 +28,7 @@ public enum MIPSTransformMode: Sendable {
 /// R² parameter for MIPS transform. Must satisfy R² ≥ max_i ‖x_i‖².
 /// R² is tracked with a safety margin; staleness flips to true if a new
 /// vector exceeds the current bound (so queries can fall back to virtual).
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @frozen
 public struct R2Parameter {
     public var value: Float
@@ -65,6 +67,7 @@ public struct R2Parameter {
 
 /// Storage for augmented vectors x' = [x ; sqrt(max(0, R² - ‖x‖²))] with
 /// paddedDim = roundUp(d+1, 16). Backing memory is 64B-aligned.
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 public struct AugmentedVectorStorage {
     public let originalDim: Int
     public let paddedDim: Int
@@ -111,6 +114,7 @@ public struct AugmentedVectorStorage {
 
 // MARK: - Telemetry (struct only; hook to your recorder if desired)
 
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @frozen
 public struct MIPSTransformTelemetry {
     public let mode: MIPSTransformMode
@@ -132,6 +136,7 @@ public struct MIPSTransformTelemetry {
 
 /// Compute R² = (1 + margin) * max_i ‖x_i‖² over the dataset.
 /// - vectors: AoS [n][d]
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @inlinable
 public func computeR2Parameter(
     vectors: UnsafePointer<Float>,
@@ -142,7 +147,7 @@ public func computeR2Parameter(
     var maxSq: Float = 0
     for i in 0..<n {
         let row = vectors + i * d
-        let s = l2NormSquaredSIMD(row, d)
+        let s = IndexOps.Support.Norms.l2NormSquared(vector: row, dimension: d)
         if s > maxSq { maxSq = s }
     }
     return R2Parameter(maxNormSquared: maxSq, margin: margin)
@@ -151,6 +156,7 @@ public func computeR2Parameter(
 /// Explicit/materialized transform: x → [x ; sqrt(max(0, R² - ‖x‖²))],
 /// storing into `augmentedOut` laid out as [n][paddedDim].
 /// Padded tail beyond (d+1) is zeroed.
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @inlinable
 public func mipsMaterializeAugmentation(
     baseVectors: UnsafePointer<Float>,
@@ -175,7 +181,7 @@ public func mipsMaterializeAugmentation(
         dst.update(from: x, count: d)
 
         // Compute sqrt(max(0, R² - ‖x‖²)) for slot d
-        let normSq = l2NormSquaredSIMD(x, d)
+        let normSq = IndexOps.Support.Norms.l2NormSquared(vector: x, dimension: d)
         let radicand = max(0, r2v - normSq)
         dst[d] = sqrtf(radicand)
         // dst[d+1 ..< paddedDim) remain zero (already memset)
@@ -183,6 +189,7 @@ public func mipsMaterializeAugmentation(
 }
 
 /// Augment a query: q' = [q ; 0] and pad to paddedDim with zeros.
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @inlinable
 public func mipsAugmentQuery(
     query: UnsafePointer<Float>,
@@ -200,6 +207,7 @@ public func mipsAugmentQuery(
 /// Virtual/on-the-fly transform without materializing x':
 /// Computes scores[i] = ‖q‖² + R² − 2·⟨q, x_i⟩ (min L2^2 ≡ max IP).
 /// Results can be fed directly to Top‑K with `.min` ordering.
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @inlinable
 public func mipsVirtualToL2Scores(
     query: UnsafePointer<Float>,
@@ -209,19 +217,20 @@ public func mipsVirtualToL2Scores(
     r2: R2Parameter,
     scoresOut: UnsafeMutablePointer<Float>
 ) {
-    let qSq = l2NormSquaredSIMD(query, d)
+    let qSq = IndexOps.Support.Norms.l2NormSquared(vector: query, dimension: d)
     let r2v = r2.value
-    // Compute dot and apply fused epilogue (no temporary buffer)
+    // Batch-compute dot products via the canonical kernel, then apply the
+    // fused epilogue in place (no temporary buffer needed).
+    IndexOps.Scoring.InnerProduct.run(q: query, xb: baseVectors, n: n, d: d, out: scoresOut)
     for i in 0..<n {
-        let x = baseVectors + i * d
-        let dot = innerProductSIMD(query, x, d)
-        scoresOut[i] = qSq + r2v - 2.0 * dot
+        scoresOut[i] = qSq + r2v - 2.0 * scoresOut[i]
     }
 }
 
 /// Hybrid mode: use explicit/materialized path when `storage.r2.isStale == false`
 /// and storage is available; otherwise fallback to the virtual path.
 /// - storage.vectors must hold [n][paddedDim] if used explicitly.
+@available(*, deprecated, message: "Unused; zero callers/tests found repo-wide. Scheduled for removal in 0.2.0's breaking phase.")
 @inlinable
 public func mipsHybridScoreBlock(
     query: UnsafePointer<Float>,
@@ -241,14 +250,8 @@ public func mipsHybridScoreBlock(
         let augQ = augQRaw!.bindMemory(to: Float.self, capacity: storage.paddedDim)
         mipsAugmentQuery(query: query, dimension: storage.originalDim, augmentedOut: augQ, paddedDim: storage.paddedDim)
 
-        // Prefer your high-performance L2 microkernel (#01) if available; otherwise fallback.
-        l2sqrBlock_dispatch(
-            query: augQ,
-            database: augBase,
-            vectorCount: n,
-            dimension: storage.paddedDim,
-            output: scoresOut
-        )
+        // Canonical L2² microkernel (#01).
+        l2sqr_f32_block(augQ, augBase, n, storage.paddedDim, scoresOut)
     } else {
         // Virtual fallback
         precondition(baseVectors != nil, "Virtual mode requires baseVectors")
@@ -260,150 +263,5 @@ public func mipsHybridScoreBlock(
             r2: storage.r2,
             scoresOut: scoresOut
         )
-    }
-}
-
-// MARK: - Helper: SIMD L2 norm (sum of squares)
-
-@inlinable
-internal func l2NormSquaredSIMD(_ x: UnsafePointer<Float>, _ d: Int) -> Float {
-    let w = 4
-    let dv = (d / w) * w
-    var a0 = SIMD4<Float>(repeating: 0), a1 = SIMD4<Float>(repeating: 0),
-        a2 = SIMD4<Float>(repeating: 0), a3 = SIMD4<Float>(repeating: 0)
-    var j = 0
-    while j + 15 < d {
-        let v0 = SIMD4<Float>(x[j + 0], x[j + 1], x[j + 2], x[j + 3])
-        let v1 = SIMD4<Float>(x[j + 4], x[j + 5], x[j + 6], x[j + 7])
-        let v2 = SIMD4<Float>(x[j + 8], x[j + 9], x[j + 10], x[j + 11])
-        let v3 = SIMD4<Float>(x[j + 12], x[j + 13], x[j + 14], x[j + 15])
-        // FIXED: Use regular operators, not wrapping operators
-        a0 += v0 * v0
-        a1 += v1 * v1
-        a2 += v2 * v2
-        a3 += v3 * v3
-        j += 16
-    }
-    let combined = a0 + a1 + a2 + a3
-    var acc = combined[0] + combined[1] + combined[2] + combined[3]
-    while j < dv {
-        let v = SIMD4<Float>(x[j + 0], x[j + 1], x[j + 2], x[j + 3])
-        let vSq = v * v
-        acc += vSq[0] + vSq[1] + vSq[2] + vSq[3]
-        j += w
-    }
-    while j < d {
-        let v = x[j]
-        acc += v * v
-        j += 1
-    }
-    return acc
-}
-
-// MARK: - Helper: SIMD inner product (dot)
-
-@inlinable
-internal func innerProductSIMD(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ d: Int) -> Float {
-    let w = 4
-    let dv = (d / w) * w
-    var a0 = SIMD4<Float>(repeating: 0), a1 = SIMD4<Float>(repeating: 0),
-        a2 = SIMD4<Float>(repeating: 0), a3 = SIMD4<Float>(repeating: 0)
-    var j = 0
-    while j + 15 < d {
-        let q0 = SIMD4<Float>(a[j + 0], a[j + 1], a[j + 2], a[j + 3])
-        let x0 = SIMD4<Float>(b[j + 0], b[j + 1], b[j + 2], b[j + 3])
-        let q1 = SIMD4<Float>(a[j + 4], a[j + 5], a[j + 6], a[j + 7])
-        let x1 = SIMD4<Float>(b[j + 4], b[j + 5], b[j + 6], b[j + 7])
-        let q2 = SIMD4<Float>(a[j + 8], a[j + 9], a[j + 10], a[j + 11])
-        let x2 = SIMD4<Float>(b[j + 8], b[j + 9], b[j + 10], b[j + 11])
-        let q3 = SIMD4<Float>(a[j + 12], a[j + 13], a[j + 14], a[j + 15])
-        let x3 = SIMD4<Float>(b[j + 12], b[j + 13], b[j + 14], b[j + 15])
-        // FIXED: Use regular operators, not wrapping operators
-        a0 += q0 * x0
-        a1 += q1 * x1
-        a2 += q2 * x2
-        a3 += q3 * x3
-        j += 16
-    }
-    let combined = a0 + a1 + a2 + a3
-    var acc = combined[0] + combined[1] + combined[2] + combined[3]
-    while j < dv {
-        let qv = SIMD4<Float>(a[j + 0], a[j + 1], a[j + 2], a[j + 3])
-        let xv = SIMD4<Float>(b[j + 0], b[j + 1], b[j + 2], b[j + 3])
-        let prod = qv * xv
-        acc += prod[0] + prod[1] + prod[2] + prod[3]
-        j += w
-    }
-    while j < d {
-        acc += a[j] * b[j]
-        j += 1
-    }
-    return acc
-}
-
-// MARK: - L2² block dispatcher (prefers high-perf kernel #01 when present)
-
-/// If your project already includes the L2 microkernel (#01) this shim will
-/// naturally inline to it; otherwise a generic fallback is used.
-@inlinable
-internal func l2sqrBlock_dispatch(
-    query: UnsafePointer<Float>,
-    database: UnsafePointer<Float>,
-    vectorCount n: Int,
-    dimension d: Int,
-    output: UnsafeMutablePointer<Float>
-) {
-    // Try to use the real kernel #01 if available
-    #if canImport(VectorCore)
-    // Wire to your actual entrypoint if available
-    generic_l2sqrBlock(query: query, database: database, n: n, d: d, out: output)
-    #else
-    // Fall back to generic implementation
-    generic_l2sqrBlock(query: query, database: database, n: n, d: d, out: output)
-    #endif
-}
-
-@inlinable
-internal func generic_l2sqrBlock(
-    query q: UnsafePointer<Float>,
-    database xb: UnsafePointer<Float>,
-    n: Int,
-    d: Int,
-    out: UnsafeMutablePointer<Float>
-) {
-    // Simple, cache-friendly row loop with SIMD inner diff² accumulation
-    for i in 0..<n {
-        let x = xb + i * d
-        var acc0 = SIMD4<Float>(repeating: 0), acc1 = SIMD4<Float>(repeating: 0),
-            acc2 = SIMD4<Float>(repeating: 0), acc3 = SIMD4<Float>(repeating: 0)
-        var j = 0
-        while j + 15 < d {
-            let q0 = SIMD4<Float>(q[j + 0], q[j + 1], q[j + 2], q[j + 3])
-            let x0 = SIMD4<Float>(x[j + 0], x[j + 1], x[j + 2], x[j + 3])
-            let q1 = SIMD4<Float>(q[j + 4], q[j + 5], q[j + 6], q[j + 7])
-            let x1 = SIMD4<Float>(x[j + 4], x[j + 5], x[j + 6], x[j + 7])
-            let q2 = SIMD4<Float>(q[j + 8], q[j + 9], q[j + 10], q[j + 11])
-            let x2 = SIMD4<Float>(x[j + 8], x[j + 9], x[j + 10], x[j + 11])
-            let q3 = SIMD4<Float>(q[j + 12], q[j + 13], q[j + 14], q[j + 15])
-            let x3 = SIMD4<Float>(x[j + 12], x[j + 13], x[j + 14], x[j + 15])
-            // FIXED: Use regular operators, not wrapping operators
-            let d0 = q0 - x0
-            let d1 = q1 - x1
-            let d2 = q2 - x2
-            let d3 = q3 - x3
-            acc0 += d0 * d0
-            acc1 += d1 * d1
-            acc2 += d2 * d2
-            acc3 += d3 * d3
-            j += 16
-        }
-        let combined = acc0 + acc1 + acc2 + acc3
-        var s = combined[0] + combined[1] + combined[2] + combined[3]
-        while j < d {
-            let diff = q[j] - x[j]
-            s += diff * diff
-            j += 1
-        }
-        out[i] = s
     }
 }

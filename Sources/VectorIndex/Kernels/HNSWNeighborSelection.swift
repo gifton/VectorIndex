@@ -250,6 +250,7 @@ public func hnsw_select_neighbors_f32_swift(
 
 // MARK: - Core API (Swift) — prune
 
+@available(*, deprecated, message: "Dead in production wiring since A9 — HNSWIndex never calls this (only hnsw_select_neighbors_f32_swift is wired into insertion/maintenance). Scheduled for removal in 0.2.0's breaking phase.")
 public func hnsw_prune_neighbors_f32_swift(
     u: Int32,
     xb: UnsafePointer<Float>, d: Int,
@@ -362,6 +363,7 @@ public func c_hnsw_select_neighbors_f32(
     return Int32(written)
 }
 
+@available(*, deprecated, message: "Exports a dead-in-production kernel (see hnsw_prune_neighbors_f32_swift); zero consumers found repo-wide, including VectorIndexAccelerated. Scheduled for removal in 0.2.0's breaking phase.")
 @_cdecl("hnsw_prune_neighbors_f32")
 public func c_hnsw_prune_neighbors_f32(
     _ u: Int32,

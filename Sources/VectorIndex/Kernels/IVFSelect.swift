@@ -377,9 +377,9 @@ private func selectNprobeSingleThread(
     let heap: any TopKHeap
     switch metric {
     case .l2:
-        heap = MinHeap(capacity: actualK)
+        heap = BoundedTopKHeap.forL2(capacity: actualK)
     case .ip, .cosine:
-        heap = MaxHeap(capacity: actualK)
+        heap = BoundedTopKHeap.forMaxMetric(capacity: actualK)
     }
 
     // Build heap from scored centroids
@@ -546,7 +546,7 @@ private func selectBeamSearch(
     }
 
     // 2. Select initial beam (top beamWidth by score)
-    let initialHeap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: beamWidth) : MaxHeap(capacity: beamWidth)
+    let initialHeap: any TopKHeap = (metric == .l2) ? BoundedTopKHeap.forL2(capacity: beamWidth) : BoundedTopKHeap.forMaxMetric(capacity: beamWidth)
     for i in 0..<kc {
         let score = scoreBuffer[i]
         if metric == .l2 && score.isInfinite && score > 0 { continue }
@@ -561,7 +561,7 @@ private func selectBeamSearch(
     }
 
     // 3. Result set (priority queue of all discovered candidates)
-    let resultHeap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: max(beamWidth, nprobe)) : MaxHeap(capacity: max(beamWidth, nprobe))
+    let resultHeap: any TopKHeap = (metric == .l2) ? BoundedTopKHeap.forL2(capacity: max(beamWidth, nprobe)) : BoundedTopKHeap.forMaxMetric(capacity: max(beamWidth, nprobe))
     for item in beam {
         resultHeap.insert(id: item.id, score: item.score)
     }
@@ -687,7 +687,7 @@ private func partitionAndSelectParallel(
                 }
 
                 // Select top-k within partition
-                let heap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: nprobe) : MaxHeap(capacity: nprobe)
+                let heap: any TopKHeap = (metric == .l2) ? BoundedTopKHeap.forL2(capacity: nprobe) : BoundedTopKHeap.forMaxMetric(capacity: nprobe)
                 for i in 0..<count {
                     let globalID = Int32(start + i)
                     let score = localScores[i]
@@ -727,7 +727,7 @@ private func mergePartitions(
     listScoresOut: inout [Float]?
 ) {
     // K-way merge using heap
-    let heap: any TopKHeap = (metric == .l2) ? MinHeap(capacity: nprobe) : MaxHeap(capacity: nprobe)
+    let heap: any TopKHeap = (metric == .l2) ? BoundedTopKHeap.forL2(capacity: nprobe) : BoundedTopKHeap.forMaxMetric(capacity: nprobe)
 
     for partition in partitions {
         for i in 0..<partition.ids.count {
@@ -771,53 +771,45 @@ private protocol TopKHeap: AnyObject {
     func extractSorted() -> [(id: Int32, score: Float)]
 }
 
-/// Min-heap for L2 distance (keep best = smallest).
+/// Bounded top-k heap parameterized by an ordering comparator, replacing the previously
+/// duplicated MinHeap (L2)/MaxHeap (IP/Cosine) — structurally identical apart from the
+/// flipped comparator direction.
 ///
-/// Maintains top-k smallest scores with O(log k) insertion.
-/// Tie-breaking: prefer smaller ID for deterministic results.
-private final class MinHeap: TopKHeap {
+/// Maintains an internal heap of size ≤ capacity whose root always holds the WORST of the
+/// currently-kept top-k (by `isBetter`), so a new candidate can be rejected in O(1) against
+/// the root, or accepted and the heap restored in O(log k).
+private final class BoundedTopKHeap: TopKHeap {
     private var storage: [(id: Int32, score: Float)] = []
     private let capacity: Int
+    /// True if `a` should be kept over `b` under the target metric (with deterministic
+    /// tie-break by smaller ID) — used both to decide whether a new candidate displaces
+    /// the current worst-of-kept, and to sort the final result best-first.
+    private let isBetter: (_ scoreA: Float, _ idA: Int32, _ scoreB: Float, _ idB: Int32) -> Bool
+    /// True if `a` should sit closer to the heap root than `b` — i.e. `a` is "worse" under
+    /// `isBetter`, since the root always holds the worst of the currently-kept top-k.
+    private let heapCompare: (_ a: (id: Int32, score: Float), _ b: (id: Int32, score: Float)) -> Bool
 
-    var count: Int { storage.count }
-
-    init(capacity: Int) {
+    init(
+      capacity: Int,
+      isBetter: @escaping (Float, Int32, Float, Int32) -> Bool,
+      heapCompare: @escaping ((id: Int32, score: Float), (id: Int32, score: Float)) -> Bool
+    ) {
         self.capacity = capacity
+        self.isBetter = isBetter
+        self.heapCompare = heapCompare
         storage.reserveCapacity(capacity)
     }
 
+    var count: Int { storage.count }
+
     func insert(id: Int32, score: Float) {
         if storage.count < capacity {
-            // Heap has space: append and bubble up
             storage.append((id, score))
             bubbleUp(storage.count - 1)
-        } else if let top = storage.first, isBetter(score, id, than: top.score, top.id) {
-            // Replace worst (root of max-heap for bottom-k) and bubble down
-            // Wait, this is a min-heap for top-k smallest, so we keep a max-heap of size k
-            // Actually for top-k minimum, we keep a MAX-heap so we can quickly reject larger values
-            // Let me fix this...
-
-            // Actually, for top-k MINIMUM values (L2), we maintain a MAX-heap of size k.
-            // The root is the LARGEST of our top-k, so we can reject anything larger in O(1).
+        } else if let top = storage.first, isBetter(score, id, top.score, top.id) {
             storage[0] = (id, score)
             bubbleDown(0)
         }
-    }
-
-    /// For L2 (minimize): a is better than b if a < b, or tie-break by smaller ID
-    private func isBetter(_ scoreA: Float, _ idA: Int32, than scoreB: Float, _ idB: Int32) -> Bool {
-        if scoreA < scoreB { return true }
-        if scoreA > scoreB { return false }
-        return idA < idB
-    }
-
-    /// For maintaining MAX-heap of top-k minimum: parent > children
-    private func heapCompare(_ a: (id: Int32, score: Float), _ b: (id: Int32, score: Float)) -> Bool {
-        // Return true if 'a' should be higher in the heap (closer to root)
-        // For MAX-heap: larger score or tie-break by larger ID
-        if a.score > b.score { return true }
-        if a.score < b.score { return false }
-        return a.id > b.id  // Inverted tie-break for max-heap
     }
 
     private func bubbleUp(_ index: Int) {
@@ -838,18 +830,12 @@ private final class MinHeap: TopKHeap {
         while true {
             let left = 2 * idx + 1
             let right = 2 * idx + 2
-            var largest = idx
-
-            if left < storage.count && heapCompare(storage[left], storage[largest]) {
-                largest = left
-            }
-            if right < storage.count && heapCompare(storage[right], storage[largest]) {
-                largest = right
-            }
-
-            if largest != idx {
-                storage.swapAt(idx, largest)
-                idx = largest
+            var extreme = idx
+            if left < storage.count && heapCompare(storage[left], storage[extreme]) { extreme = left }
+            if right < storage.count && heapCompare(storage[right], storage[extreme]) { extreme = right }
+            if extreme != idx {
+                storage.swapAt(idx, extreme)
+                idx = extreme
             } else {
                 break
             }
@@ -857,99 +843,45 @@ private final class MinHeap: TopKHeap {
     }
 
     func extractSorted() -> [(id: Int32, score: Float)] {
-        // Extract all elements and sort by actual score (ascending for L2)
-        let result = storage.sorted { a, b in
-            if a.score < b.score { return true }
-            if a.score > b.score { return false }
-            return a.id < b.id
-        }
+        let result = storage.sorted { isBetter($0.score, $0.id, $1.score, $1.id) }
         storage.removeAll(keepingCapacity: true)
         return result
     }
-}
 
-/// Max-heap for IP/Cosine (keep best = largest).
-private final class MaxHeap: TopKHeap {
-    private var storage: [(id: Int32, score: Float)] = []
-    private let capacity: Int
-
-    var count: Int { storage.count }
-
-    init(capacity: Int) {
-        self.capacity = capacity
-        storage.reserveCapacity(capacity)
-    }
-
-    func insert(id: Int32, score: Float) {
-        if storage.count < capacity {
-            storage.append((id, score))
-            bubbleUp(storage.count - 1)
-        } else if let top = storage.first, isBetter(score, id, than: top.score, top.id) {
-            // For top-k maximum, we maintain a MIN-heap so root is smallest of top-k
-            storage[0] = (id, score)
-            bubbleDown(0)
-        }
-    }
-
-    /// For IP/Cosine (maximize): a is better than b if a > b, or tie-break by smaller ID
-    private func isBetter(_ scoreA: Float, _ idA: Int32, than scoreB: Float, _ idB: Int32) -> Bool {
-        if scoreA > scoreB { return true }
-        if scoreA < scoreB { return false }
-        return idA < idB
-    }
-
-    /// For maintaining MIN-heap of top-k maximum: parent < children
-    private func heapCompare(_ a: (id: Int32, score: Float), _ b: (id: Int32, score: Float)) -> Bool {
-        if a.score < b.score { return true }
-        if a.score > b.score { return false }
-        return a.id < b.id
-    }
-
-    private func bubbleUp(_ index: Int) {
-        var idx = index
-        while idx > 0 {
-            let parent = (idx - 1) / 2
-            if heapCompare(storage[idx], storage[parent]) {
-                storage.swapAt(idx, parent)
-                idx = parent
-            } else {
-                break
+    /// L2 (minimize): smaller score wins; tie-break smaller ID. Internally a max-heap
+    /// (root = largest/worst of the kept top-k), matching the old MinHeap exactly.
+    static func forL2(capacity: Int) -> BoundedTopKHeap {
+        BoundedTopKHeap(
+            capacity: capacity,
+            isBetter: { scoreA, idA, scoreB, idB in
+                if scoreA < scoreB { return true }
+                if scoreA > scoreB { return false }
+                return idA < idB
+            },
+            heapCompare: { a, b in
+                if a.score > b.score { return true }
+                if a.score < b.score { return false }
+                return a.id > b.id
             }
-        }
+        )
     }
 
-    private func bubbleDown(_ index: Int) {
-        var idx = index
-        while true {
-            let left = 2 * idx + 1
-            let right = 2 * idx + 2
-            var smallest = idx
-
-            if left < storage.count && heapCompare(storage[left], storage[smallest]) {
-                smallest = left
+    /// IP/Cosine (maximize): larger score wins; tie-break smaller ID. Internally a
+    /// min-heap (root = smallest/worst of the kept top-k), matching the old MaxHeap exactly.
+    static func forMaxMetric(capacity: Int) -> BoundedTopKHeap {
+        BoundedTopKHeap(
+            capacity: capacity,
+            isBetter: { scoreA, idA, scoreB, idB in
+                if scoreA > scoreB { return true }
+                if scoreA < scoreB { return false }
+                return idA < idB
+            },
+            heapCompare: { a, b in
+                if a.score < b.score { return true }
+                if a.score > b.score { return false }
+                return a.id < b.id
             }
-            if right < storage.count && heapCompare(storage[right], storage[smallest]) {
-                smallest = right
-            }
-
-            if smallest != idx {
-                storage.swapAt(idx, smallest)
-                idx = smallest
-            } else {
-                break
-            }
-        }
-    }
-
-    func extractSorted() -> [(id: Int32, score: Float)] {
-        // Sort by score descending (best-first for IP/Cosine)
-        let result = storage.sorted { a, b in
-            if a.score > b.score { return true }
-            if a.score < b.score { return false }
-            return a.id < b.id
-        }
-        storage.removeAll(keepingCapacity: true)
-        return result
+        )
     }
 }
 

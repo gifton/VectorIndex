@@ -129,7 +129,16 @@ public final class CandidateReservoir: @unchecked Sendable {
     self.capacityC = capacity
     self.metric = metric
     self.opts = options
-    self.currentMode = (options.mode == .adaptive) ? options.adaptiveInitialMode : options.mode
+    // .adaptive previously collapsed to its initial *strategy* here
+    // (currentMode := adaptiveInitialMode), which made pushBatch's `.adaptive`
+    // case -- the only place the block→heap switching logic lives -- structurally
+    // unreachable: the mode never switched, and default-constructed reservoirs
+    // (options.mode defaults to .adaptive) silently ran pure Block forever.
+    // currentMode now stays .adaptive so the switching path engages;
+    // adaptiveInitialMode == .heap is honored as "skip the block phase entirely".
+    precondition(options.adaptiveInitialMode != .adaptive,
+                 "adaptiveInitialMode names the strategy .adaptive starts in; it must be .block or .heap")
+    self.currentMode = Self.startMode(for: options)
 
     let headroom = max(1, Int(ceil(Float(capacity) * max(0, options.reserveExtra))))
     self.bufferCapacity = (self.currentMode == .heap) ? capacity : capacity &+ headroom
@@ -147,6 +156,12 @@ public final class CandidateReservoir: @unchecked Sendable {
   /// O(1) when buffers are large enough (no reallocation).
   @inlinable
   public func reset(newCapacity: Int? = nil) {
+    // Re-seed the mode FIRST: the buffer-capacity policy below must size for the
+    // strategy the NEXT query starts in, not whatever a mid-query adaptive→heap
+    // switch left behind (sizing for .heap would strand the next adaptive block
+    // phase without its headroom and churn appendUnsorted's defensive-grow path).
+    currentMode = Self.startMode(for: opts)
+
     if let nc = newCapacity {
       precondition(nc > 0, "Reservoir capacity must be > 0")
       capacityC = nc
@@ -161,7 +176,6 @@ public final class CandidateReservoir: @unchecked Sendable {
     }
 
     size = 0
-    currentMode = (opts.mode == .adaptive) ? opts.adaptiveInitialMode : opts.mode
     // Reset tau
     tau = worstSentinel(for: metric)
     if opts.telemetry { telemetry = .init() }
@@ -247,12 +261,25 @@ public final class CandidateReservoir: @unchecked Sendable {
         }
 
       case .adaptive:
-        // In adaptive block phase until switch
+        // Adaptive block phase until switch.
         appendUnsorted(id: cid, score: s)
         acceptedInBatch &+= 1
 
-        // Check occupancy periodically to keep overhead low.
-        if (size & 63) == 0 {
+        if size >= bufferCapacity {
+          // Overflow guard (same invariant .block enforces): never let the block
+          // phase outgrow the preallocated buffer. A full buffer is also precisely
+          // where the block phase stops being cheap (every further batch would
+          // re-prune), and post-prune occupancy is 1.0 -- above every valid
+          // threshold -- so complete the adaptive switch here rather than waiting
+          // for the sampled check below, which can miss entirely (it only fires at
+          // multiples of 64, and the post-prune size range (C, C+headroom] may
+          // contain none).
+          pruneToTopC()
+          heapifyWorstRoot()
+          currentMode = .heap
+          telemetry.modeSwitches &+= 1
+        } else if (size & 63) == 0 {
+          // Sampled early-switch: check occupancy periodically to keep overhead low.
           let occ = Float(size) / Float(C)
           if occ > opts.adaptiveThreshold {
             // Switch to heap: ensure we have exactly top‑C, then heapify (worst-at-root).
@@ -291,8 +318,9 @@ public final class CandidateReservoir: @unchecked Sendable {
   /// Extracts top‑K results (best-first) into caller-provided buffers.
   /// K must be ≤ current `count`.
   ///
-  /// Complexity: O(count log count) for full sort; acceptable since it's off the hot path.
-  /// If you need partial select, you can adapt this to a k‑select then sort K.
+  /// Complexity: O(count) expected quickselect partition (skipped entirely when k == count)
+  /// followed by an O(k log k) sort of just the top k, vs. the previous O(count log count)
+  /// full sort of every buffered candidate.
   @inlinable
   public func extractTopK(
     k: Int,
@@ -300,12 +328,13 @@ public final class CandidateReservoir: @unchecked Sendable {
     topIDs outIDs: UnsafeMutablePointer<Int64>
   ) {
     precondition(k >= 0 && k <= size, "k must be in [0, count]")
+    guard k > 0 else { return }
 
-    // Copy to local work buffers (read-only operation per spec).
+    // Copy to local work buffers (read-only operation per spec: self.scores/self.ids are
+    // never touched, so mode/heap/tau invariants are untouched too).
     var ws = [Float](repeating: 0, count: size)
     var wi = [Int64](repeating: 0, count: size)
 
-    // Use .update(from:count:) per project deprecation guidance.
     scores.withUnsafeBufferPointer { sp in
       ws.withUnsafeMutableBufferPointer { wp in
         wp.baseAddress!.update(from: sp.baseAddress!, count: size)
@@ -317,16 +346,35 @@ public final class CandidateReservoir: @unchecked Sendable {
       }
     }
 
-    // Sort entire set by "better first" comparator (deterministic).
-    ws.indices.sorted { a, b in
-      isBetter(scoreA: ws[a], idA: wi[a], scoreB: ws[b], idB: wi[b])
-    }.prefix(k).enumerated().forEach { (j, idx) in
-      outScores[j] = ws[idx]
-      outIDs[j] = wi[idx]
+    ws.withUnsafeMutableBufferPointer { wsBuf in
+      wi.withUnsafeMutableBufferPointer { wiBuf in
+        if k < size {
+          quickselectTopBuffer(scoresBuf: wsBuf, idsBuf: wiBuf, count: size, countKeep: k)
+        }
+        // Sort just the first k by the same "better first" comparator (deterministic).
+        let order = (0..<k).sorted { a, b in
+          isBetter(scoreA: wsBuf[a], idA: wiBuf[a], scoreB: wsBuf[b], idB: wiBuf[b])
+        }
+        for (j, idx) in order.enumerated() {
+          outScores[j] = wsBuf[idx]
+          outIDs[j] = wiBuf[idx]
+        }
+      }
     }
   }
 
   // MARK: - Internal helpers (inlinable-visible)
+
+  /// Strategy the reservoir starts a query in, for the configured options:
+  /// `.adaptive` stays `.adaptive` (block-phase behavior + switch logic) unless the
+  /// caller asked to start directly in `.heap`; concrete modes pass through.
+  @usableFromInline
+  internal static func startMode(for options: ReservoirOptions) -> ReservoirMode {
+    if options.mode == .adaptive {
+      return (options.adaptiveInitialMode == .heap) ? .heap : .adaptive
+    }
+    return options.mode
+  }
 
   /// Append element without ordering (Block/Adaptive Block).
   @usableFromInline
@@ -528,6 +576,91 @@ public final class CandidateReservoir: @unchecked Sendable {
         return bc ? c : b
       }
     }
+  }
+
+  // MARK: - Selection: quickselect over caller-provided buffers (extractTopK only)
+
+  /// Mirrors quickselectTop/partitionAroundPivot/medianOfThreeIndex/swapAt above exactly,
+  /// but operates on explicit buffers instead of self.scores/self.ids, so extractTopK can
+  /// reuse the same median-of-three quickselect on its own read-only copies without
+  /// mutating the reservoir (which the self-based versions do, and which pruneToTopC()'s
+  /// hot mutating path depends on — deliberately left untouched here to avoid any risk to
+  /// that path; these two implementations must be kept in sync if the algorithm changes).
+  @usableFromInline
+  internal func quickselectTopBuffer(
+    scoresBuf: UnsafeMutableBufferPointer<Float>,
+    idsBuf: UnsafeMutableBufferPointer<Int64>,
+    count: Int,
+    countKeep k: Int
+  ) {
+    var left = 0
+    var right = count &- 1
+    let target = k &- 1
+
+    while left <= right {
+      let pivotIndex = medianOfThreeIndexBuffer(scoresBuf, idsBuf, left, (left &+ right) >> 1, right)
+      let newPivot = partitionAroundPivotBuffer(scoresBuf, idsBuf, left: left, right: right, pivotIndex: pivotIndex)
+      if newPivot == target { return }
+      if target < newPivot {
+        right = newPivot &- 1
+      } else {
+        left = newPivot &+ 1
+      }
+    }
+  }
+
+  @usableFromInline
+  internal func partitionAroundPivotBuffer(
+    _ scoresBuf: UnsafeMutableBufferPointer<Float>,
+    _ idsBuf: UnsafeMutableBufferPointer<Int64>,
+    left: Int, right: Int, pivotIndex: Int
+  ) -> Int {
+    swapAtBuffer(scoresBuf, idsBuf, pivotIndex, right)
+    let pivotScore = scoresBuf[right]
+    let pivotID = idsBuf[right]
+    var store = left
+    var i = left
+    while i < right {
+      if isBetter(scoreA: scoresBuf[i], idA: idsBuf[i], scoreB: pivotScore, idB: pivotID) {
+        swapAtBuffer(scoresBuf, idsBuf, i, store)
+        store &+= 1
+      }
+      i &+= 1
+    }
+    swapAtBuffer(scoresBuf, idsBuf, store, right)
+    return store
+  }
+
+  @usableFromInline
+  internal func medianOfThreeIndexBuffer(
+    _ scoresBuf: UnsafeMutableBufferPointer<Float>,
+    _ idsBuf: UnsafeMutableBufferPointer<Int64>,
+    _ a: Int, _ b: Int, _ c: Int
+  ) -> Int {
+    let sa = scoresBuf[a], ia = idsBuf[a]
+    let sb = scoresBuf[b], ib = idsBuf[b]
+    let sc = scoresBuf[c], ic = idsBuf[c]
+
+    let ab = isBetter(scoreA: sa, idA: ia, scoreB: sb, idB: ib)
+    let bc = isBetter(scoreA: sb, idA: ib, scoreB: sc, idB: ic)
+    let ac = isBetter(scoreA: sa, idA: ia, scoreB: sc, idB: ic)
+
+    if ab {
+      if bc { return b } else { return ac ? c : a }
+    } else {
+      if ac { return a } else { return bc ? c : b }
+    }
+  }
+
+  @usableFromInline
+  internal func swapAtBuffer(
+    _ scoresBuf: UnsafeMutableBufferPointer<Float>,
+    _ idsBuf: UnsafeMutableBufferPointer<Int64>,
+    _ a: Int, _ b: Int
+  ) {
+    if a == b { return }
+    let tmpS = scoresBuf[a]; scoresBuf[a] = scoresBuf[b]; scoresBuf[b] = tmpS
+    let tmpI = idsBuf[a]; idsBuf[a] = idsBuf[b]; idsBuf[b] = tmpI
   }
 
   // MARK: - Ordering predicates

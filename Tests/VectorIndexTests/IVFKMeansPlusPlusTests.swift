@@ -18,6 +18,26 @@ final class IVFKMeansPlusPlusTests: XCTestCase {
         XCTAssertEqual(Int(stats.details["assigned"] ?? "0"), 6)
     }
 
+    /// Guards Task 16 (B18): before this task, optimizeKMeans(maxIterations:) ran
+    /// its own standalone body that never populated idToListIndex. Same
+    /// three-cluster fixture as testOptimizeAssignsAll, driven through
+    /// optimizeKMeans() instead of optimize() -- "assigned" (backed by
+    /// idToListIndex.count, see IVFIndex.statistics()) must now read 6, proving
+    /// the delegation to optimize(maxIterations:) actually populates the map.
+    func testOptimizeKMeansPopulatesIdToListIndex() async throws {
+        let ivf = IVFIndex(dimension: 3, metric: .euclidean, config: .init(nlist: 3, nprobe: 1))
+        try await ivf.batchInsert([
+            ("a1", [1, 0, 0], nil), ("a2", [0.9, 0, 0], nil),
+            ("b1", [0, 1, 0], nil), ("b2", [0, 0.95, 0], nil),
+            ("c1", [0, 0, 1], nil), ("c2", [0, 0, 0.9], nil)
+        ])
+        try await ivf.optimizeKMeans()
+        let stats = await ivf.statistics()
+        XCTAssertEqual(stats.vectorCount, 6)
+        XCTAssertEqual(Int(stats.details["assigned"] ?? "0"), 6,
+                       "optimizeKMeans must populate idToListIndex for every assigned vector")
+    }
+
     func testSearchAfterOptimizeFindsCluster() async throws {
         let ivf = IVFIndex(dimension: 2, metric: .euclidean, config: .init(nlist: 2, nprobe: 1))
         try await ivf.batchInsert([

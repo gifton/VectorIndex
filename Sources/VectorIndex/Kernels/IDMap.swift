@@ -2,18 +2,27 @@ import Foundation
 
 // Kernel #50: ID Remapping (External UInt64 ↔ Internal Dense Int64)
 
-public enum HashTableImpl: Sendable { case swissTable, robinHood, linearProbing }
+public enum HashTableImpl: Sendable {
+    case swissTable
+    @available(*, deprecated, message: "Robin Hood hashing backend removed in VectorIndex 0.2.0 (Phase-2 cleanup, B12): IDMap now always uses SwissTable. This case has no effect and is retained only for source compatibility; scheduled for removal in a future major version. See PHASE4-ROUTING.")
+    case robinHood
+    @available(*, deprecated, message: "Linear-probing hashing backend removed in VectorIndex 0.2.0 (Phase-2 cleanup, B12): IDMap now always uses SwissTable. This case has no effect and is retained only for source compatibility; scheduled for removal in a future major version. See PHASE4-ROUTING.")
+    case linearProbing
+}
 public enum IDMapConcurrency: Sendable { case singleWriter, rwLock }
 
 internal struct IDMapOpts: Sendable {
-    public var allowReplace: Bool = false
-    public var hashTableImpl: HashTableImpl = .swissTable
-    public var capacityHint: Int = 1_000
-    public var maxLoadFactor: Double = 0.875
-    public var concurrency: IDMapConcurrency = .singleWriter
-    public var enableBloom: Bool = false
-    public var enableTelemetry: Bool = false
-    public static var `default`: IDMapOpts { IDMapOpts() }
+    var allowReplace: Bool = false
+    /// Inert since this B12 cleanup collapsed IDMap onto a single SwissTable backend
+    /// (Robin Hood / linear-probing variants had zero production or test users — see
+    /// commit history for B12). Retained only so callers constructing `IDMapOpts` with
+    /// an explicit `hashTableImpl:` argument keep compiling; the value is no longer read.
+    var hashTableImpl: HashTableImpl = .swissTable
+    var capacityHint: Int = 1_000
+    var maxLoadFactor: Double = 0.875
+    var concurrency: IDMapConcurrency = .singleWriter
+    var enableBloom: Bool = false
+    static var `default`: IDMapOpts { IDMapOpts() }
 }
 
 public struct IDMapStats {
@@ -60,30 +69,6 @@ public final class TombstoneSet {
     return v + 1
 }
 
-private enum HashTable {
-    case swiss(SwissTable), robin(RobinHoodTable), linear(LinearProbingTable)
-    static func allocate(buckets: Int, impl: HashTableImpl) -> HashTable {
-        switch impl {
-        case .swissTable:
-            let bc = max(16, (buckets + 15) & ~15)
-            return .swiss(SwissTable(bucketCount: bc))
-        case .robinHood:
-            let bc = max(8, nextPow2(buckets))
-            return .robin(RobinHoodTable(bucketCount: bc))
-        case .linearProbing:
-            let bc = max(8, nextPow2(buckets))
-            return .linear(LinearProbingTable(bucketCount: bc))
-        }
-    }
-    var bucketCount: Int { switch self { case .swiss(let t): return t.bucketCount; case .robin(let t): return t.bucketCount; case .linear(let t): return t.bucketCount } }
-    var count: Int { switch self { case .swiss(let t): return t.count; case .robin(let t): return t.count; case .linear(let t): return t.count } }
-    mutating func lookup(_ key: UInt64) -> (Bool, Int64, Int) { switch self { case .swiss(var t): let r=t.lookup(key); self = .swiss(t); return r; case .robin(var t): let r=t.lookup(key); self = .robin(t); return r; case .linear(var t): let r=t.lookup(key); self = .linear(t); return r } }
-    mutating func insert(_ key: UInt64, _ value: Int64) throws -> Int { switch self { case .swiss(var t): let p=try t.insert(key, value); self = .swiss(t); return p; case .robin(var t): let p=try t.insert(key, value); self = .robin(t); return p; case .linear(var t): let p=try t.insert(key, value); self = .linear(t); return p } }
-    mutating func updateValue(for key: UInt64, to value: Int64) -> Int? { switch self { case .swiss(var t): let p=t.updateValue(for: key, to: value); self = .swiss(t); return p; case .robin(var t): let p=t.updateValue(for: key, to: value); self = .robin(t); return p; case .linear(var t): let p=t.updateValue(for: key, to: value); self = .linear(t); return p } }
-    mutating func erase(_ key: UInt64) -> (Bool, Int?) { switch self { case .swiss(var t): let r=t.erase(key); self = .swiss(t); return r; case .robin(var t): let r=t.erase(key); self = .robin(t); return r; case .linear(var t): let r=t.erase(key); self = .linear(t); return r } }
-    func forEach(_ body: (UInt64, Int64) throws -> Void) rethrows { switch self { case .swiss(let t): try t.forEach(body); case .robin(let t): try t.forEach(body); case .linear(let t): try t.forEach(body) } }
-}
-
 private struct SwissTable {
     struct Entry { var externalID: UInt64 = 0; var internalID: Int64 = -1 }
     private static let groupSize = 16
@@ -102,25 +87,6 @@ private struct SwissTable {
     func forEach(_ body: (UInt64, Int64) throws -> Void) rethrows { for i in 0..<bucketCount { let c=control[i]; if c != 0xFF && c != 0xFE { try body(entries[i].externalID, entries[i].internalID) } } }
 }
 
-private struct RobinHoodTable { struct Entry { var externalID: UInt64 = 0; var internalID: Int64 = -1; var dib: UInt8 = 0 }
-    var entries: [Entry]; var bucketCount: Int; var count: Int=0
-    init(bucketCount: Int) { self.bucketCount=bucketCount; self.entries=[Entry](repeating: Entry(), count: bucketCount)}
-    mutating func insert(_ key: UInt64, _ value: Int64) throws -> Int { var curKey=key; var curVal=value; var dib: UInt8=0; var idx=hashH1(key, bucketCount); var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.externalID==0 { entries[idx]=Entry(externalID: curKey, internalID: curVal, dib: dib); count &+= 1; return probes } ; if e.externalID==curKey { entries[idx].internalID=curVal; return probes } ; if e.dib < dib { entries[idx]=Entry(externalID: curKey, internalID: curVal, dib: dib); curKey=e.externalID; curVal=e.internalID; dib=e.dib } ; idx=(idx+1)&(bucketCount-1); if dib==255 { throw ErrorBuilder(.capacityExceeded, operation: "idmap_robin_insert").message("Excessive probing in hash table").info("dib", "255").build() } ; dib &+= 1 } ; throw ErrorBuilder(.capacityExceeded, operation: "idmap_robin_insert").message("Hash table full").info("bucket_count", "\(bucketCount)").info("count", "\(count)").build() }
-    mutating func updateValue(for key: UInt64, to value: Int64) -> Int? { let r=lookup(key); if r.0 { var idx=hashH1(key, bucketCount); var dib: UInt8=0; var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.externalID==0 { return nil } ; if e.externalID==key { entries[idx].internalID=value; return probes } ; if e.dib < dib { return nil } ; idx=(idx+1)&(bucketCount-1); dib &+= 1 } } ; return nil }
-    mutating func erase(_ key: UInt64) -> (Bool, Int?) { var idx=hashH1(key, bucketCount); var dib: UInt8=0; var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.externalID==0 { return (false, probes) } ; if e.externalID==key { var j=idx; var k=(j+1)&(bucketCount-1); while entries[k].externalID != 0 && entries[k].dib > 0 { entries[j]=Entry(externalID: entries[k].externalID, internalID: entries[k].internalID, dib: entries[k].dib &- 1); j=k; k=(k+1)&(bucketCount-1) } ; entries[j]=Entry(); count &-= 1; return (true, probes) } ; if e.dib < dib { return (false, probes) } ; idx=(idx+1)&(bucketCount-1); dib &+= 1 } ; return (false, probes) }
-    mutating func lookup(_ key: UInt64) -> (Bool, Int64, Int) { var idx=hashH1(key, bucketCount); var dib: UInt8=0; var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.externalID==0 { return (false, -1, probes) } ; if e.externalID==key { return (true, e.internalID, probes) } ; if e.dib < dib { return (false, -1, probes) } ; idx=(idx+1)&(bucketCount-1); dib &+= 1 } ; return (false, -1, probes) }
-    func forEach(_ body: (UInt64, Int64) throws -> Void) rethrows { for e in entries where e.externalID != 0 { try body(e.externalID, e.internalID) } }
-}
-
-private struct LinearProbingTable { enum State: UInt8 { case empty=0, deleted=1, full=2 } ; struct Entry { var externalID: UInt64 = 0; var internalID: Int64 = -1; var st: State = .empty }
-    var entries: [Entry]; var bucketCount: Int; var count: Int=0
-    init(bucketCount: Int) { self.bucketCount=bucketCount; self.entries=[Entry](repeating: Entry(), count: bucketCount) }
-    mutating func insert(_ key: UInt64, _ value: Int64) throws -> Int { var idx=hashH1(key, bucketCount); var probes=0; for _ in 0..<bucketCount { probes &+= 1; if entries[idx].st != .full { entries[idx]=Entry(externalID: key, internalID: value, st: .full); count &+= 1; return probes } ; if entries[idx].externalID==key { entries[idx].internalID=value; return probes } ; idx=(idx+1)&(bucketCount-1) } ; throw ErrorBuilder(.capacityExceeded, operation: "idmap_linear_insert").message("Hash table full").info("bucket_count", "\(bucketCount)").info("count", "\(count)").build() }
-    mutating func updateValue(for key: UInt64, to value: Int64) -> Int? { let r=lookup(key); if r.0 { var idx=hashH1(key, bucketCount); var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.st == .empty { return nil } ; if e.st == .full && e.externalID==key { entries[idx].internalID=value; return probes } ; idx=(idx+1)&(bucketCount-1) } } ; return nil }
-    mutating func erase(_ key: UInt64) -> (Bool, Int?) { var idx=hashH1(key, bucketCount); var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.st == .empty { return (false, probes) } ; if e.st == .full && e.externalID==key { entries[idx].st = .deleted; count &-= 1; return (true, probes) } ; idx=(idx+1)&(bucketCount-1) } ; return (false, probes) }
-    mutating func lookup(_ key: UInt64) -> (Bool, Int64, Int) { var idx=hashH1(key, bucketCount); var probes=0; for _ in 0..<bucketCount { probes &+= 1; let e=entries[idx]; if e.st == .empty { return (false, -1, probes) } ; if e.st == .full && e.externalID==key { return (true, e.internalID, probes) } ; idx=(idx+1)&(bucketCount-1) } ; return (false, -1, probes) }
-    func forEach(_ body: (UInt64, Int64) throws -> Void) rethrows { for e in entries where e.st == .full { try body(e.externalID, e.internalID) } }
-}
 
 public final class IDMap {
     public func append(externalIDs: [UInt64]) throws -> [Int64] {
@@ -170,7 +136,7 @@ public final class IDMap {
         var extByInt: [UInt64]
         var count: Int64
         var capacity: Int64
-        fileprivate var hashTable: HashTable
+        fileprivate var hashTable: SwissTable
         fileprivate var nextInternal: Counter
         fileprivate var rwLock: RWLock?
         fileprivate var bloom: Bloom?
@@ -179,12 +145,12 @@ public final class IDMap {
         var probeTotal: Int64 = 0
         var probeOps: Int64 = 0
         var probeMax: Int = 0
-        fileprivate var retired: [HashTable] = []
+        fileprivate var retired: [SwissTable] = []
         init(extByIntCap: Int, hashBuckets: Int, opts: IDMapOpts) {
             self.extByInt = [UInt64](repeating: 0, count: max(1, extByIntCap))
             self.count = 0
             self.capacity = Int64(extByInt.count)
-            self.hashTable = HashTable.allocate(buckets: hashBuckets, impl: opts.hashTableImpl)
+            self.hashTable = SwissTable(bucketCount: max(16, (hashBuckets + 15) & ~15))
             self.nextInternal = Counter()
             self.opts = opts
             self.rwLock = (opts.concurrency == .rwLock) ? RWLock() : nil
@@ -339,7 +305,7 @@ internal func idmapErase(_ map: IDMap, externalIDs: UnsafePointer<UInt64>, count
             del &+= 1 }
     } ; return del }
 
-internal func idmapRehash(_ map: IDMap, newBucketCount: Int) throws { let impl = map.impl; let buckets = max(16, nextPow2(newBucketCount)); var newTable = HashTable.allocate(buckets: buckets, impl: impl.opts.hashTableImpl); for i in 0..<impl.count { if impl.tombstones?.isSet(i) == true { continue } ; let ext = impl.extByInt[Int(i)]; if ext == 0 && i != 0 { continue } ; _ = try newTable.insert(ext, i) } ; if let lock = impl.rwLock { lock.writeLock(); let old = impl.hashTable; impl.hashTable = newTable; lock.writeUnlock(); impl.retired.append(old) } else { let old = impl.hashTable; impl.hashTable = newTable; _ = old } }
+internal func idmapRehash(_ map: IDMap, newBucketCount: Int) throws { let impl = map.impl; let buckets = max(16, nextPow2(newBucketCount)); var newTable = SwissTable(bucketCount: max(16, (buckets + 15) & ~15)); for i in 0..<impl.count { if impl.tombstones?.isSet(i) == true { continue } ; let ext = impl.extByInt[Int(i)]; if ext == 0 && i != 0 { continue } ; _ = try newTable.insert(ext, i) } ; if let lock = impl.rwLock { lock.writeLock(); let old = impl.hashTable; impl.hashTable = newTable; lock.writeUnlock(); impl.retired.append(old) } else { let old = impl.hashTable; impl.hashTable = newTable; _ = old } }
 
 internal func idmapRebuildFromDense(_ map: IDMap) throws { let impl = map.impl; let target = max(16, nextPow2(Int(Double(max(1, Int(impl.count))) / max(0.1, min(impl.opts.maxLoadFactor, 0.95))))); try idmapRehash(map, newBucketCount: target) }
 

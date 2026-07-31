@@ -181,15 +181,7 @@ public extension IndexOps.Scoring {
             #endif
         }
         @inline(__always) private static func sumSquares(ptr: UnsafePointer<Float>, d: Int) -> Float {
-            let d4 = d & ~3
-            var acc = SIMD4<Float>.zero
-            var j = 0
-            while j < d4 { let v = load4(ptr.advanced(by: j)); acc += v * v; j += 4 }
-            var s = hsum4(acc)
-            if d - d4 >= 1 { s += ptr[d4+0] * ptr[d4+0] }
-            if d - d4 >= 2 { s += ptr[d4+1] * ptr[d4+1] }
-            if d - d4 >= 3 { s += ptr[d4+2] * ptr[d4+2] }
-            return s
+            IndexOps.Support.Norms.l2NormSquared(vector: ptr, dimension: d)
         }
         @inline(__always) private static func computeQueryInvNorm_impl(q: UnsafePointer<Float>, d: Int, epsilon: Float) -> Float {
             if d == 0 { return 1.0 / epsilon }
@@ -429,13 +421,9 @@ public extension IndexOps.Scoring {
         ) {
             if n == 0 { return }
             if d == 0 { for i in 0..<n { out[i] = 1.0 / epsilon }; return }
-            let d4 = d & ~3
             for i in 0..<n {
                 let row = xb.advanced(by: i * d)
-                var acc = SIMD4<Float>.zero
-                var j = 0
-                while j < d4 { let v = load4(row.advanced(by: j)); acc += v * v; j += 4 }
-                var s = hsum4(acc); while j < d { let v = row[j]; s += v * v; j += 1 }
+                let s = IndexOps.Support.Norms.l2NormSquared(vector: row, dimension: d)
                 out[i] = 1.0 / (sqrt(s) + epsilon)
             }
         }

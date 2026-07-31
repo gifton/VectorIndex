@@ -536,4 +536,166 @@ final class S2RNGDtypeTests: XCTestCase {
         XCTAssertEqual(padTo(16, multiple: 16), 16)
         XCTAssertEqual(padTo(17, multiple: 16), 32)
     }
+
+    // MARK: - Ported from CS2RNG-dependent tests (deleted with the CS2RNG C target;
+    // see Task 2 of the phase-2 cleanup plan for the full per-test triage).
+
+    func testXoroshiro128UniformityChiSquare() throws {
+        // Ported from RNGDeterminismTests.testUniformityChiSquare.
+        // Chi-square goodness-of-fit test: chi2 = sum((observed-expected)^2 / expected).
+        var rng = S2Xoroshiro128(seed: 0xDEADBEEF, streamID: 0, taskID: 0)
+
+        let bins = 100
+        var counts = [Int](repeating: 0, count: bins)
+        let samples = 100_000
+
+        for _ in 0..<samples {
+            let u = rng.nextUniform()
+            let bin = min(Int(u * Float(bins)), bins - 1)
+            counts[bin] += 1
+        }
+
+        let expected = Double(samples) / Double(bins)
+        let chiSquare = counts.reduce(0.0) { sum, count in
+            let diff = Double(count) - expected
+            return sum + (diff * diff) / expected
+        }
+
+        // Critical value for 99 degrees of freedom at alpha=0.001 is ~149.
+        // Verified observed value on this seed: ~99.06.
+        XCTAssertLessThan(chiSquare, 149.0,
+                           "Chi-square test failed: S2Xoroshiro128.nextUniform() is not uniform")
+    }
+
+    func testXoroshiro128StreamIndependenceQuantitative() throws {
+        // Ported from RNGDeterminismTests.testStreamIndependence. Strengthens
+        // testXoroshiro128StreamIndependence's boolean check with a quantitative bound.
+        let seed: UInt64 = 42
+
+        var rng0 = S2Xoroshiro128(seed: seed, streamID: 0, taskID: 0)
+        var rng1 = S2Xoroshiro128(seed: seed, streamID: 1, taskID: 0)
+
+        let seq0 = (0..<1000).map { _ in rng0.nextUniform() }
+        let seq1 = (0..<1000).map { _ in rng1.nextUniform() }
+
+        // Verified observed value on this seed: 0 collisions.
+        let collisions = zip(seq0, seq1).filter { $0 == $1 }.count
+        XCTAssertLessThan(collisions, 10,
+                           "Independent streams should have <1% collision rate")
+    }
+
+    func testInt8QuantizationExtremeSaturation() throws {
+        // Ported from S2EdgeCaseTests.testQuantizationWithLargeValues +
+        // testQuantizationNearMaxFloat. Values are chosen to stay within Int32 range
+        // after division by scale, so quantizeSymmetric's internal `Int32(r)` conversion
+        // does not trap (see this task's finding #1 for the Inf/NaN case that does trap
+        // and was deliberately NOT ported).
+        let largeValues: [Float] = [
+            16_777_216.0,   // 2^24
+            33_554_432.0,   // 2^25
+            1.0e10,
+            -1.0e10
+        ]
+        var largeQuantized = [Int8](repeating: 0, count: largeValues.count)
+        largeValues.withUnsafeBufferPointer { src in
+            largeQuantized.withUnsafeMutableBufferPointer { dst in
+                quantizeSymmetric(x: src, scale: 127.0, y: dst)
+            }
+        }
+        // Verified observed output: [127, 127, 127, -128]
+        XCTAssertEqual(largeQuantized, [127, 127, 127, -128],
+                       "Values far beyond scale*127 must saturate to int8 bounds")
+
+        let maxVal = Float.greatestFiniteMagnitude
+        let nearMaxValues: [Float] = [maxVal, -maxVal, maxVal * 0.5, -maxVal * 0.5]
+        let nearMaxScale = maxVal / 127.0
+        var nearMaxQuantized = [Int8](repeating: 0, count: nearMaxValues.count)
+        nearMaxValues.withUnsafeBufferPointer { src in
+            nearMaxQuantized.withUnsafeMutableBufferPointer { dst in
+                quantizeSymmetric(x: src, scale: nearMaxScale, y: dst)
+            }
+        }
+        // Verified observed output: [127, -127, 63, -63]
+        XCTAssertEqual(abs(nearMaxQuantized[0]), 127, "Max float should saturate to +-127")
+        XCTAssertEqual(abs(nearMaxQuantized[1]), 127, "-Max float should saturate to +-127")
+        XCTAssertLessThanOrEqual(abs(Int(nearMaxQuantized[2]) - 64), 1,
+                                  "0.5*max should quantize to ~64")
+        XCTAssertLessThanOrEqual(abs(Int(nearMaxQuantized[3]) + 64), 1,
+                                  "-0.5*max should quantize to ~-64")
+    }
+
+    func testNibblePackingOrderLowFirst() throws {
+        // Ported from DTypeConversionTests.testNibblePackingOrderLowFirst. Asserts a
+        // hand-computed byte value rather than round-tripping through packPair(), so it
+        // independently documents the "low nibble = first code" contract (testU4PackUnpack
+        // only checks packed[i] == packPair(...), which is tautological w.r.t. packPair
+        // itself).
+        let input: [UInt8] = [0x3, 0xA]  // codes 3 and 10
+        var packed = [UInt8](repeating: 0, count: 1)
+
+        input.withUnsafeBufferPointer { src in
+            packed.withUnsafeMutableBufferPointer { dst in
+                packNibblesU4(indices: src, packed: dst)
+            }
+        }
+
+        XCTAssertEqual(packed[0], 0xA3,
+                       "Low nibble=0x3 (first code), high nibble=0xA (second code)")
+    }
+
+    func testEndianHelpers64Bit() throws {
+        // Ported from DTypeConversionTests.testLittleEndianRoundTrip's 64-bit case.
+        // testEndianHelpers only covers the 16/32-bit helpers.
+        var buffer = ContiguousArray<UInt64>(repeating: 0, count: 1)
+
+        buffer.withUnsafeMutableBytes { ptr in
+            store64LE(ptr.baseAddress!, 0xFEDCBA9876543210)
+        }
+
+        let loaded64 = buffer.withUnsafeBytes { ptr in
+            load64LE(ptr.baseAddress!)
+        }
+
+        XCTAssertEqual(loaded64, 0xFEDCBA9876543210)
+    }
+
+    func testF16BoundaryValues() throws {
+        // Merged from S2EdgeCaseTests.testF16ConversionWithSpecialValues (overflow/
+        // underflow) and DTypeConversionTests.testF32ToF16RoundTrip (min-normal/subnormal
+        // boundary values). Verified live: Float16(Float.greatestFiniteMagnitude) saturates
+        // to +Inf (no trap) -- narrowing float-to-float conversions saturate per IEEE 754,
+        // unlike the float-to-Int32 trap in testInt8QuantizationExtremeSaturation's comment.
+        let maxVal = Float.greatestFiniteMagnitude
+        let testValues: [Float] = [
+            maxVal,          // overflows f16 range -> +Inf
+            -maxVal,         // overflows f16 range -> -Inf
+            1.0e-20,         // underflows f16 range -> 0
+            6.10352e-5,      // smallest f16 normal
+            5.96046e-8       // smallest f16 subnormal (2^-24)
+        ]
+
+        var f16Bits = [UInt16](repeating: 0, count: testValues.count)
+        var roundTrip = [Float](repeating: 0, count: testValues.count)
+
+        testValues.withUnsafeBufferPointer { src in
+            f16Bits.withUnsafeMutableBufferPointer { dst in
+                f32ToF16Batch(src.baseAddress!, dst.baseAddress!, testValues.count)
+            }
+        }
+        f16Bits.withUnsafeBufferPointer { src in
+            roundTrip.withUnsafeMutableBufferPointer { dst in
+                f16ToF32Batch(src.baseAddress!, dst.baseAddress!, testValues.count)
+            }
+        }
+
+        XCTAssertTrue(roundTrip[0].isInfinite && roundTrip[0] > 0, "Max f32 should overflow to +Inf in f16")
+        XCTAssertTrue(roundTrip[1].isInfinite && roundTrip[1] < 0, "-Max f32 should overflow to -Inf in f16")
+        XCTAssertEqual(roundTrip[2], 0.0, "1e-20 should underflow to zero in f16")
+
+        let minNormalError = abs(roundTrip[3] - testValues[3]) / testValues[3]
+        XCTAssertLessThan(minNormalError, 0.001, "Smallest f16 normal should round-trip accurately")
+
+        let subnormalError = abs(roundTrip[4] - testValues[4])
+        XCTAssertLessThan(subnormalError, 1e-8, "Smallest f16 subnormal should round-trip accurately")
+    }
 }

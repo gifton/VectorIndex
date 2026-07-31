@@ -104,14 +104,6 @@ public struct IDFilterBitset {
 public enum FilterMode {
     case allowlist
     case denylist
-
-    @inlinable
-    func shouldKeep(bit: Bool) -> Bool {
-        switch self {
-        case .allowlist: return bit
-        case .denylist:  return !bit
-        }
-    }
 }
 
 // MARK: - Inline Single-ID Checks (hot path)
@@ -313,10 +305,9 @@ public func idFilterCompact(
 }
 // Spec: stable two-finger compaction; scores kept aligned.  [oai_citation:6‡08_id_filter.md](file-service://file-TWS7TvB6rB2nnbH7j3o5hw)  [oai_citation:7‡08_id_filter.md](file-service://file-TWS7TvB6rB2nnbH7j3o5hw)
 
-/// Filter+compact with composed multi-filter using a precomputed mask.
-/// Generates mask first to amortize checks, then performs stable copy.
-///
-/// ⚠️ **Allocation Note**: This function allocates a temporary `UInt8` mask buffer of size `n`.
+/// Filter+compact with composed multi-filter, single-pass (no mask allocation).
+/// Mirrors idFilterCompact's zero-allocation pattern for the single-filter case, but for
+/// up to 5 composed filters (4 allow + 1 deny).
 ///
 /// - Returns: count of kept elements.
 @inlinable
@@ -331,26 +322,37 @@ public func idFilterCompactN(
     idsOut: UnsafeMutablePointer<Int64>,
     scoresOut: UnsafeMutablePointer<Float>?
 ) -> Int {
-    // Build mask first (⚠️ allocates temporary buffer)
-    var mask = [UInt8](repeating: 0, count: n)
-    let kept = idFilterMaskN(
-        filters: filters, modes: modes, filterCount: F,
-        ids: idsIn, count: n, capacity: capacity,
-        maskOut: &mask
-    )
+    precondition(F >= 0 && F <= 5, "Up to 5 filters supported (4 allow + 1 deny via mode)")
 
-    // Stable compaction using mask
+    // Map to at most 4 allows + optional deny (mirrors idFilterMaskN's own setup).
+    var allowPtrs: [UnsafePointer<UInt64>?] = [nil, nil, nil, nil]
+    var denyPtr: UnsafePointer<UInt64>?
+    var aIdx = 0
+    for f in 0..<F {
+        let ptr = filters[f]
+        switch modes[f] {
+        case .allowlist:
+            if aIdx < 4 { allowPtrs[aIdx] = ptr; aIdx &+= 1 }
+        case .denylist:
+            if denyPtr == nil { denyPtr = ptr }
+        }
+    }
+
     var writeIdx = 0
     for i in 0..<n {
-        if mask[i] == 1 {
-            idsOut[writeIdx] = idsIn[i]
+        let id = idsIn[i]
+        let pass = idFilterPassN(
+            allow0: allowPtrs[0], allow1: allowPtrs[1], allow2: allowPtrs[2], allow3: allowPtrs[3],
+            deny: denyPtr, id: id, capacity: capacity
+        )
+        if pass {
+            idsOut[writeIdx] = id
             if let sIn = scoresIn, let sOut = scoresOut {
                 sOut[writeIdx] = sIn[i]
             }
             writeIdx &+= 1
         }
     }
-    assert(writeIdx == kept)
     return writeIdx
 }
 // Spec: mask + stable compact variant for composed filters.  [oai_citation:8‡08_id_filter.md](file-service://file-TWS7TvB6rB2nnbH7j3o5hw)  [oai_citation:9‡08_id_filter.md](file-service://file-TWS7TvB6rB2nnbH7j3o5hw)

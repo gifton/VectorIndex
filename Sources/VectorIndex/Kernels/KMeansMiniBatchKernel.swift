@@ -190,22 +190,6 @@ internal func _vi_km12_load4(_ base: UnsafePointer<Float>, _ offset: Int) -> SIM
 @inline(__always)
 internal func _vi_km12_sum4(_ v: SIMD4<Float>) -> Float { v[0] + v[1] + v[2] + v[3] }
 
-/// Prefetch hint (no-op for now; infrastructure for future platform-specific optimization)
-///
-/// Future: Could use __builtin_prefetch (ARM) or _mm_prefetch (x86) via C bridge.
-/// Current: Documentation placeholder to preserve API surface.
-@usableFromInline
-@inline(__always)
-internal func _vi_km12_prefetch(_ ptr: UnsafeRawPointer?) {
-    _ = ptr
-    // TODO: Implement platform-specific prefetch
-    // #if arch(arm64)
-    //   __builtin_prefetch(ptr, 0, 0)
-    // #elseif arch(x86_64)
-    //   _mm_prefetch(ptr, _MM_HINT_T0)
-    // #endif
-}
-
 /// L2 squared distance: AoS fast path (8-wide unroll using SIMD4)
 ///
 /// Computes ‖a - b‖² = Σ(a[i] - b[i])²
@@ -346,37 +330,30 @@ internal func _vi_km12_repairEmpties_splitLargest(
     }
 }
 
-// MARK: - Assignment (tiling over centroids)
+// MARK: - Assignment (flat scan; tiling removed — see Phase 2 B20 cleanup)
 
-/// Assign vector to nearest centroid using tiled scan
+/// Assign vector to nearest centroid via a flat linear scan over all centroids.
 ///
-/// Cache-friendly: processes centroids in tiles of size `tile` to maintain
-/// hot data in L1/L2 cache. Tile size 32 chosen empirically for typical d.
+/// This used to be tiled with an inter-tile prefetch hint, but the prefetch
+/// (`_vi_km12_prefetch`) was a documented no-op, so the tiling added loop
+/// overhead with no cache benefit. Collapsed to a plain scan; same result.
 @usableFromInline
-internal func _vi_km12_assignAOS_tiled(
+internal func _vi_km12_assignAOS(
     xVec: UnsafePointer<Float>,
-    C: UnsafePointer<Float>, kc: Int, d: Int,
-    tile: Int
+    C: UnsafePointer<Float>, kc: Int, d: Int
 ) -> (cBest: Int, distBest: Float) {
     var cBest = 0
     var distBest = _vi_km12_l2sq_aos(xVec, C, d)
 
     var c = 1
     while c < kc {
-        let end = min(c + tile, kc)
-        // (Optional) prefetch next tile
-        if end < kc {
-            _vi_km12_prefetch(UnsafeRawPointer(C.advanced(by: end * d)))
+        let dist = _vi_km12_l2sq_aos(xVec, C.advanced(by: c * d), d)
+        // Deterministic tie-breaking: prefer lower centroid index
+        if dist < distBest || (dist == distBest && c < cBest) {
+            distBest = dist
+            cBest = c
         }
-        while c < end {
-            let dist = _vi_km12_l2sq_aos(xVec, C.advanced(by: c * d), d)
-            // Deterministic tie-breaking: prefer lower centroid index
-            if dist < distBest || (dist == distBest && c < cBest) {
-                distBest = dist
-                cBest = c
-            }
-            c += 1
-        }
+        c += 1
     }
     return (cBest, distBest)
 }
@@ -536,8 +513,6 @@ public func kmeans_minibatch_f32(
             nEpoch = n
         }
 
-        let tile = 32  // Cache tile size (empirically optimal for d ∈ [128, 2048])
-
         // Process mini-batches
         var processed: Int64 = 0
         while processed < nEpoch {
@@ -569,7 +544,7 @@ public func kmeans_minibatch_f32(
                     switch cfg.layout {
                     case .aos:
                         let vec = x.advanced(by: Int(gi) * d)
-                        return _vi_km12_assignAOS_tiled(xVec: vec, C: centroidsOut, kc: kc, d: d, tile: tile)
+                        return _vi_km12_assignAOS(xVec: vec, C: centroidsOut, kc: kc, d: d)
                     case .aosoaR:
                         let R = cfg.aosoaRegisterBlock  // Already validated > 0
                         return _vi_km12_assignAOSOA(X: x, nIndex: gi, C: centroidsOut, kc: kc, d: d, R: R)
@@ -718,7 +693,7 @@ public func kmeans_minibatch_f32(
                 switch cfg.layout {
                 case .aos:
                     let vec = x.advanced(by: i * d)
-                    return _vi_km12_assignAOS_tiled(xVec: vec, C: centroidsOut, kc: kc, d: d, tile: 32)
+                    return _vi_km12_assignAOS(xVec: vec, C: centroidsOut, kc: kc, d: d)
                 case .aosoaR:
                     let R = cfg.aosoaRegisterBlock
                     return _vi_km12_assignAOSOA(X: x, nIndex: Int64(i), C: centroidsOut, kc: kc, d: d, R: R)
@@ -801,7 +776,7 @@ public func kmeans_state_update_chunk(
             switch layout {
             case .aos:
                 let vec = x_chunk.advanced(by: Int(ii) * d)
-                return _vi_km12_assignAOS_tiled(xVec: vec, C: state.centroids.withUnsafeBufferPointer { $0.baseAddress! }, kc: kc, d: d, tile: 32)
+                return _vi_km12_assignAOS(xVec: vec, C: state.centroids.withUnsafeBufferPointer { $0.baseAddress! }, kc: kc, d: d)
             case .aosoaR:
                 return _vi_km12_assignAOSOA(X: x_chunk, nIndex: ii, C: state.centroids.withUnsafeBufferPointer { $0.baseAddress! }, kc: kc, d: d, R: R)
             }

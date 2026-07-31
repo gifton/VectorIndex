@@ -204,10 +204,14 @@ public struct RangeScanTelemetry {
     }
 }
 
-// Lightweight recorder hook — replace with your Telemetry (#46) integration.
-@usableFromInline
-@inline(__always) internal func recordTelemetry(_ t: RangeScanTelemetry) {
-    _ = t  // TODO: Wire to global telemetry
+/// Push-callback telemetry recorder, following the same pattern as
+/// `HNSWTelemetryRecorder`, `IndexOps.Scoring.Cosine.TelemetryRecorder`,
+/// `IndexOps.Scoring.InnerProduct.TelemetryRecorder`, `L2SqrTelemetryRecorder`,
+/// and `IndexOps.Selection.TopKTelemetryRecorder`. `sink` defaults to `nil`, so
+/// this is a no-op until a host application opts in.
+public enum RangeScanTelemetryRecorder {
+    public nonisolated(unsafe) static var sink: ((RangeScanTelemetry) -> Void)?
+    @inline(__always) public static func record(_ t: RangeScanTelemetry) { sink?(t) }
 }
 
 // MARK: - Public API
@@ -302,7 +306,7 @@ public func rangeScanBlock(
             bytesCodes: 0,
             executionTimeNanos: t1 - t0
         )
-        recordTelemetry(telem)
+        RangeScanTelemetryRecorder.record(telem)
     }
 
     return kept
@@ -458,7 +462,7 @@ public func rangeScanADC_u8(
             bytesCodes: n * m * MemoryLayout<UInt8>.stride,
             executionTimeNanos: t1 - t0
         )
-        recordTelemetry(telem)
+        RangeScanTelemetryRecorder.record(telem)
     }
 
     return usingReservoir ? kept : outCount
@@ -548,7 +552,7 @@ public func rangeScanADC_u4(
             bytesCodes: n * bytesPerRow * MemoryLayout<UInt8>.stride,
             executionTimeNanos: t1 - t0
         )
-        recordTelemetry(telem)
+        RangeScanTelemetryRecorder.record(telem)
     }
 
     return usingReservoir ? kept : outCount

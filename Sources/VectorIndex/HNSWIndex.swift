@@ -32,10 +32,17 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     public let config: Configuration
     public var count: Int { activeCount }
 
+    /// `toHNSWMetric(metric)` computed once at init and cached here -- `metric` is
+    /// an invariant `let` validated at init, so recomputing this pure mapping on
+    /// every search/batchSearch/makeKNNBuildContext/insert/prune call (B19) was
+    /// wasted work on the query hot path.
+    private let hnswMetric: HNSWMetric
+
     /// Supported metrics for HNSW traversal kernel
     private static let supportedMetrics: Set<SupportedDistanceMetric> = [.euclidean, .dotProduct, .cosine]
 
-    /// Convert SupportedDistanceMetric to HNSWMetric (validated at init)
+    /// Convert SupportedDistanceMetric to HNSWMetric (validated at init).
+    /// Only called once per instance now, from the designated initializer below.
     @inline(__always)
     private static func toHNSWMetric(_ metric: SupportedDistanceMetric) -> HNSWMetric {
         switch metric {
@@ -55,18 +62,21 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         self.dimension = dimension
         self.metric = metric
         self.config = config
+        self.hnswMetric = Self.toHNSWMetric(metric)
         self.rng35 = HNSWXoroRNGState.from(seed: config.rngSeed, stream: config.rngStream)
     }
 
-    // Protocol-required initializer (delegates to designated one)
+    // Protocol-required initializer. B19: this comment already claimed "delegates
+    // to the designated one" but the body actually duplicated the precondition
+    // check and RNG init instead -- a real bug (comment vs. code), not just style,
+    // since this exact two-labeled-argument call shape (HNSWIndex(dimension:
+    // metric:), no config:) is what resolves to *this* initializer rather than the
+    // designated one with a defaulted config:, and it's the shape ~15+ call sites
+    // across HNSWWALTests, TypedOverloadsTests, AccelerableIndexTests,
+    // HNSWKNNGraphTests, and ArrayCopyOptimizationBenchmark use. Now it actually
+    // delegates.
     public init(dimension: Int, metric: SupportedDistanceMetric) {
-        guard Self.supportedMetrics.contains(metric) else {
-            preconditionFailure("HNSWIndex does not support metric '\(metric)'. Supported metrics: euclidean, dotProduct, cosine. Use FlatIndex for manhattan/chebyshev.")
-        }
-        self.dimension = dimension
-        self.metric = metric
-        self.config = .init()
-        self.rng35 = HNSWXoroRNGState.from(seed: self.config.rngSeed, stream: self.config.rngStream)
+        self.init(dimension: dimension, metric: metric, config: .init())
     }
 
     public func insert(id: VectorID, vector: [Float], metadata: [String: String]?) async throws {
@@ -174,8 +184,8 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
             }
         }
 
-        // Map metric (validated at init)
-        let m33 = Self.toHNSWMetric(metric)
+        // Map metric (validated at init, cached in hnswMetric)
+        let m33 = hnswMetric
         let ef = max(config.efSearch, k)
 
         // Prepare output buffers
@@ -228,9 +238,15 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         }
     }
 
-    /// Context for parallel batch search - bundles all data needed by worker tasks
+    /// Context for parallel batch search - bundles all data needed by worker tasks.
+    /// vectorStorage is ContiguousArray<Float> (B19), matching KNNBuildContext and
+    /// the actor's own `private var vectorStorage: ContiguousArray<Float>` storage
+    /// -- a plain value assignment is COW-shared (zero bytes copied unless the
+    /// actor later mutates mid-search), whereas the previous [Float] forced an
+    /// eager Array(vectorStorage) buffer copy of the entire vector store on every
+    /// batchSearch() call, even though the TaskGroup workers only ever read it.
     private struct BatchSearchContext: @unchecked Sendable {
-        let vectorStorage: [Float]
+        let vectorStorage: ContiguousArray<Float>
         let csrOffsets: [[Int32]]
         let csrNeighbors: [[Int32]]
         let invNorms: [Float]?
@@ -262,12 +278,12 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         let N = nodes.count
         if N == 0 { return queries.map { _ in [] } }
 
-        // Map metric (validated at init)
-        let m33 = Self.toHNSWMetric(metric)
+        // Map metric (validated at init, cached in hnswMetric)
+        let m33 = hnswMetric
 
         // Build context with all data needed for parallel search
         let ctx = BatchSearchContext(
-            vectorStorage: Array(vectorStorage),
+            vectorStorage: vectorStorage,
             csrOffsets: csrOffsetsCache,
             csrNeighbors: csrNeighborsCache,
             invNorms: rebuildInvNormsIfNeededForCosine().map { Array(UnsafeBufferPointer(start: $0, count: N)) },
@@ -444,7 +460,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
             N: N,
             ef: ef,
             k: k,
-            metric: Self.toHNSWMetric(metric)
+            metric: hnswMetric
         )
         return (ctx, ids)
     }
@@ -620,7 +636,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                     vectorStorage.withUnsafeBufferPointer { xbbp in
                         let ids32 = filtered.map { Int32($0) }
                         var out = [Int32](repeating: -1, count: config.m)
-                        let metric34 = Self.toHNSWMetric(metric)
+                        let metric34 = hnswMetric
                         let invPtr = (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
                         let written = ids32.withUnsafeBufferPointer { cbp in
                             out.withUnsafeMutableBufferPointer { obp in
@@ -641,9 +657,17 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
                 }
 
                 connect(newIndex, with: selected, level: l)
-                // Update cur to closest among selected for next lower layer
-                if let best = selected.min(by: { distance(vector, vectorArray(at: $0), metric: metric) < distance(vector, vectorArray(at: $1), metric: metric) }) {
-                    cur = best
+                // Update cur to closest among selected for next lower layer.
+                // Precompute each candidate's vector + distance once (B17c): the
+                // previous min(by:) comparator called vectorArray(at:)/distance(...)
+                // twice per comparison for both operands, with zero caching across
+                // comparisons -- up to 2(M-1) redundant allocations and full-d
+                // distance recomputations for an M-candidate selection.
+                if !selected.isEmpty {
+                    let dists = selected.map { distance(vector, vectorArray(at: $0), metric: metric) }
+                    var bestIdx = 0
+                    for i in 1..<dists.count where dists[i] < dists[bestIdx] { bestIdx = i }
+                    cur = selected[bestIdx]
                 }
             }
 
@@ -697,7 +721,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
 
         let N = nodes.count
         let candidateIDs = current.map { Int32($0) }
-        let metric34 = Self.toHNSWMetric(metric)
+        let metric34 = hnswMetric
         let invPtr = (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
         let anchorOffset = nodes[idx].vectorOffset
 
@@ -1127,14 +1151,16 @@ extension HNSWIndex {
                 if mapped.count > config.m {
                     let nodeOffset = newNodes[i].vectorOffset
                     let nodeVec = Array(newVectorStorage[nodeOffset..<(nodeOffset + dim)])
-                    mapped.sort {
-                        let off0 = newNodes[$0].vectorOffset
-                        let off1 = newNodes[$1].vectorOffset
-                        let vec0 = Array(newVectorStorage[off0..<(off0 + dim)])
-                        let vec1 = Array(newVectorStorage[off1..<(off1 + dim)])
-                        return distance(nodeVec, vec0, metric: metric) < distance(nodeVec, vec1, metric: metric)
+                    // Precompute each candidate's distance once (B17c): the previous
+                    // sort comparator recomputed vec0/vec1 (fresh Array allocations)
+                    // on every pairwise comparison, O(mapped.count log mapped.count)
+                    // times, re-copying the same handful of candidates repeatedly.
+                    let withDist: [(id: Int, dist: Float)] = mapped.map { cand in
+                        let off = newNodes[cand].vectorOffset
+                        let vec = Array(newVectorStorage[off..<(off + dim)])
+                        return (cand, distance(nodeVec, vec, metric: metric))
                     }
-                    mapped = Array(mapped.prefix(config.m))
+                    mapped = withDist.sorted { $0.dist < $1.dist }.prefix(config.m).map { $0.id }
                 }
                 lvlLists.append(mapped)
             }
@@ -1162,42 +1188,6 @@ extension HNSWIndex {
         }
         // Mark caches dirty (structure has changed)
         markCSRDirty(); markInvNormsDirty()
-    }
-}
-
-// MARK: - Neighbor selection heuristic
-private extension HNSWIndex {
-    // Select up to maxM diverse neighbors among candidate node indices for a given vector at level.
-    // Implements a simple diversity heuristic from HNSW: candidates are considered in increasing
-    // distance order; a candidate is selected if it is closer to the new point than to any already
-    // selected neighbor, promoting angular diversity.
-    func selectNeighbors(for vec: [Float], among candidates: [Int], level: Int, maxM: Int) -> [Int] {
-        // Sort candidates by distance to vec
-        var sorted: [(Int, Float)] = candidates.map { ($0, distance(vec, vectorArray(at: $0), metric: metric)) }
-        sorted.sort { $0.1 < $1.1 }
-        var selected: [Int] = []
-        selected.reserveCapacity(min(maxM, sorted.count))
-        for (cand, _) in sorted {
-            var good = true
-            let candVec = vectorArray(at: cand)
-            for s in selected {
-                // If candidate is much closer to an already selected neighbor than to the new point,
-                // skip it (encourage spread). Criterion: d(cand, s) < d(cand, new)
-                let d_cs = distance(candVec, vectorArray(at: s), metric: metric)
-                let d_cx = distance(candVec, vec, metric: metric)
-                if d_cs < d_cx { good = false; break }
-            }
-            if good { selected.append(cand) }
-            if selected.count >= maxM { break }
-        }
-        // Fallback: if too few selected, fill with nearest remaining
-        if selected.count < maxM {
-            for (cand, _) in sorted where !selected.contains(cand) {
-                selected.append(cand)
-                if selected.count >= maxM { break }
-            }
-        }
-        return selected
     }
 }
 

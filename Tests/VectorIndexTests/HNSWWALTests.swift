@@ -61,6 +61,7 @@ final class HNSWWALTests: XCTestCase {
         let cases: [HNSWWALRecord] = [
             .insert(insertItem),
             .remove(id: "bravo"),
+            .update(id: "gamma", vector: [0.5, -0.5, 0.25, -0.25], metadata: ["u": "1"]),
             .clear,
             .batchInsert([
                 insertItem,
@@ -87,6 +88,13 @@ final class HNSWWALTests: XCTestCase {
                 XCTAssertEqual(a.knownInvNorm, b.knownInvNorm)
             case (.remove(let a), .remove(let b)):
                 XCTAssertEqual(a, b)
+            case (.update(let aid, let avec, let ameta), .update(let bid, let bvec, let bmeta)):
+                // B19: .update had zero test coverage of any kind before this case --
+                // codec-complete but never emitted by any current write path (see the
+                // reserved-but-unemitted note in HNSWWAL.swift).
+                XCTAssertEqual(aid, bid)
+                XCTAssertEqual(avec, bvec)
+                XCTAssertEqual(ameta, bmeta)
             case (.clear, .clear):
                 break
             case (.batchInsert(let a), .batchInsert(let b)):

@@ -63,31 +63,5 @@ public extension IndexOps.Scoring {
                 }
             }
         }
-
-        @inline(__always)
-        private static func sumSquares(ptr: UnsafePointer<Float>, d: Int) -> Float {
-            let d4 = d & ~3
-            var acc = SIMD4<Float>.zero
-            var j = 0
-            while j < d4 {
-                let v = load4(ptr.advanced(by: j))
-                acc += v * v
-                j += 4
-            }
-            var s = acc[0] + acc[1] + acc[2] + acc[3]
-            if d - d4 >= 1 { s += ptr[d4+0] * ptr[d4+0] }
-            if d - d4 >= 2 { s += ptr[d4+1] * ptr[d4+1] }
-            if d - d4 >= 3 { s += ptr[d4+2] * ptr[d4+2] }
-            return s
-        }
-
-        @inline(__always)
-        private static func load4(_ p: UnsafePointer<Float>) -> SIMD4<Float> {
-            if Int(bitPattern: p) & (MemoryLayout<SIMD4<Float>>.alignment - 1) == 0 {
-                return p.withMemoryRebound(to: SIMD4<Float>.self, capacity: 1) { $0.pointee }
-            } else {
-                return SIMD4<Float>(p[0], p[1], p[2], p[3])
-            }
-        }
     }
 }
