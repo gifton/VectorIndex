@@ -372,21 +372,40 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
     /// The CosineNormsHandle wrapping a pointer into `centroidInvNorms` is
     /// constructed AND consumed entirely inside that array's own
     /// withUnsafeBufferPointer scope below -- it is never stored.
+    ///
+    /// FIX ROUND 1, Finding 1: the old scalar `distance()` (DistanceUtils.swift,
+    /// cosine case) short-circuits to the max distance (1) whenever
+    /// `sqrt(amag2 * bmag2) <= .ulpOfOne` (`amag2`/`bmag2` are the query/row
+    /// squared norms, `amag2 == 1` when `queryIsNormalized`), *without*
+    /// dividing -- guarding against a degenerate (near-zero-norm) vector on
+    /// either side producing a meaningless similarity via an inflated
+    /// epsilon-guarded inverse. `IndexOps.Scoring.ScoreBlock`'s cosine path
+    /// never performs that check (it fuses per-factor inverse norms,
+    /// `1/(‖q‖+eps)` and `1/(‖c‖+eps)`, computed independently), so a
+    /// collapsed centroid (plausible after k-means cluster collapse, ‖c‖≈0)
+    /// would silently produce a "real" similarity instead of the old
+    /// "never probe first" behavior. Restored below by recomputing the
+    /// *exact* old guard's product, `qNormSq * centroidNormsSq[i]`, per row
+    /// -- mathematically the same quantity `amag2 * bmag2` guarded in the
+    /// old code, not a per-factor approximation from the two inverse norms
+    /// -- and forcing distance 1 wherever `sqrt(...) <= .ulpOfOne`.
     private static func centroidScores(
         qPtr: UnsafePointer<Float>,
         flatPtr: UnsafePointer<Float>,
         kc: Int,
         d: Int,
         metric: SupportedDistanceMetric,
+        centroidNormsSq: [Float],
         centroidInvNorms: [Float],
         queryIsNormalized: Bool
     ) -> [Float] {
         var out = [Float](repeating: 0, count: kc)
         guard kc > 0 else { return out }
         if metric == .cosine {
-            let qInv: Float = queryIsNormalized
+            let qNormSq: Float = queryIsNormalized
                 ? 1.0
-                : 1.0 / (IndexOps.Support.Norms.l2NormSquared(vector: qPtr, dimension: d).squareRoot() + 1e-12)
+                : IndexOps.Support.Norms.l2NormSquared(vector: qPtr, dimension: d)
+            let qInv: Float = queryIsNormalized ? 1.0 : 1.0 / (qNormSq.squareRoot() + 1e-12)
             centroidInvNorms.withUnsafeBufferPointer { ib in
                 out.withUnsafeMutableBufferPointer { ob in
                     let handle = IndexOps.Scoring.ScoreBlock.CosineNormsHandle(
@@ -396,8 +415,15 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
                         q: qPtr, xb: flatPtr, n: kc, d: d,
                         metric: metric, out: ob.baseAddress!, cosineNorms: handle)
                     // cosine similarity -> "smaller is better" distance,
-                    // matching old distance()'s `1 - sim`.
-                    for i in 0..<kc { ob[i] = 1 - ob[i] }
+                    // matching old distance()'s `1 - sim`, EXCEPT where the
+                    // old near-zero-norm guard would have short-circuited
+                    // (see doc comment above) -- those rows are forced to
+                    // the old code's max distance (1) instead of using the
+                    // (undefined-ish, epsilon-inflated) similarity.
+                    for i in 0..<kc {
+                        let denom = (qNormSq * centroidNormsSq[i]).squareRoot()
+                        ob[i] = denom > .ulpOfOne ? (1 - ob[i]) : 1
+                    }
                 }
             }
         } else {
@@ -425,19 +451,30 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             centroidsFlat.withUnsafeBufferPointer { cb in
                 Self.centroidScores(
                     qPtr: qb.baseAddress!, flatPtr: cb.baseAddress!, kc: kc, d: d,
-                    metric: metric, centroidInvNorms: centroidInvNorms,
+                    metric: metric, centroidNormsSq: centroidNormsSq, centroidInvNorms: centroidInvNorms,
                     queryIsNormalized: queryIsNormalized)
             }
         }
     }
 
-    // Assign a single vector to nearest centroid
+    // Assign a single vector to nearest centroid.
+    //
+    // FIX ROUND 1, Finding 2: restored the old loop shape verbatim
+    // (bestD starting at +infinity, best starting at -1, strict `<`,
+    // `best >= 0 ? best : nil`) rather than seeding `best = 0` and comparing
+    // against `dists[best]`. The brief mandates preserving exact old nil
+    // semantics; with `best = 0`, an all-NaN `dists` (any NaN comparison is
+    // false) would fall through every loop iteration and incorrectly return
+    // index 0 instead of nil, since NaN's `<` is always false.
     private func nearestCentroidIndex(for vector: [Float]) -> Int? {
         let dists = centroidDistances(for: vector)
         guard !dists.isEmpty else { return nil }
-        var best = 0
-        for i in 1..<dists.count where dists[i] < dists[best] { best = i }
-        return best
+        var best = -1
+        var bestD = Float.infinity
+        for i in 0..<dists.count {
+            if dists[i] < bestD { bestD = dists[i]; best = i }
+        }
+        return best >= 0 ? best : nil
     }
 
     // MARK: - Lloyd's KMeans using Kernel #12
@@ -605,6 +642,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
         // `lists.count` stands in for the old `centroids.count` (kc) below --
         // `lists` is always sized to `centroids.count` at every mutation site.
         let centroidsFlat: ContiguousArray<Float>
+        let centroidNormsSq: [Float]
         let centroidInvNorms: [Float]
         let lists: [[VectorID]]
         let store: [VectorID: ([Float], [String: String]?)]
@@ -646,6 +684,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             // Snapshot data for parallel access
             let ctx = IVFBatchSearchContext(
                 centroidsFlat: centroidsFlat,
+                centroidNormsSq: centroidNormsSq,
                 centroidInvNorms: centroidInvNorms,
                 lists: lists,
                 store: store,
@@ -708,7 +747,7 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             ctx.centroidsFlat.withUnsafeBufferPointer { cb in
                 centroidScores(
                     qPtr: qb.baseAddress!, flatPtr: cb.baseAddress!, kc: kc, d: ctx.dimension,
-                    metric: ctx.metric, centroidInvNorms: ctx.centroidInvNorms,
+                    metric: ctx.metric, centroidNormsSq: ctx.centroidNormsSq, centroidInvNorms: ctx.centroidInvNorms,
                     queryIsNormalized: ctx.queryIsNormalized)
             }
         }
@@ -1165,5 +1204,49 @@ extension IVFIndex {
         } catch {
             // Best-effort only; ignore failures
         }
+    }
+}
+
+// MARK: - Test-only hooks (reached via @testable import; see HNSWIndex's
+// `_testGraphSnapshot` for the established pattern in this codebase). These
+// exist to exercise P3a's private batched centroid-scoring path directly and
+// deterministically -- in particular FIX ROUND 1 Finding 1's cosine
+// near-zero-norm short-circuit, which no pre-existing test reached, and
+// which is impractical to trigger reliably by depending on k-means
+// happening to collapse a cluster to near-zero norm.
+extension IVFIndex {
+    /// Directly assigns `centroids` (bypassing k-means) and (re)initializes
+    /// `lists` to match, then rebuilds the P3a cache. Does not touch
+    /// `store`/`idToListIndex` -- pair with `_testInjectListEntry` or the
+    /// public `insert()` to populate lists.
+    internal func _testSetCentroids(_ cs: [[Float]]) {
+        centroids = cs
+        lists = Array(repeating: [], count: cs.count)
+        rebuildCentroidCache()
+    }
+
+    /// Places `id`/`vector` directly into `store` and list `listIndex`,
+    /// bypassing `nearestCentroidIndex`-driven assignment -- needed because
+    /// a degenerate (near-zero-norm) centroid can never win that argmin
+    /// (its forced cosine distance is 1, worse than any positively-similar
+    /// centroid), so its list could otherwise never be populated to test
+    /// probe-selection behavior against.
+    internal func _testInjectListEntry(listIndex: Int, id: VectorID, vector: [Float]) {
+        guard lists.indices.contains(listIndex) else { return }
+        store[id] = (vector, nil)
+        lists[listIndex].append(id)
+        idToListIndex[id] = listIndex
+    }
+
+    /// Passthrough to the private batched centroid scorer
+    /// (`centroidDistances(for:queryIsNormalized:)`).
+    internal func _testCentroidDistances(for query: [Float], queryIsNormalized: Bool = false) -> [Float] {
+        centroidDistances(for: query, queryIsNormalized: queryIsNormalized)
+    }
+
+    /// Passthrough to the private nearest-centroid argmin
+    /// (`nearestCentroidIndex(for:)`).
+    internal func _testNearestCentroidIndex(for vector: [Float]) -> Int? {
+        nearestCentroidIndex(for: vector)
     }
 }
