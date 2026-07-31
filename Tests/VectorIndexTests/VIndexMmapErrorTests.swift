@@ -370,6 +370,45 @@ final class VIndexMmapErrorTests: XCTestCase {
         XCTAssertEqual(mmap.msyncFailureCount, 0, "a normal flush must not record any msync failures")
     }
 
+    /// Fix round 2 (review of commit `245a932`): `writeListDescOffsets` (called only from
+    /// `mmap_append_begin`'s growth branch) writes the new idsOff/codesOff/vecsOff/capacity into
+    /// the mapped ListsDesc record BEFORE its `msyncPageAligned` call. If that msync throws (fix
+    /// round 1), the growth branch's own `tailIDs`/`tailCodes`/`tailVecs` watermark update never
+    /// runs (it's a few lines further down, reached only on success) -- so those in-memory
+    /// watermarks go stale relative to the on-disk descriptor, which already reflects the new
+    /// claim. A later growth on the SAME live handle would then compute its next offset from the
+    /// stale watermark, silently overlapping the region the descriptor already claims. The fix:
+    /// `growthPoisoned` is set in that failure path and checked at the top of every subsequent
+    /// `mmap_append_begin` call, refusing further growth until the handle is reopened (the
+    /// tested recovery path -- see `testGrowthWritesWalSentinelBeforeMutatingPayloadSections`).
+    ///
+    /// Forcing a real growth-path `msync` failure is the same non-portable injection problem as
+    /// `testMsyncFailureCountStaysZeroOnNormalCommitAndFlush` above (and `XCTSkip`'d for the same
+    /// reason in `testEnsureCapacityGrowOrRemapFailure`), so this pins the mechanism directly via
+    /// the `_simulateGrowthPoisoned()` test hook (same pattern as `_simulateDanglingMapping()`
+    /// for `mappingValid` in fix round 1, I3): set the flag exactly as the real failure path
+    /// would, then assert `mmap_append_begin` throws the poison error instead of proceeding.
+    func testGrowthPoisonedHandleRefusesFurtherAppendBegin() throws {
+        let (mmap, path) = try makeFixtureContainer()
+        defer {
+            try? mmap.close()
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+        // Sanity: an unpoisoned handle can begin an append normally.
+        _ = try mmap.mmap_append_begin(listID: 0, addLen: 1)
+
+        mmap._simulateGrowthPoisoned()
+        do {
+            _ = try mmap.mmap_append_begin(listID: 0, addLen: 1)
+            XCTFail("Expected mmap_append_begin to throw once the handle is growth-poisoned")
+        } catch let e as VectorIndexError {
+            XCTAssertEqual(e.kind, .mmapError)
+            XCTAssertTrue(e.message.lowercased().contains("reopen"),
+                "error should direct the caller to reopen the container")
+        }
+    }
+
     // MARK: - WAL replay (B13) — no prior coverage existed for mmap_wal_replay at all.
 
     /// Locates the ListsDesc section's file offset by parsing the header + TOC directly

@@ -272,6 +272,28 @@ internal final class IndexMmap {
     /// space.
     private var mappingValid = true
 
+    /// Set when `mmap_append_begin`'s growth branch's call to `writeListDescOffsets` throws
+    /// (fix round 2). `writeListDescOffsets` writes the new `idsOff`/`codesOff`/`vecsOff`/
+    /// `capacity`/strides into the mapped ListsDesc record via `memcpy`/`writeLE*` *before*
+    /// calling `msyncPageAligned` on that record — those writes land in the live mapping
+    /// immediately (mmap writes are visible to the same process's own mapping independent of
+    /// `msync`), regardless of whether the flush that follows succeeds. If `msyncPageAligned`
+    /// then throws, the growth branch's own `tailIDs`/`tailCodes`/`tailVecs` watermark update
+    /// (a few lines later, only reached on success) never runs — so the on-disk descriptor now
+    /// claims a region (`newIDsOff`/`newCodesOff`/`newVecsOff`, `newCapacity`) that this
+    /// handle's in-memory watermarks don't know about. A later growth on this *same* live
+    /// handle would then compute its next offset from the stale (lower) watermark, silently
+    /// overlapping the region the descriptor already claims — cross-list aliasing with no error
+    /// signal. Reopening is unaffected and safe: the WAL growth sentinel written earlier in the
+    /// same branch (fix round 1, I2) routes the next open through WAL replay + CRC recompute +
+    /// a fresh tail rebuild (`indexInit`'s TOC-loop, and `ensureFileCapacity`'s own post-remap
+    /// rebuild, both scan every list descriptor from scratch). Rather than try to repair the
+    /// watermarks in place on a handle whose underlying storage is already failing I/O, this
+    /// flag poisons the handle for further growth: `mmap_append_begin` throws immediately on
+    /// entry once this is `true`, directing the caller to reopen instead of risking silent
+    /// corruption on a handle that can no longer be trusted to track free space correctly.
+    private var growthPoisoned = false
+
     private var secCentroids: UnsafePointer<Float>?
     private var secCodebooks: UnsafePointer<Float>?
     private var secCentroidNorms: UnsafePointer<Float>?
@@ -482,6 +504,14 @@ internal final class IndexMmap {
     /// it must not rely on the (now `mappingValid`-gated) msync/munmap in `close()`.
     internal func _simulateDanglingMapping() {
         mappingValid = false
+    }
+
+    /// Test-only (fix round 2): sets `growthPoisoned` directly, without forcing a real
+    /// growth-path `msync` failure (not reliably/safely reproducible in a portable unit test --
+    /// see `growthPoisoned`'s doc comment and the task-4 report's fix-round-2 section for why).
+    /// Lets tests verify `mmap_append_begin` refuses to continue on a poisoned handle.
+    internal func _simulateGrowthPoisoned() {
+        growthPoisoned = true
     }
 
     private func slice(_ e: HostTOCEntry) -> UnsafeMutableRawPointer {
@@ -878,6 +908,16 @@ internal final class IndexMmap {
     private let WAL_GROWTH_SENTINEL_TAG: UInt32 = 0x53454E54 // ASCII "SENT", arbitrary/distinct from the tags above
 
     public func mmap_append_begin(listID: Int, addLen: Int) throws -> AppendReservation {
+        // Fix round 2: a previous growth-path flush failure already left the on-disk ListsDesc
+        // record ahead of this handle's in-memory tail watermarks (see `growthPoisoned`'s doc
+        // comment) -- refuse any further growth on this handle rather than risk computing an
+        // overlapping region. Reopening the container is the tested recovery path.
+        guard !growthPoisoned else {
+            throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                .message("Handle is poisoned after a failed growth-path flush; reopen the container to recover")
+                .info("list_id", "\(listID)")
+                .build()
+        }
         guard !opts.readOnly, listID >= 0, listID < kc else {
             throw ErrorBuilder(.invalidRange, operation: "mmap_append_begin")
                 .message("Invalid list ID or index is read-only")
@@ -1007,7 +1047,17 @@ internal final class IndexMmap {
                 }
             }
 
-            try writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
+            do {
+                try writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
+            } catch {
+                // Fix round 2: writeListDescOffsets already wrote the new offsets/capacity into
+                // the mapped ListsDesc record before the throw (its msyncPageAligned failed) --
+                // tailIDs/tailCodes/tailVecs below are now stale relative to that on-disk claim.
+                // See `growthPoisoned`'s doc comment for the full hazard and why reopening,
+                // rather than in-place repair, is the chosen recovery path.
+                growthPoisoned = true
+                throw error
+            }
             tailIDs = alignUp(newIDsOff &+ idsBytes, 64); tailCodes = alignUp(newCodesOff &+ codesBytes, 64)
             currIDsOff = newIDsOff
             currCodesOff = newCodesOff
