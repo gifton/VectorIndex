@@ -285,6 +285,46 @@ final class VIndexMmapErrorTests: XCTestCase {
         try reopened2.close()
     }
 
+    // MARK: - P5: ranged page-aligned msync + per-commit flush accounting
+
+    /// Failing-first test for P5: `msyncPageAligned` must honor its `ptr`/`length` parameters
+    /// (page-align the start down, the end up, clamp to the mapping) instead of always flushing
+    /// the whole mapping via `msync(base, fileSize, MS_SYNC)` regardless of what was asked for.
+    /// Task 3 (P4) already dropped the per-commit `updateSectionCRC` calls, so today's commit
+    /// path has exactly 3 msync call sites for a PQ-format commit against this (codes-only)
+    /// fixture: the IDs memcpy, the Codes memcpy, and the ListsDesc length write. (A flat/vecs
+    /// format commit would add a 4th for the vecs memcpy.)
+    func testCommitFlushesOnlyTouchedPages() throws {
+        let (mmap, path) = try makeFixtureContainer()
+        defer {
+            try? mmap.close()
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+        let m = 8
+        let addLen = 4
+        let ids: [UInt64] = (0..<addLen).map { UInt64($0) }
+        let codes = [UInt8](repeating: 1, count: addLen * m)
+
+        let pageSize = Int(getpagesize())
+        let callsBefore = mmap.msyncCallCount
+        let bytesBefore = mmap.msyncBytesFlushed
+        let res = try mmap.mmap_append_begin(listID: 0, addLen: addLen)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap.mmap_append_commit(res,
+                    idsSrc: UnsafeRawPointer(idBuf.baseAddress!),
+                    codesSrc: UnsafeRawPointer(codeBuf.baseAddress!),
+                    vecsSrc: nil)
+            }
+        }
+        let calls = mmap.msyncCallCount - callsBefore
+        let bytes = mmap.msyncBytesFlushed - bytesBefore
+        XCTAssertEqual(calls, 3, "PQ commit = ids + codes + listsDesc flushes only")
+        XCTAssertLessThanOrEqual(bytes, 3 * 2 * pageSize,
+            "each flush covers only the touched range rounded to page boundaries, not fileSize")
+    }
+
     // MARK: - WAL replay (B13) — no prior coverage existed for mmap_wal_replay at all.
 
     /// Locates the ListsDesc section's file offset by parsing the header + TOC directly

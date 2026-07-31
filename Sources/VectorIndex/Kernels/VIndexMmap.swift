@@ -220,6 +220,20 @@ internal final class IndexMmap {
     /// zero to this counter; only `flush()`/`close()`/unclean-reopen WAL repair should.
     internal private(set) var crcBytesHashed: Int = 0
 
+    /// Number of `msync(2)` syscalls issued by `msyncPageAligned` over this handle's lifetime
+    /// (P5). Instrumentation for the ranged-flush fix: before P5, `msyncPageAligned` ignored its
+    /// `ptr`/`length` parameters and always flushed the entire mapping, so every one of the
+    /// (post-P4) 3-4 per-commit call sites paid for an `fileSize`-sized `msync` regardless of how
+    /// few bytes actually changed. Now each call flushes only the page-aligned range that was
+    /// actually touched.
+    internal private(set) var msyncCallCount: Int = 0
+
+    /// Total bytes covered by all `msync(2)` calls issued by `msyncPageAligned` over this
+    /// handle's lifetime (P5) -- the page-aligned, mapping-clamped range passed to each syscall,
+    /// summed. Paired with `msyncCallCount` as the deterministic gate for "ranged flush, not
+    /// whole-mapping flush": a tiny commit must add at most a few pages per call, not `fileSize`.
+    internal private(set) var msyncBytesFlushed: Int = 0
+
     /// Set once resources are released (via `close()` or the test-only `_abandonWithoutClose()`)
     /// so a subsequent `deinit`-triggered `close()` call is a safe no-op instead of a double
     /// `Darwin.close(fd)`/`munmap` (the `fd` value can be reused by an unrelated open by then).
@@ -467,9 +481,28 @@ internal final class IndexMmap {
     private struct HostTOCEntry { var type: SectionType; var offset: UInt64; var size: UInt64; var align: UInt32; var flags: UInt32; var crc32: UInt32 }
     private func mapSection(_ ty: SectionType) -> HostTOCEntry? { tocByType[ty] }
 
+    /// Flushes exactly the touched `[ptr, ptr+length)` range to disk (P5), not the whole mapping.
+    /// `msync(2)` requires a page-aligned address and rejects a length that runs past the mapping,
+    /// so the start is rounded down to a page boundary, the end rounded up, and the result clamped
+    /// to `[base, base+fileSize)` before the syscall. Every existing call site already passes the
+    /// actual touched `ptr`/`length` (ids/codes/vecs memcpy destinations, the 64-byte ListsDesc
+    /// record, the 36-byte TOC entry, ...) -- this function previously discarded both parameters
+    /// and flushed `fileSize` bytes unconditionally, making every commit's 3-4 msync calls pay for
+    /// a whole-mapping flush regardless of how few bytes changed.
     @inline(__always) private func msyncPageAligned(_ ptr: UnsafeMutableRawPointer, _ length: Int) {
-        // Robust: flush whole mapping to avoid sub-page msync pitfalls on macOS
-        _ = msync(base, Int(fileSize), MS_SYNC)
+        guard length > 0 else { return }
+        let pageSize = Int(getpagesize())
+        let baseAddr = Int(bitPattern: base)
+        let start = Int(bitPattern: ptr)
+        // Round start down to a page boundary, end up, and clamp to the mapping.
+        let alignedStart = max(start & ~(pageSize - 1), baseAddr)
+        let alignedEnd = min((start + length + pageSize - 1) & ~(pageSize - 1),
+                             baseAddr + Int(fileSize))
+        let len = alignedEnd - alignedStart
+        guard len > 0 else { return }
+        msyncCallCount &+= 1
+        msyncBytesFlushed &+= len
+        _ = msync(UnsafeMutableRawPointer(bitPattern: alignedStart)!, len, MS_SYNC)
     }
 
     @inline(__always) private func writeLE32(_ p: UnsafeMutableRawPointer, _ v: UInt32) {
