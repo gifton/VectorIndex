@@ -325,6 +325,51 @@ final class VIndexMmapErrorTests: XCTestCase {
             "each flush covers only the touched range rounded to page boundaries, not fileSize")
     }
 
+    /// Fix round 1 (review of commit `2b4b823`): `msyncPageAligned` now `throws` on a failed
+    /// `msync(2)` instead of silently discarding the return value, and increments the new
+    /// `msyncFailureCount` before throwing. Genuinely forcing `msync(2)` to fail is not portable
+    /// to do safely in a unit test -- unlike `testEnsureCapacityGrowOrRemapFailure`'s `XCTSkip` for
+    /// a real remap failure, or `testCloseAfterDanglingMappingLeavesOnDiskTOCUntouched`'s use of
+    /// the `_simulateDanglingMapping()` test hook for a real dangling-pointer scenario, there is no
+    /// safe way to simulate an EIO/ENOMEM/disk-full `msync` without either actually exhausting
+    /// resources (unreliable, environment-dependent, and potentially harmful to the test host) or
+    /// corrupting the mapping in a way that would crash the process rather than return an error
+    /// code (the reviewer's own instruction explicitly rules out "msync on a deliberately-invalid-
+    /// but-safe range" for exactly this reason). So this test pins the two things that ARE safely
+    /// verifiable: (1) `msyncFailureCount` stays at 0 across a normal commit + `flush()` cycle --
+    /// telemetry does not spuriously report failures when nothing failed; (2) the non-discardable
+    /// shape is enforced at compile time, not by convention -- `msyncPageAligned` is `throws` (not
+    /// `@discardableResult` on a `Bool`), so every one of its 10 call sites in `VIndexMmap.swift`
+    /// requires an explicit `try` to even compile (verified: this file's callers -- and this test
+    /// module's `try mmap.mmap_append_commit(...)` / `try mmap.flush()` below -- would fail to
+    /// build if any call site dropped the `try` and let a thrown flush failure vanish silently).
+    func testMsyncFailureCountStaysZeroOnNormalCommitAndFlush() throws {
+        let (mmap, path) = try makeFixtureContainer()
+        defer {
+            try? mmap.close()
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+        let m = 8
+        let addLen = 4
+        let ids: [UInt64] = (0..<addLen).map { UInt64($0) }
+        let codes = [UInt8](repeating: 1, count: addLen * m)
+
+        XCTAssertEqual(mmap.msyncFailureCount, 0, "sanity: no failures before any I/O")
+        let res = try mmap.mmap_append_begin(listID: 0, addLen: addLen)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap.mmap_append_commit(res,
+                    idsSrc: UnsafeRawPointer(idBuf.baseAddress!),
+                    codesSrc: UnsafeRawPointer(codeBuf.baseAddress!),
+                    vecsSrc: nil)
+            }
+        }
+        XCTAssertEqual(mmap.msyncFailureCount, 0, "a normal commit must not record any msync failures")
+        try mmap.flush()
+        XCTAssertEqual(mmap.msyncFailureCount, 0, "a normal flush must not record any msync failures")
+    }
+
     // MARK: - WAL replay (B13) — no prior coverage existed for mmap_wal_replay at all.
 
     /// Locates the ListsDesc section's file offset by parsing the header + TOC directly

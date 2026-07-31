@@ -232,7 +232,18 @@ internal final class IndexMmap {
     /// handle's lifetime (P5) -- the page-aligned, mapping-clamped range passed to each syscall,
     /// summed. Paired with `msyncCallCount` as the deterministic gate for "ranged flush, not
     /// whole-mapping flush": a tiny commit must add at most a few pages per call, not `fileSize`.
+    /// Incremented only after the underlying `msync(2)` call succeeds (fix round 1), so this
+    /// counter -- like `msyncCallCount` -- means "successfully flushed", not merely "attempted".
     internal private(set) var msyncBytesFlushed: Int = 0
+
+    /// Number of `msync(2)` calls issued by `msyncPageAligned` that returned a nonzero result
+    /// (fix round 1). `msync` failing (EIO, ENOMEM, disk full, ...) means the page range was NOT
+    /// durably written back; every throwing call site surfaces that as a thrown error instead of
+    /// silently continuing, so in practice this counter stays 0 except on paths that deliberately
+    /// swallow the throw (e.g. `deinit`'s `try? close()`) -- it exists so even those paths leave
+    /// an observable trace that a flush failed, instead of the counters simply looking identical
+    /// to a fully successful run.
+    internal private(set) var msyncFailureCount: Int = 0
 
     /// Set once resources are released (via `close()` or the test-only `_abandonWithoutClose()`)
     /// so a subsequent `deinit`-triggered `close()` call is a safe no-op instead of a double
@@ -489,7 +500,17 @@ internal final class IndexMmap {
     /// record, the 36-byte TOC entry, ...) -- this function previously discarded both parameters
     /// and flushed `fileSize` bytes unconditionally, making every commit's 3-4 msync calls pay for
     /// a whole-mapping flush regardless of how few bytes changed.
-    @inline(__always) private func msyncPageAligned(_ ptr: UnsafeMutableRawPointer, _ length: Int) {
+    ///
+    /// Throws (fix round 1) when the underlying `msync(2)` call fails (EIO, ENOMEM, disk full,
+    /// ...): every call site sits inside a `throws` function (verified by audit -- see the task-4
+    /// report's fix-round-1 section), so a failed flush now surfaces as a thrown error instead of
+    /// being silently discarded. This matters specifically for `mmap_append_commit`: its contract
+    /// is "returning means the payload is durable," so a flush failure on the commit path MUST
+    /// prevent that return, not just log/count it. `msyncCallCount`/`msyncBytesFlushed` are
+    /// incremented only after the syscall succeeds, so they mean "successfully flushed";
+    /// `msyncFailureCount` is incremented on failure, before the throw, so telemetry stays honest
+    /// even on the few paths that deliberately swallow the error (`deinit`'s `try? close()`).
+    @inline(__always) private func msyncPageAligned(_ ptr: UnsafeMutableRawPointer, _ length: Int) throws {
         guard length > 0 else { return }
         let pageSize = Int(getpagesize())
         let baseAddr = Int(bitPattern: base)
@@ -500,9 +521,19 @@ internal final class IndexMmap {
                              baseAddr + Int(fileSize))
         let len = alignedEnd - alignedStart
         guard len > 0 else { return }
+        let rc = msync(UnsafeMutableRawPointer(bitPattern: alignedStart)!, len, MS_SYNC)
+        if rc != 0 {
+            let err = errno
+            msyncFailureCount &+= 1
+            throw ErrorBuilder(.fileIOError, operation: "vindex_msync")
+                .message("Failed to flush mapped pages to disk")
+                .info("path", path)
+                .info("bytes", "\(len)")
+                .info("errno", "\(err)")
+                .build()
+        }
         msyncCallCount &+= 1
         msyncBytesFlushed &+= len
-        _ = msync(UnsafeMutableRawPointer(bitPattern: alignedStart)!, len, MS_SYNC)
     }
 
     @inline(__always) private func writeLE32(_ p: UnsafeMutableRawPointer, _ v: UInt32) {
@@ -621,7 +652,7 @@ internal final class IndexMmap {
                 // doesn't repeat on the next open.
                 try mmap_wal_replay()
                 try recomputeAllSectionCRCs()
-                msyncPageAligned(base, Int(fileSize))
+                try msyncPageAligned(base, Int(fileSize))
                 try truncateWAL()
             }
         }
@@ -711,7 +742,7 @@ internal final class IndexMmap {
                 memset(UnsafeMutableRawPointer(mutating: basePtr).advanced(by: blob.count), 0, maxSize - blob.count)
             }
         }
-        msyncPageAligned(UnsafeMutableRawPointer(mutating: basePtr), maxSize)
+        try msyncPageAligned(UnsafeMutableRawPointer(mutating: basePtr), maxSize)
         // Update CRC in TOC entry in-place
         try updateSectionCRC(.idMap)
     }
@@ -739,7 +770,7 @@ internal final class IndexMmap {
         crcBytesHashed += sz
         let newCRC = CRC32.hash(p, sz)
         writeLE32(entryPtr.advanced(by: 28), newCRC)
-        msyncPageAligned(entryPtr, DISK_TOC_ENTRY_SIZE)
+        try msyncPageAligned(entryPtr, DISK_TOC_ENTRY_SIZE)
         // also refresh cache
         if var e = tocByType[ty] { e.crc32 = newCRC; tocByType[ty] = e }
     }
@@ -803,7 +834,7 @@ internal final class IndexMmap {
     public func flush() throws {
         guard !opts.readOnly, mappingValid else { return }
         try recomputeAllSectionCRCs()
-        msyncPageAligned(base, Int(fileSize))
+        try msyncPageAligned(base, Int(fileSize))
         try truncateWAL()
     }
 
@@ -976,7 +1007,7 @@ internal final class IndexMmap {
                 }
             }
 
-            writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
+            try writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
             tailIDs = alignUp(newIDsOff &+ idsBytes, 64); tailCodes = alignUp(newCodesOff &+ codesBytes, 64)
             currIDsOff = newIDsOff
             currCodesOff = newCodesOff
@@ -1017,7 +1048,7 @@ internal final class IndexMmap {
             }
             let dst = idsBase.advanced(by: Int(relOff))
             memcpy(dst, ids, Int(bytes))
-            msyncPageAligned(dst, Int(bytes))
+            try msyncPageAligned(dst, Int(bytes))
             // P4: IDs section CRC freshness is deferred to flush()/close() (or unclean-reopen
             // repair) instead of recomputed here. Recomputing the whole section's CRC on every
             // commit made N appends O(N^2) — the WAL append/commit records above already make
@@ -1041,7 +1072,7 @@ internal final class IndexMmap {
             }
             let dst = codesBase.advanced(by: Int(relOff))
             memcpy(dst, codes, Int(bytes))
-            msyncPageAligned(dst, Int(bytes))
+            try msyncPageAligned(dst, Int(bytes))
             // P4: Codes section CRC freshness deferred — see the IDs branch above.
         }
         if res.vecsStride > 0, let vecs = vecsSrc, let vecsBase = secVecs {
@@ -1062,7 +1093,7 @@ internal final class IndexMmap {
             }
             let dst = vecsBase.advanced(by: Int(relOff))
             memcpy(dst, vecs, Int(bytes))
-            msyncPageAligned(dst, Int(bytes))
+            try msyncPageAligned(dst, Int(bytes))
             // P4: Vecs section CRC freshness deferred — see the IDs branch above.
         }
         let newLen = res.oldLen + res.addLen
@@ -1073,7 +1104,7 @@ internal final class IndexMmap {
         if let base = listsDescBase {
             let rec = base.advanced(by: res.listID * 64)
             writeLE32(rec.advanced(by: 4), UInt32(truncatingIfNeeded: newLen))
-            msyncPageAligned(rec, 64)
+            try msyncPageAligned(rec, 64)
         }
         try writeWalCommit(listID: res.listID, newLen: newLen)
     }
@@ -1137,13 +1168,17 @@ internal final class IndexMmap {
                 if i >= 0 && i < kc {
                     let rec = base.advanced(by: i * 64)
                     writeLE32(rec.advanced(by: 4), nl)
-                    msyncPageAligned(rec, 64)
+                    try msyncPageAligned(rec, 64)
                 }
             }
         }
     }
 
-    private func writeListDescOffsets(listID: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64, newCapacity: Int, idsStride: Int, codesStride: Int, vecsStride: Int) {
+    /// `throws` (fix round 1): now propagates a failed `msyncPageAligned` instead of discarding
+    /// it. Its only call site (`mmap_append_begin`'s growth branch) is itself `throws`, so this
+    /// was the one call site among the 10 audited for the msync-failure fix that did NOT already
+    /// sit in a throwing context -- promoting it to `throws` was required to surface the error.
+    private func writeListDescOffsets(listID: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64, newCapacity: Int, idsStride: Int, codesStride: Int, vecsStride: Int) throws {
         guard let base = listsDescBase else { return }
         let rec = base.advanced(by: listID * 64)
         // Write packed LE fields
@@ -1154,7 +1189,7 @@ internal final class IndexMmap {
         writeLE32(rec.advanced(by: 40), UInt32(truncatingIfNeeded: idsStride))
         writeLE32(rec.advanced(by: 44), UInt32(truncatingIfNeeded: codesStride))
         writeLE32(rec.advanced(by: 48), UInt32(truncatingIfNeeded: vecsStride))
-        msyncPageAligned(rec, 64)
+        try msyncPageAligned(rec, 64)
         _ = try? updateSectionCRC(.listsDesc)
     }
 
