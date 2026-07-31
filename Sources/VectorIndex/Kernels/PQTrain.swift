@@ -753,12 +753,29 @@ private func buildSampleIndex(n: Int64, sampleN: Int64, rng: inout Xoroshiro128)
 // MARK: - Distance Functions
 
 @inline(__always) private func l2Sq(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ len: Int) -> Float {
-    var acc: Float = 0
-    for i in 0..<len {
-        let d = a[i] - b[i]
-        acc += d * d
+    var acc0 = SIMD4<Float>.zero, acc1 = SIMD4<Float>.zero
+    let l8 = len & ~7
+    var i = 0
+    while i < l8 {
+        let a0 = SIMD4<Float>(a[i], a[i+1], a[i+2], a[i+3])
+        let b0 = SIMD4<Float>(b[i], b[i+1], b[i+2], b[i+3])
+        let d0 = a0 - b0; acc0 += d0 * d0
+        let a1 = SIMD4<Float>(a[i+4], a[i+5], a[i+6], a[i+7])
+        let b1 = SIMD4<Float>(b[i+4], b[i+5], b[i+6], b[i+7])
+        let d1 = a1 - b1; acc1 += d1 * d1
+        i += 8
     }
+    var acc = (acc0 + acc1).sum()
+    while i < len { let d = a[i] - b[i]; acc += d * d; i += 1 }
     return acc
+}
+
+/// Test-only visibility shim for micro-benchmarking `l2Sq` from `KMeansKernelBenchmarks`.
+/// Does not change `l2Sq`'s signature or its `private` access level; this is the only
+/// visibility addition made for P6a.
+@usableFromInline
+internal func pqTrainL2SqForBench(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ len: Int) -> Float {
+    l2Sq(a, b, len)
 }
 
 @inline(__always) private func dotProduct(_ a: UnsafePointer<Float>, _ b: UnsafePointer<Float>, _ len: Int) -> Float {
@@ -773,11 +790,22 @@ private func buildSampleIndex(n: Int64, sampleN: Int64, rng: inout Xoroshiro128)
 
 @inline(__always)
 private func l2Sq(_ x: UnsafePointer<Float>, _ c: UnsafePointer<Float>, _ dsub: Int, subtract g: UnsafePointer<Float>) -> Float {
-    var acc: Float = 0
-    for u in 0..<dsub {
-        let r = (x[u] - g[u]) - c[u]
-        acc += r * r
+    var acc0 = SIMD4<Float>.zero, acc1 = SIMD4<Float>.zero
+    let l8 = dsub & ~7
+    var i = 0
+    while i < l8 {
+        let r0 = (SIMD4<Float>(x[i], x[i+1], x[i+2], x[i+3])
+                  - SIMD4<Float>(g[i], g[i+1], g[i+2], g[i+3]))
+                 - SIMD4<Float>(c[i], c[i+1], c[i+2], c[i+3])
+        acc0 += r0 * r0
+        let r1 = (SIMD4<Float>(x[i+4], x[i+5], x[i+6], x[i+7])
+                  - SIMD4<Float>(g[i+4], g[i+5], g[i+6], g[i+7]))
+                 - SIMD4<Float>(c[i+4], c[i+5], c[i+6], c[i+7])
+        acc1 += r1 * r1
+        i += 8
     }
+    var acc = (acc0 + acc1).sum()
+    while i < dsub { let r = (x[i] - g[i]) - c[i]; acc += r * r; i += 1 }
     return acc
 }
 
