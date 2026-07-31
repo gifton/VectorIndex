@@ -754,10 +754,10 @@ final class PQTrainTests: XCTestCase {
         // against commit 40c02bb). The O(ks) restructure (Step 2) reads the same l2Sq
         // distances via a running min instead of rescanning 0..<k each time, so these
         // must survive unchanged -- that identity IS the parity gate for the rewrite.
-        XCTAssertEqual(codebooks[0], 0.38221052, accuracy: 1e-6)
-        XCTAssertEqual(codebooks[1], 0.09950597, accuracy: 1e-6)
-        XCTAssertEqual(codebooks[2], 0.09419185, accuracy: 1e-6)
-        XCTAssertEqual(codebooks[3], -0.17333749, accuracy: 1e-6)
+        XCTAssertEqual(codebooks[0].bitPattern, Float(0.38221052).bitPattern)
+        XCTAssertEqual(codebooks[1].bitPattern, Float(0.09950597).bitPattern)
+        XCTAssertEqual(codebooks[2].bitPattern, Float(0.09419185).bitPattern)
+        XCTAssertEqual(codebooks[3].bitPattern, Float(-0.17333749).bitPattern)
     }
 
     // MARK: - Performance Validation Tests
