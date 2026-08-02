@@ -393,10 +393,8 @@ static inline uint8_t encode_subspace_u8_residual_with_csq(
 #endif
 
     int   best_k = 0;
-    float best_d = r2 + csq_j[0] - 2.0f * /* dot(r, c0) */ ({
-        /* compute dot(r,c) on the fly */
-        dot_only(x_sub, cb_j + 0 * dsub, dsub) - dot_only(coarse_sub, cb_j + 0 * dsub, dsub);
-    });
+    float dot_r_c0 = dot_only(x_sub, cb_j, dsub) - dot_only(coarse_sub, cb_j, dsub);
+    float best_d = r2 + csq_j[0] - 2.0f * dot_r_c0;
 
     for (int t = 0; t < ks; t += tile_k) {
         int kend = (t + tile_k < ks) ? (t + tile_k) : ks;
