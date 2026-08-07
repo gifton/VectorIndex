@@ -175,4 +175,59 @@ final class CandidateReservoirTests: XCTestCase {
         XCTAssertEqual(a.ids, h.ids, "adaptive must produce results identical to pure heap")
         XCTAssertEqual(a.scores, h.scores)
     }
+
+    // Regression test for Task 15: `telemetry.accepted` and `telemetry.prunes` are declared
+    // on `ReservoirTelemetry` but (pre-fix) never incremented anywhere in `pushBatch`/
+    // `pruneToTopC` -- dead fields that always read 0. This test forces a real Block-mode
+    // prune cycle plus one dedup rejection and one invalid (NaN) rejection in the same
+    // batch, then checks:
+    //   1) at least one prune fired (buffer-capacity overflow forces `pruneToTopC()`), and
+    //   2) `accepted` reconciles exactly against the batch's outcome tally. Every pushed
+    //      element takes exactly one of four mutually exclusive paths -- accepted, rejected
+    //      by tau, rejected by dedup, rejected as invalid -- so `pushed == accepted +
+    //      rejectedTau + rejectedDedup + rejectedInvalid` holds by construction, regardless
+    //      of how many *later* prunes evict an already-accepted element from the buffer:
+    //      `accepted` counts admission into the reservoir, not survival to the end of the
+    //      query (mirrors the pre-existing `acceptedInBatch` return-value semantics of
+    //      `pushBatch`).
+    func testTelemetryTracksAcceptedAndPrunes() {
+        let capacity = 8
+        let reservoir = CandidateReservoir(
+            capacity: capacity, metric: .l2,
+            options: ReservoirOptions(mode: .block, reserveExtra: 0.25, telemetry: true)
+        )
+        // bufferCapacity = 8 + ceil(8*0.25) = 10 -> appending 30 unique valid items cycles
+        // through "append until size==10, prune to 8" repeatedly, guaranteeing >=1 prune.
+        let uniqueCount = 30
+        var ids: [Int64] = (0..<uniqueCount).map { Int64($0) }
+        var scores: [Float] = (0..<uniqueCount).map { Float($0) }
+        // Trailing dedup rejection: id 5 repeated (already marked visited earlier in this
+        // same batch).
+        ids.append(5)
+        scores.append(5.0)
+        // Trailing invalid rejection: NaN score (checked before dedup, so it never touches
+        // the visited set).
+        ids.append(999)
+        scores.append(Float.nan)
+
+        let visited = DefaultVisitedSet(idCapacity: 1_000)
+        ids.withUnsafeBufferPointer { idBuf in
+            scores.withUnsafeBufferPointer { scoreBuf in
+                _ = reservoir.pushBatch(
+                    ids: idBuf.baseAddress!, scores: scoreBuf.baseAddress!,
+                    count: ids.count, visited: visited
+                )
+            }
+        }
+
+        let t = reservoir.telemetry
+        XCTAssertEqual(t.pushed, Int64(ids.count))
+        XCTAssertEqual(t.rejectedInvalid, 1, "the NaN-score entry must be rejected as invalid")
+        XCTAssertEqual(t.rejectedDedup, 1, "the repeated id-5 entry must be rejected by dedup")
+        XCTAssertGreaterThanOrEqual(t.prunes, 1, "buffer-capacity overflow must trigger >=1 prune in Block mode")
+        XCTAssertEqual(
+            t.accepted, t.pushed - t.rejectedTau - t.rejectedDedup - t.rejectedInvalid,
+            "accepted must reconcile exactly against the batch's outcome tally"
+        )
+    }
 }
