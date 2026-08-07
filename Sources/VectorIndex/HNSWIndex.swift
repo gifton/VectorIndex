@@ -1374,6 +1374,7 @@ extension HNSWIndex {
                     if let nn = remap[oldN] { mapped.append(nn) }
                 }
                 // prune to M
+                // Defensive: pruneNeighbors bounds lists to ≤ m during construction, so remap cannot exceed m; kept as a guard for future insert-path changes. No public-API fixture reaches this (verified 2026-07-31, Phase 3 Task 14).
                 if mapped.count > config.m {
                     let nodeOffset = newNodes[i].vectorOffset
                     let nodeVec = Array(newVectorStorage[nodeOffset..<(nodeOffset + dim)])

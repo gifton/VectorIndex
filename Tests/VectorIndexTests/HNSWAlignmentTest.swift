@@ -10,10 +10,6 @@ import XCTest
 import VectorCore
 
 final class HNSWAlignmentTest: XCTestCase {
-    override func setUpWithError() throws {
-        throw XCTSkip("Temporarily disabled: candidates API changed; test needs update.")
-    }
-    
     func testIndexStructureWithDeletedNodes() async throws {
         let index = HNSWIndex(dimension: 3, metric: .euclidean)
         
