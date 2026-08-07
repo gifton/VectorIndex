@@ -432,16 +432,11 @@ public extension IndexOps.Scoring {
         ) {
             if n == 0 { return }
             if d == 0 { for i in 0..<n { out[i] = Float16(1.0 / epsilon) }; return }
-            let d4 = d & ~3
+            let limit = Float(Float16.greatestFiniteMagnitude)
             for i in 0..<n {
-                let row = xb.advanced(by: i * d)
-                var acc = SIMD4<Float>.zero
-                var j = 0
-                while j < d4 { let v = load4(row.advanced(by: j)); acc += v * v; j += 4 }
-                var s = hsum4(acc); while j < d { let v = row[j]; s += v * v; j += 1 }
-                let inv = 1.0 / (sqrt(s) + epsilon)
-                let clamp = max(-Float(Float16.greatestFiniteMagnitude), min(Float(Float16.greatestFiniteMagnitude), inv))
-                out[i] = Float16(clamp)
+                let s = IndexOps.Support.Norms.l2NormSquared(vector: xb.advanced(by: i * d), dimension: d)
+                let inv = 1.0 / (s.squareRoot() + epsilon)
+                out[i] = Float16(max(-limit, min(limit, inv)))
             }
         }
     }
