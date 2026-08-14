@@ -1531,7 +1531,8 @@ private func minibatchKMeansSubspaceChunk(
                         for u in 0..<dsub {
                             let oldVal = Double(cptr[baseC + u])
                             let batchMean = sums[baseC + u] / Double(ck)
-                            cptr[baseC + u] = Float(oldW * oldVal + newW * batchMean)
+                            let v = Float(oldW * oldVal + newW * batchMean)
+                            cptr[baseC + u] = v.isFinite ? v : 0
                         }
                         passCounts[k] &+= ck
                     }
