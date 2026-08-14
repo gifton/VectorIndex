@@ -292,6 +292,27 @@ Record the result. If it faults, that is your RED. If it does NOT fault, the exi
 
 ---
 
+### Task 5b: Re-baseline garbage-calibrated test expectations (P1, added 2026-08-13)
+
+**Why this task exists (mid-phase amendment):** Tasks 1–2 unmasked two tests whose expectations were calibrated against garbage-influenced arithmetic: `testWarmStartMinibatchImprovesOnePass` (threshold 2.326×1.0001 vs post-fix 2.368, deterministic to 15 digits) and `testStreamingSeederSmallNTakesStreamingBranch` (Phase 3's `.bitPattern` snapshot, harvested from output the overflow was silently perturbing — proven by call-graph exclusion in Task 2's review). Re-baselining was deliberately deferred until Tasks 1–5 are ALL complete, because the streaming test traverses `:582`/`:644-646`, which stay garbage until Tasks 3–4 land. **Precondition: Tasks 1–5 complete and their ASan gates green.**
+
+**Files:**
+- Modify: `Tests/VectorIndexTests/PQTrainTests.swift` only. No production code.
+
+- [ ] **Step 1: re-harvest the seeder snapshot on fully-fixed code**
+
+Run `swift test --filter PQTrainTests/testStreamingSeederSmallNTakesStreamingBranch` once; it fails printing (or assert-diffing) the now-correct `codebooks[0..<4]` values. Harvest them via Swift's default shortest-round-trip printing, update the four `.bitPattern` constants, and update the test's comment to say the constants were re-baselined after the Phase 4 pointer fix (cite the investigation doc). Then the gate: three separate process invocations, all PASS — bit-identical constants across processes is the point of this test, and it is only now meaningful.
+
+- [ ] **Step 2: settle the warm-start threshold on evidence, not vibes**
+
+The test asserts one minibatch pass improves warm-started distortion within a 1.0001 factor. Minibatch k-means is stochastic and does not guarantee monotone per-pass improvement. Determine what the correct invariant is: run the test's scenario across 5 different `cfg.seed` values (temporary harness or manual runs; delete any scratch) and record cold vs warm distortion each time. If warm ≤ cold×(1+ε) holds across all seeds for some defensible ε, recalibrate the assertion to that ε with a comment citing the measured spread. If the invariant does not hold at all, replace the threshold assertion with the strongest one the evidence supports (e.g. warm start is finite, sane-magnitude, and not catastrophically worse than cold) and record the weakening explicitly in the ledger — do NOT keep an assertion the algorithm does not actually guarantee.
+
+- [ ] **Step 3: full-suite sanity** — `swift test --filter PQTrainTests 2>&1 | tail -5` → all 19 green.
+
+- [ ] **Step 4: commit** — `test(pq): re-baseline expectations calibrated against pre-fix garbage arithmetic` + trailer. The commit message must name both tests and cite the investigation doc.
+
+---
+
 ### Task 6: Close the CI gap (P1)
 
 Today CI has no sanitizer job at all, and `PQTrainTests` is in **no** filter group while `CI_SKIP_PQTRAIN: '1'` is set (`.github/workflows/ci.yml:109`) — so this entire suite has never run in CI. That is why an ASan-detectable bug survived indefinitely.
