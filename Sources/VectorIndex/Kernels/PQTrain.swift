@@ -1559,13 +1559,6 @@ private func streamingKMeansppSeed(
     while off >= nChunks[cIdx] { off -= nChunks[cIdx]; cIdx += 1 }
     let base0 = Int(off) * d + j * dsub
     let x0 = xChunks[cIdx]
-    if let coarse = coarse, let aChunks = assignChunks {
-        let gid = Int(aChunks[cIdx][Int(off)])
-        let gbase = gid * d + j * dsub
-        for u in 0..<dsub { outC[u] = x0[base0 + u] - coarse[gbase + u] }
-    } else {
-        for u in 0..<dsub { outC[u] = x0[base0 + u] }
-    }
 
     // dminChunks[c][i]: running min distance^2 of point i (chunk c) to any chosen
     // centroid so far. Seeded against centroid 0 below; each iteration folds in
@@ -1577,49 +1570,76 @@ private func streamingKMeansppSeed(
     // from dmin here are bit-identical to the old full-recompute -- this is a
     // pure restructuring, not a numerical change.
     var dminChunks: [[Float]] = nChunks.map { [Float](repeating: .infinity, count: Int($0)) }
-    for (c, nc) in nChunks.enumerated() where nc > 0 {
-        var xc = xChunks[c]  // var required for &xc[index] syntax
-        for i in 0..<Int(nc) {
-            let base = i * d + j * dsub
-            dminChunks[c][i] = l2Sq(&xc[base], &outC[0], dsub)
-        }
-    }
 
-    for k in 1..<ks {
-        var sum: Double = 0
-        for (c, nc) in nChunks.enumerated() where nc > 0 {
-            for i in 0..<Int(nc) { sum += Double(dminChunks[c][i]) }
-        }
-        if !(sum > 0) {
-            let base = 0 * d + j * dsub
-            for u in 0..<dsub { outC[k*dsub + u] = xChunks[0][base + u] }
+    // outC is both read (via l2Sq's dsub-wide contiguous read, which needs real
+    // buffer provenance -- see Tasks 1-4) and written (plain indexed centroid
+    // writes) throughout the rest of seeding. Wrap it exactly once with
+    // withUnsafeMutableBufferPointer for the whole seeding body and route every
+    // remaining access to it -- read or write -- through `cptr`; touching `outC`
+    // directly inside this closure would be an overlapping-access violation.
+    // xChunks[c] has a different identity on each outer-loop pass (a fresh chunk
+    // each time), so per Task 4's precedent it gets its own per-chunk
+    // withUnsafeBufferPointer wrap at each l2Sq call site rather than one
+    // hoisted wrap for the whole function.
+    outC.withUnsafeMutableBufferPointer { cbuf in
+        let cptr = cbuf.baseAddress!
+
+        if let coarse = coarse, let aChunks = assignChunks {
+            let gid = Int(aChunks[cIdx][Int(off)])
+            let gbase = gid * d + j * dsub
+            for u in 0..<dsub { cptr[u] = x0[base0 + u] - coarse[gbase + u] }
         } else {
-            var r = rng.uniformF64() * sum
-            var chosen = false
-            outer: for (c, nc) in nChunks.enumerated() where nc > 0 {
-                let xc = xChunks[c]  // plain read here -- no &xc[index] pointer call in this loop
+            for u in 0..<dsub { cptr[u] = x0[base0 + u] }
+        }
+
+        for (c, nc) in nChunks.enumerated() where nc > 0 {
+            xChunks[c].withUnsafeBufferPointer { xbuf in
+                let xptr = xbuf.baseAddress!
                 for i in 0..<Int(nc) {
-                    r -= Double(dminChunks[c][i])
-                    if r <= 0 {
-                        let base = i * d + j * dsub
-                        for u in 0..<dsub { outC[k*dsub + u] = xc[base + u] }
-                        chosen = true
-                        break outer
-                    }
+                    let base = i * d + j * dsub
+                    dminChunks[c][i] = l2Sq(xptr + base, cptr, dsub)
                 }
             }
-            if !chosen {
-                for u in 0..<dsub { outC[k*dsub + u] = outC[u] }
-            }
         }
 
-        // Fold the newly chosen centroid k into the running dmin for every point.
-        for (c, nc) in nChunks.enumerated() where nc > 0 {
-            var xc = xChunks[c]  // var required for &xc[index] syntax
-            for i in 0..<Int(nc) {
-                let base = i * d + j * dsub
-                let di = l2Sq(&xc[base], &outC[k*dsub], dsub)
-                if di < dminChunks[c][i] { dminChunks[c][i] = di }
+        for k in 1..<ks {
+            var sum: Double = 0
+            for (c, nc) in nChunks.enumerated() where nc > 0 {
+                for i in 0..<Int(nc) { sum += Double(dminChunks[c][i]) }
+            }
+            if !(sum > 0) {
+                let base = 0 * d + j * dsub
+                for u in 0..<dsub { cptr[k*dsub + u] = xChunks[0][base + u] }
+            } else {
+                var r = rng.uniformF64() * sum
+                var chosen = false
+                outer: for (c, nc) in nChunks.enumerated() where nc > 0 {
+                    let xc = xChunks[c]  // plain read here -- no &xc[index] pointer call in this loop
+                    for i in 0..<Int(nc) {
+                        r -= Double(dminChunks[c][i])
+                        if r <= 0 {
+                            let base = i * d + j * dsub
+                            for u in 0..<dsub { cptr[k*dsub + u] = xc[base + u] }
+                            chosen = true
+                            break outer
+                        }
+                    }
+                }
+                if !chosen {
+                    for u in 0..<dsub { cptr[k*dsub + u] = cptr[u] }
+                }
+            }
+
+            // Fold the newly chosen centroid k into the running dmin for every point.
+            for (c, nc) in nChunks.enumerated() where nc > 0 {
+                xChunks[c].withUnsafeBufferPointer { xbuf in
+                    let xptr = xbuf.baseAddress!
+                    for i in 0..<Int(nc) {
+                        let base = i * d + j * dsub
+                        let di = l2Sq(xptr + base, cptr + k*dsub, dsub)
+                        if di < dminChunks[c][i] { dminChunks[c][i] = di }
+                    }
+                }
             }
         }
     }
