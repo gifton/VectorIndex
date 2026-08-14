@@ -386,9 +386,38 @@ final class PQTrainTests: XCTestCase {
             centroidNormsOut: &nilNorms
         )
 
-        // Expect warm-start to be no worse than cold-start given same pass budget
-        XCTAssertLessThanOrEqual(warmStats.distortion, coldStats.distortion * 1.0001,
-                                 "Warm-start should not regress compared to cold-start for same pass budget")
+        // WEAKENED (Task 5b, re-baselined after the Phase 4 pointer-safety fix -- see
+        // docs/superpowers/2026-08-08-pq-streaming-distortion-blowup-investigation.md).
+        // The original assertion (warmStats.distortion <= coldStats.distortion * 1.0001)
+        // was calibrated against pre-fix garbage arithmetic; post-fix it misses by ~1.8%
+        // (2.368 vs 2.326*1.0001) for this test's own cfg.seed=42, deterministic to 15
+        // digits. Per Task 5b Step 2, this scenario was re-run across 5 different
+        // cfg.seed values (this exact n/d/m/ks/data, only cfg.seed varied) to determine
+        // whether "warm-start does not regress vs cold-start" is an invariant this
+        // algorithm actually guarantees:
+        //
+        //   seed    cold          warm          warm/cold
+        //   1       1.9849002277  1.9556623573  0.9853  (warm better)
+        //   7       2.2624990243  2.2889689007  1.0117  (warm worse)
+        //   42      2.3261379727  2.3679951422  1.0180  (warm worse; this test's seed)
+        //   123     2.0061406822  1.8812891413  0.9378  (warm better)
+        //   999     2.6138988005  2.7245860241  1.0423  (warm worse)
+        //
+        // 3 of 5 seeds show warm-start regressing vs cold by 1.2%-4.2% -- not a hairline
+        // miss of a tight epsilon but a real, seed-dependent property: minibatch k-means
+        // is stochastic (per-pass subsampling) and one pass from a warm start is not
+        // guaranteed to beat one pass from cold. Fitting a tight epsilon to these 5
+        // samples (e.g. ~4.3%) would just be re-committing the same "calibrate against
+        // whatever this run produced" mistake this task exists to undo. Instead we assert
+        // only what the evidence actually supports: the result is finite, positive, and
+        // not catastrophically worse than cold-start. 2x is a generous bound relative to
+        // the observed max regression (~4.2%) -- it catches real regressions (e.g. a
+        // return of the garbage-arithmetic blowup) without asserting a monotone-
+        // improvement guarantee the algorithm doesn't provide.
+        XCTAssertTrue(warmStats.distortion.isFinite, "warm-start distortion must be finite")
+        XCTAssertGreaterThan(warmStats.distortion, 0, "warm-start distortion must be positive")
+        XCTAssertLessThan(warmStats.distortion, coldStats.distortion * 2.0,
+                           "warm-start should not be catastrophically worse than cold-start (see Task 5b 5-seed evidence above)")
     }
 
     func testWarmStartLloydImprovesOneIter() throws {
@@ -760,15 +789,23 @@ final class PQTrainTests: XCTestCase {
         }
         XCTAssertLessThan(stats.distortion, trivialDistortion, "trained distortion should beat the trivial all-zero-centroid baseline")
 
-        // SNAPSHOT: centroids[0..<4] harvested from the pre-fix O(ks^2) full-recompute
-        // seeder (swift test --filter PQTrainTests/testStreamingSeederSmallNTakesStreamingBranch
-        // against commit 40c02bb). The O(ks) restructure (Step 2) reads the same l2Sq
-        // distances via a running min instead of rescanning 0..<k each time, so these
-        // must survive unchanged -- that identity IS the parity gate for the rewrite.
-        XCTAssertEqual(codebooks[0].bitPattern, Float(0.38221052).bitPattern)
-        XCTAssertEqual(codebooks[1].bitPattern, Float(0.09950597).bitPattern)
-        XCTAssertEqual(codebooks[2].bitPattern, Float(0.09419185).bitPattern)
-        XCTAssertEqual(codebooks[3].bitPattern, Float(-0.17333749).bitPattern)
+        // SNAPSHOT: centroids[0..<4] re-baselined after the Phase 4 pointer-safety fix
+        // (base commit 3647e3d; see
+        // docs/superpowers/2026-08-08-pq-streaming-distortion-blowup-investigation.md).
+        // The prior (Phase 3) constants this replaces were harvested from output that a
+        // stack-buffer-overflow READ in l2Sq's call sites (:576-584, :644-646, and the
+        // minibatch assignment step) was silently perturbing with process-launch-
+        // dependent garbage; that investigation's call-graph exclusion proved the
+        // streaming seeder itself (kmeansppSeedSubspaceDense/streamingKMeansppSeed) was
+        // never implicated, so re-harvesting after Tasks 1-5 fixed every unsafe l2Sq
+        // call site is a like-for-like snapshot update, not a behavior change. The four
+        // values below were harvested via Swift's default shortest-round-trip printing
+        // and verified bit-identical across three separate `swift test` process
+        // invocations.
+        XCTAssertEqual(codebooks[0].bitPattern, Float(0.7648039).bitPattern)
+        XCTAssertEqual(codebooks[1].bitPattern, Float(-0.5310464).bitPattern)
+        XCTAssertEqual(codebooks[2].bitPattern, Float(-0.7147653).bitPattern)
+        XCTAssertEqual(codebooks[3].bitPattern, Float(0.30723625).bitPattern)
     }
 
     // MARK: - Performance Validation Tests
