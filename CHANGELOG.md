@@ -90,6 +90,28 @@ multi-run requalification.
   completes the switch (the sampled occupancy check alone can miss for common shapes);
   and `reset()` re-seeds the mode before sizing buffers. `adaptiveInitialMode ==
   .adaptive` is now a precondition failure.
+- PQ training's minibatch/streaming family (`Sources/VectorIndex/Kernels/PQTrain.swift`)
+  no longer overflows its own stack frame while computing distances: `l2Sq` was called
+  at 22 sites with a single-element `&array[index]` pointer while reading `dsub`
+  contiguous `Float`s starting from it — a pattern Swift only guarantees valid for one
+  element, which AddressSanitizer confirmed as a genuine stack-buffer-overflow READ
+  (`l2Sq`, `PQTrain.swift:760`, reached from `minibatchKMeansSubspaceChunk`). The
+  garbage bytes read past the materialized stack temporary decoded to huge-but-finite
+  floats, which surfaced as wildly wrong `distortion` statistics (values on the order
+  of 1e25, or 0.0), the same seeded input producing a different result on every fresh
+  process launch, and potentially suboptimal cluster assignments wherever a corrupted
+  distance flipped a nearest-centroid comparison. PQ codebook *values* were never
+  corrupted in any traced path — the corrupted reads only ever reached ephemeral
+  comparison variables and the distortion accumulator, never a write back into the
+  codebook. All 22 call sites now derive their pointers from
+  `withUnsafeBufferPointer`/`withUnsafeMutableBufferPointer` base pointers plus offset
+  arithmetic; `stats.distortion` is now bit-identical across process launches for the
+  same seeded input (`60.3531861292243` across three separate processes for
+  `testStreamingPQTraining`'s configuration). Hardened with a real upper-bound
+  assertion on `distortion` (the prior `> 0` check passed for any finite value,
+  including the garbage ones), a nightly + on-demand AddressSanitizer CI job over the
+  affected kernel suites, and `PQTrainTests` running in CI for the first time (it had
+  been unconditionally skipped there via `CI_SKIP_PQTRAIN`).
 
 ### Deprecated
 
