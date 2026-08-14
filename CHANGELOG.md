@@ -95,7 +95,8 @@ multi-run requalification.
   at 22 sites with a single-element `&array[index]` pointer while reading `dsub`
   contiguous `Float`s starting from it — a pattern Swift only guarantees valid for one
   element, which AddressSanitizer confirmed as a genuine stack-buffer-overflow READ
-  (`l2Sq`, `PQTrain.swift:760`, reached from `minibatchKMeansSubspaceChunk`). The
+  (`l2Sq`, `PQTrain.swift:760` — line numbers as of the pre-fix commit, reached from
+  `minibatchKMeansSubspaceChunk`). The
   garbage bytes read past the materialized stack temporary decoded to huge-but-finite
   floats, which surfaced as wildly wrong `distortion` statistics (values on the order
   of 1e25, or 0.0), the same seeded input producing a different result on every fresh
