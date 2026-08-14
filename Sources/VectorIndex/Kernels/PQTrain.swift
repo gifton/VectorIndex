@@ -1169,10 +1169,6 @@ private func minibatchKMeansSubspace(
     didWarmStart: Bool = false,
     outDistortion: inout Double, outIters: inout Int, outEmpties: inout Int
 ) {
-    // Create local var copies for &array[index] syntax
-    var x = x
-    let coarse = coarse
-
     let nI = Int(n)
     var idx = [UInt32](repeating: 0, count: nI)
     for i in 0..<nI { idx[i] = UInt32(i) }
@@ -1193,168 +1189,210 @@ private func minibatchKMeansSubspace(
     var counts = [Int64](repeating: 0, count: ks)
 
     let passes = max(1, cfg.maxIters)
-    for p in 0..<passes {
-        if cfg.verbose { print("[PQTrain][mini] j=\(j) pass=\(p+1)/\(passes) B=\(B) n=\(nI) ks=\(ks)") }
-        randpermInPlace(&idx, rng: &rng)
-        var processed = 0
-        let limit = (cfg.sampleN > 0) ? min(nI, Int(cfg.sampleN)) : nI
-        // Per-pass counts to detect persistently empty clusters
-        var passCounts = [Int64](repeating: 0, count: ks)
-        while processed < limit {
-            let s = processed
-            let e = min(s + B, limit)
-            let nb = e - s
-            // zero reusable accumulators
-            for i in 0..<(ks * dsub) { sums[i] = 0 }
-            for i in 0..<ks { counts[i] = 0 }
 
-            for t in 0..<nb {
-                let i = Int(idx[s + t])
-                let base = i * d + j * dsub
-                var bestK = 0
-                var bestD: Float
+    // Use withUnsafe[Mutable]BufferPointer for stable pointer provenance.
+    // This avoids Swift's &array[index] pointer aliasing issues: l2Sq reads
+    // `dsub` contiguous floats per pointer, but `&array[index]` is only
+    // guaranteed valid for a single element. C is both read (distance) and
+    // written (centroid update) throughout this function, so it is wrapped
+    // exactly once here and every access to it below goes through `cptr`;
+    // likewise `x` is wrapped once and accessed only via `xptr`. The
+    // emptyKs bookkeeping never touches x/C directly, so hoisting this one
+    // wrap over the whole rest of the function body (passes loop, empty
+    // -cluster repair, final sanitization sweep, distortion estimate) does
+    // not force any awkward nesting.
+    x.withUnsafeBufferPointer { xbuf in
+        let xptr = xbuf.baseAddress!
+        C.withUnsafeMutableBufferPointer { cbuf in
+            let cptr = cbuf.baseAddress!
 
-                if let coarse = coarse, let assign = assign {
-                    var coarse = coarse  // Re-shadow as var for &coarse syntax
-                    let gid = Int(assign[i]); let gbase = gid * d + j * dsub
-                    bestD = l2Sq(&x[base], &C[0], dsub, subtract: &coarse[gbase])
-                    for k in 1..<ks {
-                        let dk = l2Sq(&x[base], &C[k*dsub], dsub, subtract: &coarse[gbase])
-                        if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+            for p in 0..<passes {
+                if cfg.verbose { print("[PQTrain][mini] j=\(j) pass=\(p+1)/\(passes) B=\(B) n=\(nI) ks=\(ks)") }
+                randpermInPlace(&idx, rng: &rng)
+                var processed = 0
+                let limit = (cfg.sampleN > 0) ? min(nI, Int(cfg.sampleN)) : nI
+                // Per-pass counts to detect persistently empty clusters
+                var passCounts = [Int64](repeating: 0, count: ks)
+                while processed < limit {
+                    let s = processed
+                    let e = min(s + B, limit)
+                    let nb = e - s
+                    // zero reusable accumulators
+                    for i in 0..<(ks * dsub) { sums[i] = 0 }
+                    for i in 0..<ks { counts[i] = 0 }
+
+                    if let coarse = coarse, let assign = assign {
+                        coarse.withUnsafeBufferPointer { gbuf in
+                            let gptr = gbuf.baseAddress!
+                            for t in 0..<nb {
+                                let i = Int(idx[s + t])
+                                let base = i * d + j * dsub
+                                var bestK = 0
+                                let gid = Int(assign[i]); let gbase = gid * d + j * dsub
+                                var bestD = l2Sq(xptr + base, cptr, dsub, subtract: gptr + gbase)
+                                for k in 1..<ks {
+                                    let dk = l2Sq(xptr + base, cptr + k*dsub, dsub, subtract: gptr + gbase)
+                                    if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                                }
+                                for u in 0..<dsub { sums[bestK*dsub + u] += Double(xptr[base+u] - gptr[gbase+u]) }
+                                counts[bestK] += 1
+                                passCounts[bestK] += 1
+                            }
+                        }
+                    } else {
+                        for t in 0..<nb {
+                            let i = Int(idx[s + t])
+                            let base = i * d + j * dsub
+                            var bestK = 0
+                            var bestD = l2Sq(xptr + base, cptr, dsub)
+                            for k in 1..<ks {
+                                let dk = l2Sq(xptr + base, cptr + k*dsub, dsub)
+                                if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                            }
+                            for u in 0..<dsub { sums[bestK*dsub + u] += Double(xptr[base+u]) }
+                            counts[bestK] += 1
+                            passCounts[bestK] += 1
+                        }
                     }
-                    for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u] - coarse[gbase+u]) }
-                } else {
-                    bestD = l2Sq(&x[base], &C[0], dsub)
-                    for k in 1..<ks {
-                        let dk = l2Sq(&x[base], &C[k*dsub], dsub)
-                        if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+
+                    // Incremental centroid update per cluster
+                    for k in 0..<ks {
+                        let ck = counts[k]
+                        if ck > 0 {
+                            let oldN = globalCounts[k]
+                            let newN = oldN &+ ck
+                            globalCounts[k] = newN
+                            let oldW = Double(oldN) / Double(newN)
+                            let newW = Double(ck) / Double(newN)
+                            let baseC = k * dsub
+                            // Compute batch mean and blend with existing centroid
+                            for u in 0..<dsub {
+                                let oldVal = Double(cptr[baseC + u])
+                                let batchMean = sums[baseC + u] / Double(ck)
+                                let updated = oldW * oldVal + newW * batchMean
+                                let v = Float(updated)
+                                cptr[baseC + u] = v.isFinite ? v : 0
+                            }
+                        }
                     }
-                    for u in 0..<dsub { sums[bestK*dsub + u] += Double(x[base+u]) }
+
+                    iters += 1
+                    processed = e
                 }
 
-                counts[bestK] += 1
-                passCounts[bestK] += 1
-            }
-
-            // Incremental centroid update per cluster
-            for k in 0..<ks {
-                let ck = counts[k]
-                if ck > 0 {
-                    let oldN = globalCounts[k]
-                    let newN = oldN &+ ck
-                    globalCounts[k] = newN
-                    let oldW = Double(oldN) / Double(newN)
-                    let newW = Double(ck) / Double(newN)
-                    let baseC = k * dsub
-                    // Compute batch mean and blend with existing centroid
-                    for u in 0..<dsub {
-                        let oldVal = Double(C[baseC + u])
-                        let batchMean = sums[baseC + u] / Double(ck)
-                        let updated = oldW * oldVal + newW * batchMean
-                        let v = Float(updated)
-                        C[baseC + u] = v.isFinite ? v : 0
+                // Pass-level empty repair: operate only on clusters that never received assignments overall
+                var emptyKs: [Int] = []
+                for k in 0..<ks where globalCounts[k] == 0 {
+                    emptyKs.append(k)
+                }
+                if !emptyKs.isEmpty {
+                    let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : cfg.distEvalN))
+                    if evalLim > 0 {
+                        // Precompute min distance to any centroid for sampled points
+                        var mins = [Float](repeating: 0, count: evalLim)
+                        var inds = [Int](repeating: 0, count: evalLim)
+                        if let coarse = coarse, let assign = assign {
+                            coarse.withUnsafeBufferPointer { gbuf in
+                                let gptr = gbuf.baseAddress!
+                                for t in 0..<evalLim {
+                                    let i = Int(idx[t % idx.count])
+                                    inds[t] = i
+                                    let base = i * d + j * dsub
+                                    let gid = Int(assign[i])
+                                    let gbase = gid * d + j * dsub
+                                    var minD = l2Sq(xptr + base, cptr, dsub, subtract: gptr + gbase)
+                                    for kk in 1..<ks {
+                                        let di = l2Sq(xptr + base, cptr + kk*dsub, dsub, subtract: gptr + gbase)
+                                        if di < minD { minD = di }
+                                    }
+                                    mins[t] = minD
+                                }
+                            }
+                        } else {
+                            for t in 0..<evalLim {
+                                let i = Int(idx[t % idx.count])
+                                inds[t] = i
+                                let base = i * d + j * dsub
+                                var minD = l2Sq(xptr + base, cptr, dsub)
+                                for kk in 1..<ks {
+                                    let di = l2Sq(xptr + base, cptr + kk*dsub, dsub)
+                                    if di < minD { minD = di }
+                                }
+                                mins[t] = minD
+                            }
+                        }
+                        // Select top-|emptyKs| farthest points (largest min distance)
+//                        let ecount = emptyKs.count
+                        let order = (0..<evalLim).sorted { mins[$0] > mins[$1] }
+                        if let coarse = coarse, let assign = assign {
+                            coarse.withUnsafeBufferPointer { gbuf in
+                                let gptr = gbuf.baseAddress!
+                                for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
+                                    let pickIdx = order[rank]
+                                    let i = inds[pickIdx]
+                                    let base = i * d + j * dsub
+                                    let gid = Int(assign[i]); let gbase = gid * d + j * dsub
+                                    for u in 0..<dsub { cptr[kEmpty*dsub + u] = xptr[base + u] - gptr[gbase + u] }
+                                    globalCounts[kEmpty] = 1
+                                    emptiesFixed += 1
+                                }
+                            }
+                        } else {
+                            for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
+                                let pickIdx = order[rank]
+                                let i = inds[pickIdx]
+                                let base = i * d + j * dsub
+                                for u in 0..<dsub { cptr[kEmpty*dsub + u] = xptr[base + u] }
+                                globalCounts[kEmpty] = 1
+                                emptiesFixed += 1
+                            }
+                        }
                     }
                 }
+                #if DEBUG
+                let nonEmptyPass = passCounts.filter { $0 > 0 }.count
+                let emptyPass = ks - nonEmptyPass
+                let nonEmptyTotal = globalCounts.filter { $0 > 0 }.count
+                let emptyTotal = ks - nonEmptyTotal
+                let maxCount = passCounts.max() ?? 0
+                let minCount = passCounts.filter { $0 > 0 }.min() ?? 0
+                print("[PQTrain][mini][debug] j=\(j) pass=\(p+1) emptyPass=\(emptyPass) emptyTotal=\(emptyTotal) minPassCount=\(minCount) maxPassCount=\(maxCount)")
+                for ci in 0..<(ks * dsub) { if !cptr[ci].isFinite { print("[PQTrain][mini][debug] non-finite centroid value detected"); assertionFailure("Non-finite centroid") } }
+                #endif
+                if cfg.verbose { print("[PQTrain][mini] j=\(j) pass=\(p+1) completed; iters so far=\(iters)") }
             }
 
-            iters += 1
-            processed = e
-        }
+            // Final sanitation of centroids to eliminate any residual non-finite values
+            for t in 0..<(ks * dsub) {
+                let v = cptr[t]
+                if !v.isFinite { cptr[t] = 0 }
+            }
 
-        // Pass-level empty repair: operate only on clusters that never received assignments overall
-        var emptyKs: [Int] = []
-        for k in 0..<ks where globalCounts[k] == 0 {
-            emptyKs.append(k)
-        }
-        if !emptyKs.isEmpty {
+            // Estimate distortion on a limited sample to keep runtime bounded
+            var total: Double = 0
+            var used = 0
             let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : cfg.distEvalN))
-            if evalLim > 0 {
-                // Precompute min distance to any centroid for sampled points
-                var mins = [Float](repeating: 0, count: evalLim)
-                var inds = [Int](repeating: 0, count: evalLim)
-                for t in 0..<evalLim {
-                    let i = Int(idx[t % idx.count])
-                    inds[t] = i
-                    let base = i * d + j * dsub
-                    var minD: Float
-                    if let coarse = coarse, let assign = assign {
-                        var coarse = coarse
-                        let gid = Int(assign[i])
-                        let gbase = gid * d + j * dsub
-                        minD = l2Sq(&x[base], &C[0], dsub, subtract: &coarse[gbase])
-                        for kk in 1..<ks {
-                            let di = l2Sq(&x[base], &C[kk*dsub], dsub, subtract: &coarse[gbase])
-                            if di < minD { minD = di }
-                        }
-                    } else {
-                        minD = l2Sq(&x[base], &C[0], dsub)
-                        for kk in 1..<ks {
-                            let di = l2Sq(&x[base], &C[kk*dsub], dsub)
-                            if di < minD { minD = di }
-                        }
-                    }
-                    mins[t] = minD
+            // Reuse current permutation for sampling
+            for t in 0..<evalLim {
+                let i = Int(idx[t % idx.count])
+                let base = i * d + j * dsub
+                var best = l2Sq(xptr + base, cptr, dsub)
+                for k in 1..<ks {
+                    let dk = l2Sq(xptr + base, cptr + k*dsub, dsub)
+                    if dk < best { best = dk }
                 }
-                // Select top-|emptyKs| farthest points (largest min distance)
-//                let ecount = emptyKs.count
-                let order = (0..<evalLim).sorted { mins[$0] > mins[$1] }
-                for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
-                    let pickIdx = order[rank]
-                    let i = inds[pickIdx]
-                    let base = i * d + j * dsub
-                    if let coarse = coarse, let assign = assign {
-                        let gid = Int(assign[i]); let gbase = gid * d + j * dsub
-                        for u in 0..<dsub { C[kEmpty*dsub + u] = x[base + u] - coarse[gbase + u] }
-                    } else {
-                        for u in 0..<dsub { C[kEmpty*dsub + u] = x[base + u] }
-                    }
-                    globalCounts[kEmpty] = 1
-                    emptiesFixed += 1
+                if best < 0 { best = 0 }
+                if best.isFinite {
+                    total += Double(best)
+                    used += 1
                 }
             }
+            if used > 0 && total.isFinite {
+                outDistortion = total / Double(used)
+            } else {
+                outDistortion = 1.0
+            }
         }
-        #if DEBUG
-        let nonEmptyPass = passCounts.filter { $0 > 0 }.count
-        let emptyPass = ks - nonEmptyPass
-        let nonEmptyTotal = globalCounts.filter { $0 > 0 }.count
-        let emptyTotal = ks - nonEmptyTotal
-        let maxCount = passCounts.max() ?? 0
-        let minCount = passCounts.filter { $0 > 0 }.min() ?? 0
-        print("[PQTrain][mini][debug] j=\(j) pass=\(p+1) emptyPass=\(emptyPass) emptyTotal=\(emptyTotal) minPassCount=\(minCount) maxPassCount=\(maxCount)")
-        for v in C { if !v.isFinite { print("[PQTrain][mini][debug] non-finite centroid value detected"); assertionFailure("Non-finite centroid") } }
-        #endif
-        if cfg.verbose { print("[PQTrain][mini] j=\(j) pass=\(p+1) completed; iters so far=\(iters)") }
-    }
-
-    // Final sanitation of centroids to eliminate any residual non-finite values
-    for t in 0..<(ks * dsub) {
-        let v = C[t]
-        if !v.isFinite { C[t] = 0 }
-    }
-
-    // Estimate distortion on a limited sample to keep runtime bounded
-    var total: Double = 0
-    var used = 0
-    let evalLim = min(nI, (cfg.sampleN > 0 ? Int(cfg.sampleN) : cfg.distEvalN))
-    // Reuse current permutation for sampling
-    for t in 0..<evalLim {
-        let i = Int(idx[t % idx.count])
-        let base = i * d + j * dsub
-        var best = l2Sq(&x[base], &C[0], dsub)
-        for k in 1..<ks {
-            let dk = l2Sq(&x[base], &C[k*dsub], dsub)
-            if dk < best { best = dk }
-        }
-        if best < 0 { best = 0 }
-        if best.isFinite {
-            total += Double(best)
-            used += 1
-        }
-    }
-    if used > 0 && total.isFinite {
-        outDistortion = total / Double(used)
-    } else {
-        outDistortion = 1.0
     }
     outIters = iters
     outEmpties += emptiesFixed
