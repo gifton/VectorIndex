@@ -142,11 +142,17 @@ jobs:
     runs-on: macos-latest
     timeout-minutes: 45
     # Deliberately NOT on every push/PR: an instrumented ASan build cannot
-    # reuse the plain-debug build cache and costs ~7-10 min to build plus
-    # ~2x normal runtime to test, on top of the existing push/PR matrix.
-    # Nightly schedule bounds regression exposure to <=24h; workflow_dispatch
-    # allows an on-demand run (e.g. to vet a branch before merge) without
-    # paying that cost on every commit.
+    # reuse the plain-debug build cache and costs ~7-10 min to build (cold,
+    # GH Actions macOS runner). The per-class test loop below (see the "Test
+    # kernels (ASan)" step) was measured end-to-end locally at ~6.4 min for
+    # all 16 classes -- dominated by PQTrainTests alone at ~4.9 min under
+    # ASan -- so budget ~15-20 min for the test loop on slower/colder CI
+    # runners, giving a realistic ~25-30 min total against the 45-min
+    # timeout below. On top of the existing push/PR matrix, that is a real
+    # cost for a bug class that changes rarely. Nightly schedule bounds
+    # regression exposure to <=24h; workflow_dispatch allows an on-demand
+    # run (e.g. to vet a branch before merge) without paying that cost on
+    # every commit.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     # Isolated from the workflow-level `concurrency:` group: that group keys
     # on push/PR ref and would otherwise collide with a same-ref `push` run
@@ -187,4 +193,41 @@ jobs:
         run: swift build -v --build-tests --sanitize=address
 
       - name: Test kernels (ASan)
-        run: swift test -v --skip-build --sanitize=address --filter '^VectorIndexTests\.(CosineKernelTests|CosineFusedCacheIntegrationTests|MicrokernelIntegrationTests|ResidualKernelTests|LayoutTransformsTests|KMeansMiniBatchTests|KMeansPPSeedingTests|PQEncodeParity_SwiftOnly_Tests|PQEncodeParity_AoS_C_vs_Swift_Tests|VIndexMmapErrorTests|Kernel30AppendTests|IDMapPersistenceTests|PersistenceTests|PersistenceEdgeTests|FlatIndexEdgeCasesTests|PQTrainTests)'
+        # One `swift test --filter` invocation PER CLASS, each a zero-alternation
+        # regex (`^VectorIndexTests\.<Class>`, no `|`). Do NOT collapse this back
+        # into a single `(A|B|C|...)` alternation filter: `swift test --filter`
+        # silently falls back to running the FULL suite once a regex has roughly
+        # >=6 `|` alternation terms (observed/documented in Phase 3 --
+        # docs/superpowers/plans/2026-07-31-vectorindex-0.2.0-phase3-perf.md:20).
+        # This job's whole point is a *scoped* ASan pass over `kernels`; a
+        # silently-expanded run would (a) blow the timeout below serially
+        # sanitizing 400+ tests instead of ~16 classes, and (b) newly exercise
+        # suites (HNSW, mmap, persistence, ...) under ASan with no prior
+        # baseline, for the first time, unreviewed. `set -e` below means any
+        # one class's ASan fault (or SwiftPM's own exit code) fails the whole
+        # step immediately.
+        run: |
+          set -e
+          classes=(
+            CosineKernelTests
+            CosineFusedCacheIntegrationTests
+            MicrokernelIntegrationTests
+            ResidualKernelTests
+            LayoutTransformsTests
+            KMeansMiniBatchTests
+            KMeansPPSeedingTests
+            PQEncodeParity_SwiftOnly_Tests
+            PQEncodeParity_AoS_C_vs_Swift_Tests
+            VIndexMmapErrorTests
+            Kernel30AppendTests
+            IDMapPersistenceTests
+            PersistenceTests
+            PersistenceEdgeTests
+            FlatIndexEdgeCasesTests
+            PQTrainTests
+          )
+          for c in "${classes[@]}"; do
+            echo "::group::ASan: $c"
+            swift test -v --skip-build --sanitize=address --filter "^VectorIndexTests\.$c"
+            echo "::endgroup::"
+          done
