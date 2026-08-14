@@ -670,6 +670,17 @@ final class PQTrainTests: XCTestCase {
         XCTAssertEqual(codebooks.count, m * ks * (d/m))
         XCTAssert(stats.distortion > 0)
 
+        // A trained codebook must beat the trivial all-zero-centroid baseline.
+        // The pre-fix code reported ~1e25 here, which this bound rejects.
+        var trivial = 0.0
+        for i in 0..<Int(n) {
+            for u in 0..<d { let v = Double(fullData[i*d + u]); trivial += v*v }
+        }
+        trivial /= Double(n)
+        XCTAssertLessThan(stats.distortion, trivial,
+                          "distortion must beat the all-zero-centroid baseline")
+        XCTAssertTrue(stats.distortion.isFinite)
+
         print("✅ Streaming training: distortion=\(stats.distortion)")
     }
 

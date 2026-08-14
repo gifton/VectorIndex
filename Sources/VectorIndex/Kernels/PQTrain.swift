@@ -675,16 +675,21 @@ public func pq_train_streaming_f32(
         var seen: Int64 = 0
         for (c, nc) in nChunks.enumerated() {
             guard nc > 0 else { continue }
-            var xc = xChunks[c]  // var required for &xc[index] syntax
-            for i in 0..<Int(nc) {
-                let base = i * d + j * dsub
-                var best = l2Sq(&xc[base], &Cj[0], dsub)
-                for k in 1..<ks {
-                    let dval = l2Sq(&xc[base], &Cj[k*dsub], dsub)
-                    if dval < best { best = dval }
+            xChunks[c].withUnsafeBufferPointer { xbuf in
+                let xptr = xbuf.baseAddress!
+                Cj.withUnsafeBufferPointer { cbuf in
+                    let cptr = cbuf.baseAddress!
+                    for i in 0..<Int(nc) {
+                        let base = i * d + j * dsub
+                        var best = l2Sq(xptr + base, cptr, dsub)
+                        for k in 1..<ks {
+                            let dval = l2Sq(xptr + base, cptr + k*dsub, dsub)
+                            if dval < best { best = dval }
+                        }
+                        if best < 0 { best = 0 }
+                        if best.isFinite { Dj += Double(best) }
+                    }
                 }
-                if best < 0 { best = 0 }
-                if best.isFinite { Dj += Double(best) }
             }
             seen += nc
         }
