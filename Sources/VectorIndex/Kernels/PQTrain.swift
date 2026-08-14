@@ -1367,10 +1367,6 @@ private func minibatchKMeansSubspaceChunk(
     globalCounts: inout [Int64], passCounts: inout [Int64],
     sampleProb: Double = 1.0
 ) {
-    // Create local var copies for &array[index] syntax
-    var xChunk = xChunk
-    let coarse = coarse
-
     let nI = Int(n)
     if nI == 0 { return }
     var idx = [UInt32](repeating: 0, count: nI)
@@ -1381,61 +1377,88 @@ private func minibatchKMeansSubspaceChunk(
     // Reusable per-batch accumulators
     var sums = [Double](repeating: 0, count: ks * dsub)
     var counts = [Int64](repeating: 0, count: ks)
-    var s = 0
-    while s < nI {
-        let e = min(s + B, nI)
-        let nb = e - s
-        // zero reusable accumulators
-        for i in 0..<(ks * dsub) { sums[i] = 0 }
-        for i in 0..<ks { counts[i] = 0 }
-        for t in 0..<nb {
-            // Probabilistic thinning to reduce per-pass workload across chunks
-            if sampleProb < 1.0 {
-                let u = rng.uniformF64()
-                if u > sampleProb { continue }
-            }
-            let i = Int(idx[s + t])
-            let base = i * d + j * dsub
-            var bestK = 0
-            var bestD: Float
 
-            if let coarse = coarse, let assign = assignChunk {
-                var coarse = coarse  // Re-shadow as var for &coarse syntax
-                let gid = Int(assign[i]); let gbase = gid * d + j * dsub
-                bestD = l2Sq(&xChunk[base], &C[0], dsub, subtract: &coarse[gbase])
-                for k in 1..<ks {
-                    let dk = l2Sq(&xChunk[base], &C[k*dsub], dsub, subtract: &coarse[gbase])
-                    if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+    // Use withUnsafe[Mutable]BufferPointer for stable pointer access.
+    // This avoids Swift's &array[index] pointer aliasing issues: l2Sq reads
+    // `dsub` contiguous floats per pointer, but `&array[index]` is only
+    // guaranteed valid for a single element. C is both read (distance) and
+    // written (centroid update) below, so it is wrapped exactly once and
+    // all access to it goes through `cptr` for the whole loop.
+    xChunk.withUnsafeBufferPointer { xbuf in
+        let xptr = xbuf.baseAddress!
+        C.withUnsafeMutableBufferPointer { cbuf in
+            let cptr = cbuf.baseAddress!
+
+            var s = 0
+            while s < nI {
+                let e = min(s + B, nI)
+                let nb = e - s
+                // zero reusable accumulators
+                for i in 0..<(ks * dsub) { sums[i] = 0 }
+                for i in 0..<ks { counts[i] = 0 }
+
+                if let coarse = coarse, let assign = assignChunk {
+                    coarse.withUnsafeBufferPointer { gbuf in
+                        let gptr = gbuf.baseAddress!
+                        for t in 0..<nb {
+                            // Probabilistic thinning to reduce per-pass workload across chunks
+                            if sampleProb < 1.0 {
+                                let u = rng.uniformF64()
+                                if u > sampleProb { continue }
+                            }
+                            let i = Int(idx[s + t])
+                            let base = i * d + j * dsub
+                            var bestK = 0
+                            let gid = Int(assign[i]); let gbase = gid * d + j * dsub
+                            var bestD = l2Sq(xptr + base, cptr, dsub, subtract: gptr + gbase)
+                            for k in 1..<ks {
+                                let dk = l2Sq(xptr + base, cptr + k*dsub, dsub, subtract: gptr + gbase)
+                                if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                            }
+                            for u in 0..<dsub { sums[bestK*dsub + u] += Double(xptr[base+u] - gptr[gbase+u]) }
+                            counts[bestK] += 1
+                        }
+                    }
+                } else {
+                    for t in 0..<nb {
+                        // Probabilistic thinning to reduce per-pass workload across chunks
+                        if sampleProb < 1.0 {
+                            let u = rng.uniformF64()
+                            if u > sampleProb { continue }
+                        }
+                        let i = Int(idx[s + t])
+                        let base = i * d + j * dsub
+                        var bestK = 0
+                        var bestD = l2Sq(xptr + base, cptr, dsub)
+                        for k in 1..<ks {
+                            let dk = l2Sq(xptr + base, cptr + k*dsub, dsub)
+                            if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+                        }
+                        for u in 0..<dsub { sums[bestK*dsub + u] += Double(xptr[base+u]) }
+                        counts[bestK] += 1
+                    }
                 }
-                for u in 0..<dsub { sums[bestK*dsub + u] += Double(xChunk[base+u] - coarse[gbase+u]) }
-            } else {
-                bestD = l2Sq(&xChunk[base], &C[0], dsub)
-                for k in 1..<ks {
-                    let dk = l2Sq(&xChunk[base], &C[k*dsub], dsub)
-                    if dk < bestD || (dk == bestD && k < bestK) { bestD = dk; bestK = k }
+
+                for k in 0..<ks {
+                    let ck = counts[k]
+                    if ck > 0 {
+                        let oldN = globalCounts[k]
+                        let newN = oldN &+ ck
+                        globalCounts[k] = newN
+                        let oldW = Double(oldN) / Double(newN)
+                        let newW = Double(ck) / Double(newN)
+                        let baseC = k * dsub
+                        for u in 0..<dsub {
+                            let oldVal = Double(cptr[baseC + u])
+                            let batchMean = sums[baseC + u] / Double(ck)
+                            cptr[baseC + u] = Float(oldW * oldVal + newW * batchMean)
+                        }
+                        passCounts[k] &+= ck
+                    }
                 }
-                for u in 0..<dsub { sums[bestK*dsub + u] += Double(xChunk[base+u]) }
+                s = e
             }
-            counts[bestK] += 1
         }
-        for k in 0..<ks {
-            let ck = counts[k]
-            if ck > 0 {
-                let oldN = globalCounts[k]
-                let newN = oldN &+ ck
-                globalCounts[k] = newN
-                let oldW = Double(oldN) / Double(newN)
-                let newW = Double(ck) / Double(newN)
-                let baseC = k * dsub
-                for u in 0..<dsub {
-                    let oldVal = Double(C[baseC + u])
-                    let batchMean = sums[baseC + u] / Double(ck)
-                    C[baseC + u] = Float(oldW * oldVal + newW * batchMean)
-                }
-                passCounts[k] &+= ck
-            }
-        }
-        s = e
     }
 }
 
