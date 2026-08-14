@@ -463,3 +463,53 @@ No tracked file was left modified. The one temporary edit made during Q3 (swappi
 bodies for the pre-Task-9 scalar versions, to run the A/B ASan test) was reverted with
 `git checkout -- Sources/VectorIndex/Kernels/PQTrain.swift` immediately after capturing evidence,
 confirmed via `git diff --stat` returning empty before proceeding to Q4/Q5.
+
+---
+
+## Addendum (2026-08-13, post final review): escaped-baseAddress sites outside HNSW — known, unassessed
+
+The final whole-branch review of Phase 4 (`gifton/fix-0.2.0-phase4-pointer-safety`) found the
+**escaped-closure-pointer idiom** — the same defect mechanism documented in
+`docs/superpowers/2026-08-13-hnsw-pointer-escape-assessment.md` for HNSW's Task 7 (i.e.
+`withUnsafeBufferPointer { $0.baseAddress }` / `withUnsafeMutableBufferPointer { $0.baseAddress! }`
+extracted and used *after* the closure returns) — at **10 additional call sites outside HNSW**,
+none of which this document's l2Sq-focused sweep (Q2 above) covered, because Q2's grep
+(`&[A-Za-z_][A-Za-z0-9_]*\[`) specifically targets the *other* defect class (the fixed l2Sq
+single-element `&array[index]` idiom), not the escaped-`baseAddress` idiom. **This is not the
+l2Sq idiom** — it is the same class of bug as the HNSW cosine inv-norms finding, verified here at
+each cited line against the current file content:
+
+- **`Sources/VectorIndex/Kernels/KMeansMiniBatchKernel.swift`** (in
+  `kmeans_state_update_chunk`, operating on `state.centroids: [Float]` where `KMeansState` is a
+  `final class` declared `@unchecked Sendable` — so only calling convention, not the type system,
+  enforces the single-threaded-caller assumption these escapes rely on):
+  - `:779` — `return _vi_km12_assignAOS(xVec: vec, C: state.centroids.withUnsafeBufferPointer { $0.baseAddress! }, kc: kc, d: d)` — **immutable** escape.
+  - `:781` — `return _vi_km12_assignAOSOA(X: x_chunk, nIndex: ii, C: state.centroids.withUnsafeBufferPointer { $0.baseAddress! }, kc: kc, d: d, R: R)` — **immutable** escape.
+  - `:834` — `let cp = state.centroids.withUnsafeBufferPointer { $0.baseAddress! }.advanced(by: c * d)` — **immutable** escape (inside the `normalizeCentroids` mean-computation loop).
+  - `:791` — `let cPtr = state.centroids.withUnsafeMutableBufferPointer { $0.baseAddress! }.advanced(by: cBest * d)` — **MUTABLE** escape; the escaped pointer is subsequently written through via SIMD4 stores (`raw0.storeBytes(...)`, `raw1.storeBytes(...)`) and scalar `cPtr[j] +=` in the lines immediately following.
+  - `:840` — `let cp = state.centroids.withUnsafeMutableBufferPointer { $0.baseAddress! }.advanced(by: c * d)` — **MUTABLE** escape; written through via `cp[j] -= Float(mean[j])` in the same loop.
+
+- **`Sources/VectorIndex/Operations/Rerank/ExactRerank.swift`** (`scores` and `scoresDense`
+  static methods): `:485-486` and `:514-515` — `let invPtr: UnsafePointer<Float>? =
+  invNorms?.withUnsafeBufferPointer { $0.baseAddress }` / the `sqPtr` equivalent. Parameter
+  arrays (`invNorms`, `sqNorms` are function parameters, not stored properties), used only within
+  the synchronous window of the enclosing call before the function returns — safe by
+  calling-convention lifetime (the backing array's ARC lifetime is guaranteed by the caller
+  holding the parameter for the duration of the call), but still technically outside the documented
+  contract of `withUnsafeBufferPointer`.
+
+- **`Sources/VectorIndex/IVFIndex.swift:1366`** — `let base =
+  dummy.withUnsafeMutableBufferPointer { $0.baseAddress! }`, paired with `len: 0` on the next
+  line (`:1367`, `lists.append(.init(base: UnsafePointer(base), len: 0))`) for list IDs with no
+  entry in `listBases`/`listLengths`. Benign: the reader is contracted to treat `len == 0` as
+  "never dereference `base`," so the escaped pointer is a dummy placeholder that is never actually
+  read through.
+
+**All 10 sites are judged currently-safe-by-inspection by the final review** — none crash, none
+are ASan-confirmed defects, and the mutable-write sites (`:791`, `:840`) are exercised routinely
+by the existing kernel test suite without incident. **None of them have been assessed to Task-7
+rigor** (i.e. no dedicated reproduction/adversarial-timing investigation of the kind
+`2026-08-13-hnsw-pointer-escape-assessment.md` performed for HNSW's cosine inv-norms cache). They
+fold into the same follow-up item as the HNSW Task A/B/C recommendations (see that document) —
+this addendum exists to record their location and disposition so they are not lost, not to close
+them out.
