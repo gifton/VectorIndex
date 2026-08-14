@@ -406,18 +406,26 @@ final class PQTrainTests: XCTestCase {
         // 3 of 5 seeds show warm-start regressing vs cold by 1.2%-4.2% -- not a hairline
         // miss of a tight epsilon but a real, seed-dependent property: minibatch k-means
         // is stochastic (per-pass subsampling) and one pass from a warm start is not
-        // guaranteed to beat one pass from cold. Fitting a tight epsilon to these 5
-        // samples (e.g. ~4.3%) would just be re-committing the same "calibrate against
-        // whatever this run produced" mistake this task exists to undo. Instead we assert
-        // only what the evidence actually supports: the result is finite, positive, and
-        // not catastrophically worse than cold-start. 2x is a generous bound relative to
-        // the observed max regression (~4.2%) -- it catches real regressions (e.g. a
-        // return of the garbage-arithmetic blowup) without asserting a monotone-
-        // improvement guarantee the algorithm doesn't provide.
+        // guaranteed to beat one pass from cold. Fitting an epsilon tight enough to just
+        // barely clear the observed max (~4.3%) would just be re-committing the same
+        // "calibrate against whatever this run produced" mistake this task exists to
+        // undo. But the evidence does support more than "finite and positive": it bounds
+        // how much worse warm-start can plausibly get. Bound chosen: coldStats.distortion
+        // * 1.15 (epsilon=0.15). Arithmetic: the observed max regression across all 5
+        // seeds is +4.23% (seed=999, ratio 1.0423); a 15% bound gives 0.15/0.0423 ~= 3.55x
+        // headroom over that max -- comfortably robust to this test's own fixed seed
+        // (42 -> +1.80%, well inside) and to reasonable additional seed-to-seed spread,
+        // while still being the strongest bound the 5-seed evidence supports: it is tight
+        // enough to catch a real, non-catastrophic regression (e.g. a 30-90% distortion
+        // increase) that a loose 2x/isFinite-only check would let sail through undetected.
+        // Note: isFinite alone is NOT sufficient to catch the historical bug class this
+        // guards against -- per the investigation doc, the garbage read was finite by
+        // construction (huge-but-finite floats, not NaN/Inf), so it is the magnitude
+        // bound below, not the isFinite check, that would catch a regression of that kind.
         XCTAssertTrue(warmStats.distortion.isFinite, "warm-start distortion must be finite")
         XCTAssertGreaterThan(warmStats.distortion, 0, "warm-start distortion must be positive")
-        XCTAssertLessThan(warmStats.distortion, coldStats.distortion * 2.0,
-                           "warm-start should not be catastrophically worse than cold-start (see Task 5b 5-seed evidence above)")
+        XCTAssertLessThan(warmStats.distortion, coldStats.distortion * 1.15,
+                           "warm-start should not regress beyond the evidence-supported margin (see Task 5b 5-seed evidence above; max observed regression was +4.23%)")
     }
 
     func testWarmStartLloydImprovesOneIter() throws {
