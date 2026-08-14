@@ -1212,6 +1212,7 @@ private func minibatchKMeansSubspace(
     outDistortion: inout Double, outIters: inout Int, outEmpties: inout Int
 ) {
     let nI = Int(n)
+    if nI == 0 { return }
     var idx = [UInt32](repeating: 0, count: nI)
     for i in 0..<nI { idx[i] = UInt32(i) }
 
