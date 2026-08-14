@@ -562,45 +562,82 @@ public func pq_train_streaming_f32(
                     // Precompute min distance per sampled point
                     var mins = [Float](repeating: 0, count: evalN)
                     var pts: [(c: Int, i: Int)] = Array(repeating: (0, 0), count: evalN)
-                    for t in 0..<evalN {
-                        let g = Int64(rng.uniformF64() * Double(totalN))
-                        let (c, i) = mapIndex(g)
-                        pts[t] = (c, i)
-                        var xc = xChunks[c]
-                        let base = i * d + j * dsub
-                        var minD: Float
+
+                    // Use withUnsafe[Mutable]BufferPointer for stable pointer provenance.
+                    // l2Sq reads `dsub` contiguous floats per pointer, but `&array[index]`
+                    // is only guaranteed valid for a single element. Cj and coarse each have
+                    // one fixed identity for this whole repair block (Cj is read below and
+                    // also written in the selection loop; coarse, when present, is read-only
+                    // throughout), so each is wrapped exactly once and accessed only via
+                    // cptr/gptr for the rest of this block. xChunks[c], in contrast, indexes
+                    // a *different* chunk array on every sampled point -- the chunk is chosen
+                    // by a random global-index draw each iteration -- so there is no single
+                    // array to hoist one wrap around for the whole loop; per the task's
+                    // approach (a), it is wrapped per-iteration around just the chosen chunk
+                    // instead. Repairs are rare, so the extra closure entry per sample is
+                    // negligible. The rng.uniformF64() draw below is the only RNG use in this
+                    // block; its position (once per t, first statement in the iteration) and
+                    // count are unchanged by this refactor.
+                    Cj.withUnsafeMutableBufferPointer { cbuf in
+                        let cptr = cbuf.baseAddress!
                         if let coarse = coarseCentroids, let aChunks = assignChunks {
-                            var coarse = coarse
-                            let gid = Int(aChunks[c][i])
-                            let gbase = gid * d + j * dsub
-                            minD = l2Sq(&xc[base], &Cj[0], dsub, subtract: &coarse[gbase])
-                            for kk in 1..<ks {
-                                let di = l2Sq(&xc[base], &Cj[kk*dsub], dsub, subtract: &coarse[gbase])
-                                if di < minD { minD = di }
+                            coarse.withUnsafeBufferPointer { gbuf in
+                                let gptr = gbuf.baseAddress!
+                                for t in 0..<evalN {
+                                    let g = Int64(rng.uniformF64() * Double(totalN))
+                                    let (c, i) = mapIndex(g)
+                                    pts[t] = (c, i)
+                                    let base = i * d + j * dsub
+                                    let gid = Int(aChunks[c][i])
+                                    let gbase = gid * d + j * dsub
+                                    xChunks[c].withUnsafeBufferPointer { xbuf in
+                                        let xptr = xbuf.baseAddress!
+                                        var minD = l2Sq(xptr + base, cptr, dsub, subtract: gptr + gbase)
+                                        for kk in 1..<ks {
+                                            let di = l2Sq(xptr + base, cptr + kk*dsub, dsub, subtract: gptr + gbase)
+                                            if di < minD { minD = di }
+                                        }
+                                        mins[t] = minD
+                                    }
+                                }
+                                // Select farthest points for empties
+                                let order = (0..<evalN).sorted { mins[$0] > mins[$1] }
+                                for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
+                                    let pick = order[rank]
+                                    let (c, i) = pts[pick]
+                                    let base = i * d + j * dsub
+                                    let gid = Int(aChunks[c][i])
+                                    let gbase = gid * d + j * dsub
+                                    for u in 0..<dsub { cptr[kEmpty*dsub + u] = xChunks[c][base + u] - gptr[gbase + u] }
+                                    globalCounts[kEmpty] = 1
+                                }
                             }
                         } else {
-                            minD = l2Sq(&xc[base], &Cj[0], dsub)
-                            for kk in 1..<ks {
-                                let di = l2Sq(&xc[base], &Cj[kk*dsub], dsub)
-                                if di < minD { minD = di }
+                            for t in 0..<evalN {
+                                let g = Int64(rng.uniformF64() * Double(totalN))
+                                let (c, i) = mapIndex(g)
+                                pts[t] = (c, i)
+                                let base = i * d + j * dsub
+                                xChunks[c].withUnsafeBufferPointer { xbuf in
+                                    let xptr = xbuf.baseAddress!
+                                    var minD = l2Sq(xptr + base, cptr, dsub)
+                                    for kk in 1..<ks {
+                                        let di = l2Sq(xptr + base, cptr + kk*dsub, dsub)
+                                        if di < minD { minD = di }
+                                    }
+                                    mins[t] = minD
+                                }
+                            }
+                            // Select farthest points for empties
+                            let order = (0..<evalN).sorted { mins[$0] > mins[$1] }
+                            for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
+                                let pick = order[rank]
+                                let (c, i) = pts[pick]
+                                let base = i * d + j * dsub
+                                for u in 0..<dsub { cptr[kEmpty*dsub + u] = xChunks[c][base + u] }
+                                globalCounts[kEmpty] = 1
                             }
                         }
-                        mins[t] = minD
-                    }
-                    // Select farthest points for empties
-                    let order = (0..<evalN).sorted { mins[$0] > mins[$1] }
-                    for (rank, kEmpty) in emptyKs.enumerated() where rank < order.count {
-                        let pick = order[rank]
-                        let (c, i) = pts[pick]
-                        let base = i * d + j * dsub
-                        if let coarse = coarseCentroids, let aChunks = assignChunks {
-                            let gid = Int(aChunks[c][i])
-                            let gbase = gid * d + j * dsub
-                            for u in 0..<dsub { Cj[kEmpty*dsub + u] = xChunks[c][base + u] - coarse[gbase + u] }
-                        } else {
-                            for u in 0..<dsub { Cj[kEmpty*dsub + u] = xChunks[c][base + u] }
-                        }
-                        globalCounts[kEmpty] = 1
                     }
                 }
             }
