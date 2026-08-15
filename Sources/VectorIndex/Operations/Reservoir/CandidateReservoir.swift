@@ -34,6 +34,28 @@ public enum ReservoirMode: Sendable {
 
 /// Configuration options for reservoir behavior.
 public struct ReservoirOptions: Sendable {
+  /// Reservoir buffering strategy. `.adaptive` (the default) starts in `.block` and switches
+  /// to `.heap` once occupancy crosses `adaptiveThreshold`, so callers get most of `.heap`'s
+  /// speed without having to know their stream's score order upfront.
+  ///
+  /// Measured guidance (`ReservoirModeBenchmarks`, C ∈ {64, 1024}, 100k pushes in 1k
+  /// batches, release build, median of 7 trials, re-measured 2026-08-15 on a quiet
+  /// machine — an earlier 2026-08-07 measurement under heavy background load overstated
+  /// the ratios ~5×; direction and ranking were unchanged):
+  /// - Streams where the top-C stabilizes early (ascending or random score order, i.e. most
+  ///   pushes end up rejected against tau): `.heap` and `.adaptive` are **~6-19× faster**
+  ///   than `.block` (e.g. C=1024 random: 25.9 ns/push heap, 25.4 ns/push adaptive vs.
+  ///   487.0 ns/push block; C=64 ascending: 11.7 ns heap, 12.3 ns adaptive vs. 136.6 ns block).
+  /// - Fully monotonic *improving* (descending-score) streams, where nearly every push
+  ///   replaces the heap root: all three modes converge to comparable cost (within ~1.1-1.7×
+  ///   of each other) -- no mode shows a decisive win here (C=1024: 282.3 heap / 285.0
+  ///   adaptive / 314.4 block ns/push).
+  /// - `.adaptive` switched exactly once per query in every measured cell and produced results
+  ///   identical to `.heap` (see `CandidateReservoirTests.testAdaptiveSampledSwitchMatchesPureHeapResults`).
+  ///   `.block` never compares against tau (it appends unconditionally and prunes
+  ///   periodically), so it was not the fastest mode in any cell measured here -- prefer
+  ///   `.adaptive` as the default and reach for `.block` only for its simpler code path, not
+  ///   for throughput.
   public var mode: ReservoirMode
   /// Extra headroom fraction for Block mode (α). Typical 0.1–0.2.
   public var reserveExtra: Float
@@ -255,6 +277,7 @@ public final class CandidateReservoir: @unchecked Sendable {
         // Append (no threshold check); prune when exceeding headroom.
         appendUnsorted(id: cid, score: s)
         acceptedInBatch &+= 1
+        telemetry.accepted &+= 1
 
         if size >= bufferCapacity {
           pruneToTopC() // sets tau
@@ -264,6 +287,7 @@ public final class CandidateReservoir: @unchecked Sendable {
         // Adaptive block phase until switch.
         appendUnsorted(id: cid, score: s)
         acceptedInBatch &+= 1
+        telemetry.accepted &+= 1
 
         if size >= bufferCapacity {
           // Overflow guard (same invariant .block enforces): never let the block
@@ -295,12 +319,14 @@ public final class CandidateReservoir: @unchecked Sendable {
         if size < C {
           heapInsert(id: cid, score: s)
           acceptedInBatch &+= 1
+          telemetry.accepted &+= 1
         } else {
           // Compare against tau (root is worst).
           let worstID = ids[0]
           if isBetter(scoreA: s, idA: cid, scoreB: tau, idB: worstID) {
             replaceRoot(id: cid, score: s)
             acceptedInBatch &+= 1
+            telemetry.accepted &+= 1
           } else {
             telemetry.rejectedTau &+= 1
           }
@@ -402,6 +428,7 @@ public final class CandidateReservoir: @unchecked Sendable {
       // Not full yet; leave tau sentinel.
       return
     }
+    telemetry.prunes &+= 1
     quickselectTop(countKeep: C)
     size = C
     // Update tau: find worst within first C.

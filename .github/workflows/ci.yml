@@ -12,6 +12,10 @@ on:
     paths-ignore:
       - 'docs/**'
       - '**/*.md'
+  schedule:
+    # Nightly AddressSanitizer run (see `asan` job). Does not trigger build/test/lint.
+    - cron: '0 6 * * *'
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -25,6 +29,7 @@ jobs:
     name: Build (Debug, with tests)
     runs-on: macos-latest
     timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -61,6 +66,7 @@ jobs:
     runs-on: macos-latest
     needs: build
     timeout-minutes: 30
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     strategy:
       fail-fast: false
       matrix:
@@ -100,19 +106,18 @@ jobs:
               echo "filter=^VectorIndexTests\.(IVFTests|IVFSelectTests|IVFSelectBatchSugarTests|IVFSelectBenchmarks|IVFFlatRerankTests|IVFProbeMonotonicTests|IVFRecallTests|IVFMoreTests|IVFListMaintenanceTests|IVFListVecsReaderRerankTests|IVFKMeansPlusPlusTests)" >> $GITHUB_OUTPUT
               ;;
             kernels)
-              echo "filter=^VectorIndexTests\.(CosineKernelTests|CosineFusedCacheIntegrationTests|MicrokernelIntegrationTests|ResidualKernelTests|LayoutTransformsTests|KMeansMiniBatchTests|KMeansPPSeedingTests|PQEncodeParity_SwiftOnly_Tests|PQEncodeParity_AoS_C_vs_Swift_Tests|VIndexMmapErrorTests|Kernel30AppendTests|IDMapPersistenceTests|PersistenceTests|PersistenceEdgeTests|FlatIndexEdgeCasesTests)" >> $GITHUB_OUTPUT
+              echo "filter=^VectorIndexTests\.(CosineKernelTests|CosineFusedCacheIntegrationTests|MicrokernelIntegrationTests|ResidualKernelTests|LayoutTransformsTests|KMeansMiniBatchTests|KMeansPPSeedingTests|PQEncodeParity_SwiftOnly_Tests|PQEncodeParity_AoS_C_vs_Swift_Tests|VIndexMmapErrorTests|Kernel30AppendTests|IDMapPersistenceTests|PersistenceTests|PersistenceEdgeTests|FlatIndexEdgeCasesTests|PQTrainTests)" >> $GITHUB_OUTPUT
               ;;
           esac
 
-      - name: Test ${{ matrix.group }} (skip PQTrain)
-        env:
-          CI_SKIP_PQTRAIN: '1'
+      - name: Test ${{ matrix.group }}
         run: swift test -v --parallel --skip-build --filter '${{ steps.select.outputs.filter }}'
 
   lint:
     name: SwiftLint
     runs-on: macos-latest
     timeout-minutes: 10
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -131,3 +136,98 @@ jobs:
           else
             echo "SwiftLint not installed; skipping"
           fi
+
+  asan:
+    name: AddressSanitizer (kernels)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    # Deliberately NOT on every push/PR: an instrumented ASan build cannot
+    # reuse the plain-debug build cache and costs ~7-10 min to build (cold,
+    # GH Actions macOS runner). The per-class test loop below (see the "Test
+    # kernels (ASan)" step) was measured end-to-end locally at ~6.4 min for
+    # all 16 classes -- dominated by PQTrainTests alone at ~4.9 min under
+    # ASan -- so budget ~15-20 min for the test loop on slower/colder CI
+    # runners, giving a realistic ~25-30 min total against the 45-min
+    # timeout below. On top of the existing push/PR matrix, that is a real
+    # cost for a bug class that changes rarely. Nightly schedule bounds
+    # regression exposure to <=24h; workflow_dispatch allows an on-demand
+    # run (e.g. to vet a branch before merge) without paying that cost on
+    # every commit.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    # Isolated from the workflow-level `concurrency:` group: that group keys
+    # on push/PR ref and would otherwise collide with a same-ref `push` run
+    # (both resolve to `ci-refs/heads/main`), letting a routine push cancel
+    # an in-progress nightly ASan run (or vice versa) via cancel-in-progress.
+    concurrency:
+      group: ci-asan-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: System Info
+        run: |
+          echo "## System Info (ASan)" >> $GITHUB_STEP_SUMMARY
+          echo "Swift: $(swift --version | head -1)" >> $GITHUB_STEP_SUMMARY
+          echo "CPU: $(sysctl -n machdep.cpu.brand_string)" >> $GITHUB_STEP_SUMMARY
+          echo "OS: $(sw_vers -productName) $(sw_vers -productVersion)" >> $GITHUB_STEP_SUMMARY
+
+      - name: Cache SPM (ASan build)
+        uses: actions/cache@v4
+        with:
+          path: |
+            .build
+            ~/.swiftpm
+            ~/Library/Developer/Xcode/DerivedData
+          key: ${{ runner.os }}-spm-asan-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-spm-asan-${{ hashFiles('**/Package.resolved') }}
+            ${{ runner.os }}-spm-asan-
+
+      - name: Build (ASan, include tests)
+        run: swift build -v --build-tests --sanitize=address
+
+      - name: Test kernels (ASan)
+        # One `swift test --filter` invocation PER CLASS, each a zero-alternation
+        # regex (`^VectorIndexTests\.<Class>`, no `|`). Do NOT collapse this back
+        # into a single `(A|B|C|...)` alternation filter: `swift test --filter`
+        # silently falls back to running the FULL suite once a regex has roughly
+        # >=6 `|` alternation terms (observed/documented in Phase 3 --
+        # docs/superpowers/plans/2026-07-31-vectorindex-0.2.0-phase3-perf.md:20).
+        # This job's whole point is a *scoped* ASan pass over `kernels`; a
+        # silently-expanded run would (a) blow the timeout below serially
+        # sanitizing 400+ tests instead of ~16 classes, and (b) newly exercise
+        # suites (HNSW, mmap, persistence, ...) under ASan with no prior
+        # baseline, for the first time, unreviewed. `set -e` below means any
+        # one class's ASan fault (or SwiftPM's own exit code) fails the whole
+        # step immediately.
+        run: |
+          set -e
+          classes=(
+            CosineKernelTests
+            CosineFusedCacheIntegrationTests
+            MicrokernelIntegrationTests
+            ResidualKernelTests
+            LayoutTransformsTests
+            KMeansMiniBatchTests
+            KMeansPPSeedingTests
+            PQEncodeParity_SwiftOnly_Tests
+            PQEncodeParity_AoS_C_vs_Swift_Tests
+            VIndexMmapErrorTests
+            Kernel30AppendTests
+            IDMapPersistenceTests
+            PersistenceTests
+            PersistenceEdgeTests
+            FlatIndexEdgeCasesTests
+            PQTrainTests
+          )
+          for c in "${classes[@]}"; do
+            echo "::group::ASan: $c"
+            swift test -v --skip-build --sanitize=address --filter "^VectorIndexTests\.$c"
+            echo "::endgroup::"
+          done

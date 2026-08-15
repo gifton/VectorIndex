@@ -53,12 +53,17 @@ public extension IndexOps.Scoring {
             default:
                 // Fallback: compute scalar distances via existing util into out
                 // Note: this is slow and should be rarely hit in practice.
+                // P6c: qArr/tmp hoisted above the loop (previously reallocated
+                // every row -- O(n) allocations per call, O(kc) per IVF
+                // centroid probe with manhattan/chebyshev metrics). tmp is
+                // refilled per row in place; qArr is invariant across rows.
+                let qArr = Array(UnsafeBufferPointer(start: q, count: d))
+                var tmp = [Float](repeating: 0, count: d)
                 var idx = 0
                 while idx < n {
                     let row = xb.advanced(by: idx * d)
-                    var tmp = [Float](repeating: 0, count: d)
                     for j in 0..<d { tmp[j] = row[j] }
-                    out[idx] = distance(Array(UnsafeBufferPointer(start: q, count: d)), tmp, metric: metric)
+                    out[idx] = distance(qArr, tmp, metric: metric)
                     idx += 1
                 }
             }

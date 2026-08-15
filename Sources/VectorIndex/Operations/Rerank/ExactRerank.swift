@@ -243,6 +243,16 @@ public extension IndexOps.Rerank {
     @inline(__always) private static func norm2(_ x: UnsafePointer<Float>, _ d: Int) -> Float { var s: Float = 0; for i in 0..<d { s += x[i] * x[i] }; return s }
 
     // MARK: - Core scoring (single query, scores aligned with cand_ids)
+    // P6c: `scratchIn`/`presentIn`/`tileScoresIn` are optional externally-owned
+    // tile-sized buffers for the single-thread path below (nil => allocate
+    // locally, the pre-existing behavior). `rerank_exact_topk_batch` allocates
+    // these ONCE for the whole batch and threads them through
+    // `_rerank_exact_topk_impl` instead of the single-thread path reallocating
+    // them on every `scoreBlock` call (i.e. every query in the batch). The
+    // parallel path below is untouched -- it already allocates fresh
+    // per-tile/per-task scratch inside `DispatchQueue.concurrentPerform`,
+    // which cannot safely share a single caller-supplied buffer across
+    // concurrent tasks.
     @inline(__always)
     @preconcurrency
     private static func scoreBlock(
@@ -254,7 +264,10 @@ public extension IndexOps.Rerank {
         reader: any VectorReader,
         opts: RerankOpts,
         scoresOut: UnsafeMutablePointer<Float>,      // [C], aligned with cand_ids order
-        presentMaskOut: UnsafeMutablePointer<UInt8>? // optional [C], 1 if present
+        presentMaskOut: UnsafeMutablePointer<UInt8>?, // optional [C], 1 if present
+        scratchIn: UnsafeMutablePointer<Float>? = nil,
+        presentIn: UnsafeMutablePointer<UInt8>? = nil,
+        tileScoresIn: UnsafeMutablePointer<Float>? = nil
     ) {
         let tile = max(1, opts.gatherTile)
         let order = buildReorder(ids, C, reader: reader, enabled: opts.reorderBySegment)
@@ -265,13 +278,19 @@ public extension IndexOps.Rerank {
         // Decide single-thread vs parallel
         let parallel = opts.enableParallel && C >= max(opts.parallelThreshold, tile * 2)
         if !parallel {
-            // Single-thread path
-            let scratch = UnsafeMutablePointer<Float>.allocate(capacity: tile * d)
-            defer { scratch.deallocate() }
-            let present = UnsafeMutablePointer<UInt8>.allocate(capacity: tile)
-            defer { present.deallocate() }
-            let tileScores = UnsafeMutablePointer<Float>.allocate(capacity: tile)
-            defer { tileScores.deallocate() }
+            // Single-thread path. Buffers sized `tile`/`tile*d` -- identical
+            // sizing whether allocated here or supplied by the caller, since
+            // the caller (rerank_exact_topk_batch) computes `tile` from the
+            // same `opts.gatherTile` it passes down.
+            let ownsScratch = scratchIn == nil
+            let scratch = scratchIn ?? UnsafeMutablePointer<Float>.allocate(capacity: tile * d)
+            defer { if ownsScratch { scratch.deallocate() } }
+            let ownsPresent = presentIn == nil
+            let present = presentIn ?? UnsafeMutablePointer<UInt8>.allocate(capacity: tile)
+            defer { if ownsPresent { present.deallocate() } }
+            let ownsTileScores = tileScoresIn == nil
+            let tileScores = tileScoresIn ?? UnsafeMutablePointer<Float>.allocate(capacity: tile)
+            defer { if ownsTileScores { tileScores.deallocate() } }
 
             var i = 0
             while i < C {
@@ -673,12 +692,38 @@ public extension IndexOps.Rerank {
         scoreBlock(q: q, d: d, metric: metric, ids: candIDs, C: C, reader: reader, opts: opts, scoresOut: scoresOut, presentMaskOut: nil)
     }
 
-    /// Top-K (single query)
+    /// Top-K (single query). Thin wrapper: allocates no scratch of its own,
+    /// delegates to `_rerank_exact_topk_impl` with `nil` scratch buffers
+    /// (allocate-locally, matching pre-P6c behavior).
     static func rerank_exact_topk(
         q: UnsafePointer<Float>, d: Int, metric: SupportedDistanceMetric,
         candIDs: UnsafePointer<Int64>, C: Int, K: Int,
         reader: any VectorReader, opts: RerankOpts,
         topScores: UnsafeMutablePointer<Float>, topIDs: UnsafeMutablePointer<Int64>
+    ) {
+        _rerank_exact_topk_impl(
+            q: q, d: d, metric: metric, candIDs: candIDs, C: C, K: K,
+            reader: reader, opts: opts, topScores: topScores, topIDs: topIDs,
+            scratch: nil, present: nil, tileScores: nil)
+    }
+
+    /// Top-K (single query), P6c scratch-threading variant. `scratch`/
+    /// `present`/`tileScores` are optional externally-owned tile-sized
+    /// buffers (`tile*d`/`tile`/`tile`, where `tile = max(1, opts.gatherTile)`)
+    /// forwarded to `scoreBlock`'s single-thread path; `nil` for any of them
+    /// falls back to that buffer being allocated locally per-call, i.e. the
+    /// pre-existing per-query-call allocation behavior. `rerank_exact_topk`
+    /// always passes `nil` for all three (unchanged public behavior);
+    /// `rerank_exact_topk_batch` allocates them once and reuses them across
+    /// every query in the batch.
+    internal static func _rerank_exact_topk_impl(
+        q: UnsafePointer<Float>, d: Int, metric: SupportedDistanceMetric,
+        candIDs: UnsafePointer<Int64>, C: Int, K: Int,
+        reader: any VectorReader, opts: RerankOpts,
+        topScores: UnsafeMutablePointer<Float>, topIDs: UnsafeMutablePointer<Int64>,
+        scratch: UnsafeMutablePointer<Float>?,
+        present: UnsafeMutablePointer<UInt8>?,
+        tileScores: UnsafeMutablePointer<Float>?
     ) {
         precondition(K <= C && K >= 0)
 
@@ -687,7 +732,7 @@ public extension IndexOps.Rerank {
         var presentMask = [UInt8](repeating: 0, count: C)
         scores.withUnsafeMutableBufferPointer { sb in
             presentMask.withUnsafeMutableBufferPointer { pb in
-                scoreBlock(q: q, d: d, metric: metric, ids: candIDs, C: C, reader: reader, opts: opts, scoresOut: sb.baseAddress!, presentMaskOut: pb.baseAddress!)
+                scoreBlock(q: q, d: d, metric: metric, ids: candIDs, C: C, reader: reader, opts: opts, scoresOut: sb.baseAddress!, presentMaskOut: pb.baseAddress!, scratchIn: scratch, presentIn: present, tileScoresIn: tileScores)
             }
         }
 
@@ -769,6 +814,19 @@ public extension IndexOps.Rerank {
     }
 
     // MARK: - Batched Top-K
+    // P6c: the three tile-sized scratch buffers `scoreBlock`'s single-thread
+    // path needs (`scratch`: tile*d, `present`/`tileScores`: tile) are
+    // allocated ONCE here and reused across every query in the batch, instead
+    // of each `rerank_exact_topk` call (transitively, each `scoreBlock` call)
+    // reallocating them -- O(b) allocations collapsed to O(1). Sequential
+    // `for qi in 0..<b` loop: each `_rerank_exact_topk_impl` call fully
+    // completes (single-threaded use of these buffers) before the next
+    // begins, so reuse across iterations is safe. Sized from `opts.gatherTile`
+    // exactly as `scoreBlock` would size them itself, since `opts` flows
+    // through unchanged. If a given query's candidate count triggers
+    // `scoreBlock`'s parallel path, these buffers are simply left unused for
+    // that call -- the parallel path always allocates its own per-task
+    // scratch (see `scoreBlock`'s doc comment).
     static func rerank_exact_topk_batch(
         Q: UnsafePointer<Float>, b: Int, d: Int, metric: SupportedDistanceMetric,
         candOffsets: UnsafePointer<Int64>,  // [b+1]
@@ -778,13 +836,25 @@ public extension IndexOps.Rerank {
         topScores: UnsafeMutablePointer<Float>, // [b*K]
         topIDs: UnsafeMutablePointer<Int64>     // [b*K]
     ) {
+        let tile = max(1, opts.gatherTile)
+        let scratch = UnsafeMutablePointer<Float>.allocate(capacity: tile * d)
+        defer { scratch.deallocate() }
+        let present = UnsafeMutablePointer<UInt8>.allocate(capacity: tile)
+        defer { present.deallocate() }
+        let tileScores = UnsafeMutablePointer<Float>.allocate(capacity: tile)
+        defer { tileScores.deallocate() }
+
         for qi in 0..<b {
             let qPtr = Q.advanced(by: qi * d)
             let start = Int(candOffsets[qi])
             let end   = Int(candOffsets[qi + 1])
             let C     = end - start
             let ids   = candIDs.advanced(by: start)
-            rerank_exact_topk(q: qPtr, d: d, metric: metric, candIDs: ids, C: C, K: K, reader: reader, opts: opts, topScores: topScores.advanced(by: qi * K), topIDs: topIDs.advanced(by: qi * K))
+            _rerank_exact_topk_impl(
+                q: qPtr, d: d, metric: metric, candIDs: ids, C: C, K: K,
+                reader: reader, opts: opts,
+                topScores: topScores.advanced(by: qi * K), topIDs: topIDs.advanced(by: qi * K),
+                scratch: scratch, present: present, tileScores: tileScores)
         }
     }
 }

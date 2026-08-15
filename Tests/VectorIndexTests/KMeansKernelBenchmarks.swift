@@ -643,6 +643,50 @@ final class KMeansKernelBenchmarks: XCTestCase {
         }
     }
 
+    // MARK: - PQTrain l2Sq Micro-benchmark (P6a)
+
+    /// Micro-benchmark for PQTrain's `l2Sq` distance primitive (scalar vs dual-SIMD4).
+    ///
+    /// Gating note: unlike the rest of this file (which gates on the hardcoded
+    /// `benchmarksEnabled` flag above, intended for the slow multi-minute suites),
+    /// this test gates on the `RUN_BENCHMARKS` env var, matching the pattern used by
+    /// sibling files `IVFSelectBenchmarks.swift` / `MmapAppendBenchmark.swift` in this
+    /// test target. This lets the fast micro-bench be invoked on demand
+    /// (`RUN_BENCHMARKS=1 swift test -c release --filter ...`) without flipping
+    /// `benchmarksEnabled`, which would also unskip the slow suites above.
+    func testPerformance_PQTrainL2SqMicro() throws {
+        guard ProcessInfo.processInfo.environment["RUN_BENCHMARKS"] == "1" else {
+            throw XCTSkip("Benchmarks disabled by default. Set RUN_BENCHMARKS=1 to enable.")
+        }
+        // 1M pairs at dsub=32: representative PQ-subspace shape.
+        //
+        // NOTE: the brief's original sketch reused one fixed (a, b) pair for all 1M
+        // calls. Measured that way, this bench reports ~1.5ns/call with a sink value
+        // that equals (to within FP error) pairs * l2Sq(a, b, dsub) computed once --
+        // i.e. the optimizer hoists the loop-invariant call across the module
+        // boundary instead of measuring 1M real invocations. To defeat that, walk a
+        // circular buffer of `bufN` distinct dsub-vectors with a runtime-varying
+        // offset (k % bufN), keeping everything cache-resident but making each call's
+        // inputs unpredictable at compile time.
+        let dsub = 32, pairs = 1_000_000, bufN = 1024
+        var aBuf = [Float](repeating: 0, count: bufN * dsub)
+        var bBuf = [Float](repeating: 0, count: bufN * dsub)
+        for i in 0..<(bufN * dsub) {
+            aBuf[i] = Float(i % 97) * 0.5
+            bBuf[i] = Float(i % 89) * 0.25 + 1
+        }
+        var sink: Float = 0
+        let t0 = DispatchTime.now()
+        aBuf.withUnsafeBufferPointer { ap in bBuf.withUnsafeBufferPointer { bp in
+            for k in 0..<pairs {
+                let off = (k % bufN) * dsub
+                sink += pqTrainL2SqForBench(ap.baseAddress! + off, bp.baseAddress! + off, dsub)
+            }
+        }}
+        let sec = Double(DispatchTime.now().uptimeNanoseconds - t0.uptimeNanoseconds) / 1e9
+        print("l2Sq micro: \(pairs) pairs dsub=\(dsub) in \(sec)s (sink \(sink))")
+    }
+
     // MARK: - Helper Functions
 
     private func generateRandomData(n: Int, d: Int) -> [Float] {

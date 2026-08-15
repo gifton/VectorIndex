@@ -717,6 +717,7 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
         guard idx >= 0 && idx < nodes.count else { return }
         guard level >= 0 && level < nodes[idx].neighbors.count else { return }
         let current = nodes[idx].neighbors[level]
+        assert(!current.contains(idx), "neighbor list must never contain the node itself")
         if current.isEmpty { nodes[idx].neighbors[level].removeAll(keepingCapacity: false); return }
 
         let N = nodes.count
@@ -760,66 +761,273 @@ public actor HNSWIndex: VectorIndexProtocol, AccelerableIndex {
     }
 
     // MARK: - Layer Search
-    private func greedySearchLayer(_ query: [Float], enter: Int, level: Int) -> Int {
-        var cur = enter
-        var curDist = distance(query, vectorArray(at: cur), metric: metric)
-        var changed = true
-        while changed {
-            changed = false
-            for n in nodes[cur].neighbors[safe: level] ?? [] {
-                let d = distance(query, vectorArray(at: n), metric: metric)
-                if d < curDist {
-                    curDist = d
-                    cur = n
-                    changed = true
-                }
+
+    // P1: bounded-free min-heap over (distance, arrival sequence). Pop order
+    // reproduces the old linear-scan pop exactly: strictly smallest distance
+    // first; among equal distances, the earliest-pushed entry.
+    private struct CandidateHeap {
+        private var dists: [Float] = []
+        private var seqs: [Int32] = []
+        private var ids: [Int32] = []
+        private var nextSeq: Int32 = 0
+
+        var isEmpty: Bool { dists.isEmpty }
+
+        mutating func reserveCapacity(_ n: Int) {
+            dists.reserveCapacity(n); seqs.reserveCapacity(n); ids.reserveCapacity(n)
+        }
+
+        @inline(__always) private func precedes(_ i: Int, _ j: Int) -> Bool {
+            dists[i] != dists[j] ? dists[i] < dists[j] : seqs[i] < seqs[j]
+        }
+
+        @inline(__always) private mutating func swapAt(_ a: Int, _ b: Int) {
+            dists.swapAt(a, b); seqs.swapAt(a, b); ids.swapAt(a, b)
+        }
+
+        mutating func push(id: Int32, dist: Float) {
+            dists.append(dist); seqs.append(nextSeq); ids.append(id); nextSeq &+= 1
+            var c = dists.count - 1
+            while c > 0 {
+                let p = (c - 1) >> 1
+                if precedes(c, p) { swapAt(c, p); c = p } else { break }
             }
         }
-        return cur
+
+        mutating func popMin() -> (id: Int32, dist: Float) {
+            let outID = ids[0], outDist = dists[0]
+            let last = dists.count - 1
+            swapAt(0, last)
+            dists.removeLast(); seqs.removeLast(); ids.removeLast()
+            var p = 0
+            while true {
+                let l = 2 * p + 1, r = l + 1
+                var m = p
+                if l < dists.count, precedes(l, m) { m = l }
+                if r < dists.count, precedes(r, m) { m = r }
+                if m == p { break }
+                swapAt(p, m); p = m
+            }
+            return (outID, outDist)
+        }
     }
 
-    private func searchLayer(_ query: [Float], enter: Int, ef: Int, level: Int) -> [Int] {
-        // Candidate list (min by distance)
-        var candidates: [(Int, Float)] = []
-        // Result set (kept sorted ascending by distance)
-        var result: [(Int, Float)] = []
-        var visited = Set<Int>()
-
-        let enterDist = distance(query, vectorArray(at: enter), metric: metric)
-        candidates.append((enter, enterDist))
-        result.append((enter, enterDist))
-        visited.insert(enter)
-
-        while !candidates.isEmpty {
-            // Pop best candidate
-            var bestIdx = 0
-            for i in 1..<candidates.count { if candidates[i].1 < candidates[bestIdx].1 { bestIdx = i } }
-            let (cand, candDist) = candidates.remove(at: bestIdx)
-
-            // If this candidate is worse than the worst in result and result is full, we can stop
-            if result.count >= ef, let worst = result.last, candDist > worst.1 { break }
-
-            for n in nodes[cand].neighbors[safe: level] ?? [] {
-                if visited.insert(n).inserted, !nodes[n].isDeleted {
-                    let d = distance(query, vectorArray(at: n), metric: metric)
-                    // Maintain result set up to ef
-                    if result.count < ef || d < (result.last?.1 ?? .infinity) {
-                        // Insert into candidates
-                        candidates.append((n, d))
-                        // Insert sorted into result
-                        insertSorted(&result, (n, d))
-                        if result.count > ef { _ = result.popLast() }
+    /// Gathers `batchIDs`' vectors from `xBase` into `gather` (growing the
+    /// caller-owned scratch buffers on demand, never allocating per-neighbor),
+    /// scores them against the query in ONE `ScoreBlock` call, and writes
+    /// "smaller is better" distances into `scores[0..<batchIDs.count]`.
+    /// Ordering-equivalent to the old per-neighbor
+    /// `distance(query, vectorArray(at:), metric:)` calls: euclidean keeps L2^2
+    /// (monotone in the old `sqrt(L2^2)`); dot/cosine convert ScoreBlock's
+    /// higher-is-better similarity into the old lower-is-better distance.
+    ///
+    /// Not a nested closure/function on purpose: under this package's
+    /// StrictConcurrency setting, a local function capturing an
+    /// `UnsafePointer`-bearing optional (`CosineNormsHandle?`) across two
+    /// levels of `withUnsafeBufferPointer` closures runs into spurious
+    /// capture diagnostics. Taking every pointer as an explicit parameter of
+    /// a plain (non-nested) actor method sidesteps that entirely.
+    ///
+    /// POINTER-LIFETIME: `qPtr`/`xBase`/`invNormsPtr` are only valid for the
+    /// duration of this call (owned by the caller's `withUnsafeBufferPointer`
+    /// scopes) and never escape it. The `CosineNormsHandle` wrapping a
+    /// pointer into `gatherInv` is constructed and consumed entirely inside
+    /// `gatherInv`'s own `withUnsafeBufferPointer` scope below -- it is never
+    /// stored. This method reads `nodes[_].vectorOffset` but performs no
+    /// mutation of `vectorStorage`/`nodes`.
+    private func scoreBatch(
+        _ batchIDs: [Int],
+        qPtr: UnsafePointer<Float>,
+        xBase: UnsafePointer<Float>,
+        d: Int,
+        invNormsPtr: UnsafePointer<Float>?,
+        qInvNorm: Float?,
+        gather: inout [Float],
+        gatherInv: inout [Float],
+        scores: inout [Float]
+    ) {
+        let n = batchIDs.count
+        if gather.count < n * d { gather = [Float](repeating: 0, count: n * d) }
+        if scores.count < n { scores = [Float](repeating: 0, count: n) }
+        gather.withUnsafeMutableBufferPointer { gb in
+            for (i, id) in batchIDs.enumerated() {
+                (gb.baseAddress! + i * d)
+                    .update(from: xBase + nodes[id].vectorOffset, count: d)
+            }
+        }
+        if metric == .cosine, let inv = invNormsPtr {
+            if gatherInv.count < n { gatherInv = [Float](repeating: 0, count: n) }
+            for (i, id) in batchIDs.enumerated() { gatherInv[i] = inv[id] }
+            gatherInv.withUnsafeBufferPointer { ib in
+                let handle = IndexOps.Scoring.ScoreBlock.CosineNormsHandle(
+                    dbInvNormsF32: ib.baseAddress, dbInvNormsF16: nil,
+                    queryInvNorm: qInvNorm, epsilon: 1e-12)
+                gather.withUnsafeBufferPointer { gb in
+                    scores.withUnsafeMutableBufferPointer { sb in
+                        IndexOps.Scoring.ScoreBlock.run(
+                            q: qPtr, xb: gb.baseAddress!, n: n, d: d,
+                            metric: metric, out: sb.baseAddress!, cosineNorms: handle)
+                        // cosine similarity -> "smaller is better" distance,
+                        // matching old distance()'s `1 - sim`.
+                        for i in 0..<n { sb[i] = 1 - sb[i] }
+                    }
+                }
+            }
+        } else {
+            gather.withUnsafeBufferPointer { gb in
+                scores.withUnsafeMutableBufferPointer { sb in
+                    IndexOps.Scoring.ScoreBlock.run(
+                        q: qPtr, xb: gb.baseAddress!, n: n, d: d,
+                        metric: metric, out: sb.baseAddress!, cosineNorms: nil)
+                    switch metric {
+                    case .euclidean:
+                        // L2^2 via IndexOps.Scoring.L2Sqr, which at d>=256
+                        // (this call site: d=384) selects the dot-trick
+                        // expansion ||q||^2 + ||x||^2 - 2<q,x> rather than a
+                        // direct sum-of-squared-differences reduction.
+                        // Ordering-equivalent to the old sqrt'd per-pair
+                        // distance() in exact arithmetic only -- not
+                        // bit-for-bit; FP cancellation is possible for
+                        // near-duplicate vectors. This is also the same
+                        // kernel the query path (HNSWTraversal) and the #34
+                        // neighbor-selection kernel already use, so this
+                        // rewrite makes construction numerically consistent
+                        // with them rather than introducing a new algorithm.
+                        break
+                    case .dotProduct: for i in 0..<n { sb[i] = -sb[i] }
+                    case .cosine:     for i in 0..<n { sb[i] = 1 - sb[i] }
+                    default: break   // ScoreBlock fallback already returns distances
                     }
                 }
             }
         }
-        return result.map { $0.0 }
     }
 
-    private func insertSorted(_ array: inout [(Int, Float)], _ element: (Int, Float)) {
-        // insertion into ascending array by distance
-        let pos = array.firstIndex(where: { $0.1 > element.1 }) ?? array.count
-        array.insert(element, at: pos)
+    private func greedySearchLayer(_ query: [Float], enter: Int, level: Int) -> Int {
+        let d = dimension
+        let invNormsPtr: UnsafePointer<Float>? =
+            (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
+
+        return query.withUnsafeBufferPointer { qbp -> Int in
+            vectorStorage.withUnsafeBufferPointer { xbp -> Int in
+                let qPtr = qbp.baseAddress!
+                let xBase = xbp.baseAddress!
+                let qInvNorm: Float? = (metric == .cosine)
+                    ? 1.0 / (IndexOps.Support.Norms.l2NormSquared(vector: qPtr, dimension: d)
+                                 .squareRoot() + 1e-12)
+                    : nil
+
+                // Reused scratch buffers (grown on demand, never per-neighbor).
+                var gather: [Float] = []
+                var gatherInv: [Float] = []
+                var scores: [Float] = []
+
+                var cur = enter
+                scoreBatch([cur], qPtr: qPtr, xBase: xBase, d: d, invNormsPtr: invNormsPtr,
+                           qInvNorm: qInvNorm, gather: &gather, gatherInv: &gatherInv, scores: &scores)
+                var curDist = scores[0]
+
+                var changed = true
+                while changed {
+                    changed = false
+                    // Snapshot cur's neighbor list BEFORE any reassignment in
+                    // this pass -- matches the old `for n in
+                    // nodes[cur].neighbors[...]` semantics, whose sequence
+                    // expression was evaluated once even though `cur` (and
+                    // hence what "nodes[cur]" would mean) changes mid-loop.
+                    let neighborIDs = nodes[cur].neighbors[safe: level] ?? []
+                    guard !neighborIDs.isEmpty else { continue }
+                    // NOTE: does NOT skip deleted nodes -- matches current behavior exactly.
+                    scoreBatch(neighborIDs, qPtr: qPtr, xBase: xBase, d: d, invNormsPtr: invNormsPtr,
+                               qInvNorm: qInvNorm, gather: &gather, gatherInv: &gatherInv, scores: &scores)
+                    for i in 0..<neighborIDs.count {
+                        let nd = scores[i]
+                        if nd < curDist {
+                            curDist = nd
+                            cur = neighborIDs[i]
+                            changed = true
+                        }
+                    }
+                }
+                return cur
+            }
+        }
+    }
+
+    private func searchLayer(_ query: [Float], enter: Int, ef: Int, level: Int) -> [Int] {
+        let d = dimension
+        let invNormsPtr: UnsafePointer<Float>? =
+            (metric == .cosine) ? rebuildInvNormsIfNeededForCosine() : nil
+
+        return query.withUnsafeBufferPointer { qbp -> [Int] in
+            vectorStorage.withUnsafeBufferPointer { xbp -> [Int] in
+                let qPtr = qbp.baseAddress!
+                let xBase = xbp.baseAddress!
+                let qInvNorm: Float? = (metric == .cosine)
+                    ? 1.0 / (IndexOps.Support.Norms.l2NormSquared(vector: qPtr, dimension: d)
+                                 .squareRoot() + 1e-12)
+                    : nil
+
+                var heap = CandidateHeap()
+                heap.reserveCapacity(2 * ef)
+                // Result set (kept sorted ascending by distance).
+                var resIDs: [Int] = []; var resDists: [Float] = []
+                resIDs.reserveCapacity(ef + 1); resDists.reserveCapacity(ef + 1)
+                var visited = Set<Int>()
+
+                // Reused per-expansion scratch (grown on demand, never per-neighbor).
+                var batchIDs: [Int] = []
+                var gather: [Float] = []
+                var gatherInv: [Float] = []
+                var scores: [Float] = []
+
+                @inline(__always) func insertResult(_ id: Int, _ dist: Float) {
+                    // Upper-bound binary search: ties land AFTER equal entries,
+                    // matching the old insertSorted's arrival-order tie-break.
+                    var lo = 0, hi = resDists.count
+                    while lo < hi {
+                        let mid = (lo + hi) >> 1
+                        if resDists[mid] > dist { hi = mid } else { lo = mid + 1 }
+                    }
+                    resIDs.insert(id, at: lo); resDists.insert(dist, at: lo)
+                    if resIDs.count > ef { resIDs.removeLast(); resDists.removeLast() }
+                }
+
+                scoreBatch([enter], qPtr: qPtr, xBase: xBase, d: d, invNormsPtr: invNormsPtr,
+                           qInvNorm: qInvNorm, gather: &gather, gatherInv: &gatherInv, scores: &scores)
+                let enterDist = scores[0]
+                heap.push(id: Int32(enter), dist: enterDist)
+                insertResult(enter, enterDist)
+                visited.insert(enter)
+
+                while !heap.isEmpty {
+                    let (cand32, candDist) = heap.popMin()
+                    // If this candidate is worse than the worst in result and result is full, stop.
+                    if resIDs.count >= ef, let worst = resDists.last, candDist > worst { break }
+
+                    batchIDs.removeAll(keepingCapacity: true)
+                    for n in nodes[Int(cand32)].neighbors[safe: level] ?? [] {
+                        // Node is marked visited before the deleted-check;
+                        // deleted nodes are consumed from `visited` but never scored.
+                        if visited.insert(n).inserted, !nodes[n].isDeleted {
+                            batchIDs.append(n)
+                        }
+                    }
+                    guard !batchIDs.isEmpty else { continue }
+                    scoreBatch(batchIDs, qPtr: qPtr, xBase: xBase, d: d, invNormsPtr: invNormsPtr,
+                               qInvNorm: qInvNorm, gather: &gather, gatherInv: &gatherInv, scores: &scores)
+                    for (i, nid) in batchIDs.enumerated() {
+                        let nd = scores[i]
+                        // Maintain result set up to ef.
+                        if resIDs.count < ef || nd < (resDists.last ?? .infinity) {
+                            heap.push(id: Int32(nid), dist: nd)
+                            insertResult(nid, nd)
+                        }
+                    }
+                }
+                return resIDs
+            }
+        }
     }
 
     // MARK: - Utilities
@@ -851,6 +1059,24 @@ extension HNSWIndex {
 
     /// Whether the inverse-norm cache is currently marked dirty.
     internal var _testInvNormsCacheIsDirty: Bool { invNormsDirty }
+
+    // Test-only structural snapshot (internal, reached via @testable): full
+    // adjacency so determinism failures diff meaningfully instead of hashing.
+    internal struct HNSWGraphSnapshot: Equatable, Sendable {
+        let entryPoint: Int?
+        let maxLevel: Int
+        let levels: [Int]
+        let adjacency: [[[Int]]]   // [node][level][neighbor]
+    }
+
+    internal func _testGraphSnapshot() -> HNSWGraphSnapshot {
+        HNSWGraphSnapshot(
+            entryPoint: entryPoint,
+            maxLevel: maxLevel,
+            levels: nodes.map { $0.level },
+            adjacency: nodes.map { $0.neighbors }
+        )
+    }
 }
 
 // MARK: - Kernel #33: Traversal caches and builders
@@ -1148,6 +1374,7 @@ extension HNSWIndex {
                     if let nn = remap[oldN] { mapped.append(nn) }
                 }
                 // prune to M
+                // Defensive: pruneNeighbors bounds lists to ≤ m during construction, so remap cannot exceed m; kept as a guard for future insert-path changes. No public-API fixture reaches this (verified 2026-07-31, Phase 3 Task 14).
                 if mapped.count > config.m {
                     let nodeOffset = newNodes[i].vectorOffset
                     let nodeVec = Array(newVectorStorage[nodeOffset..<(nodeOffset + dim)])

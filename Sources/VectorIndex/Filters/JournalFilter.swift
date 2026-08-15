@@ -89,10 +89,15 @@ public struct JournalFilter: Sendable {
             // Date check (ISO-8601) – parse if configured
             if let range = dateRange {
                 if let dateStr = meta[dateKey] {
-                    // Use a fresh formatter per call to avoid thread-safety issues
-                    let fmt = ISO8601DateFormatter()
-                    fmt.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-                    let date = fmt.date(from: dateStr) ?? ISO8601DateFormatter().date(from: dateStr)
+                    // P6c: thread-local cached formatters instead of a fresh
+                    // ISO8601DateFormatter() per call (two allocations per
+                    // invocation, on a potentially hot filter path). Each
+                    // formatter is confined to the thread that created it
+                    // (never stored/read across threads), so this preserves
+                    // the original thread-safety rationale exactly while
+                    // amortizing the allocation to once per thread.
+                    let date = cachedISO8601Formatter(fractional: true).date(from: dateStr)
+                        ?? cachedISO8601Formatter(fractional: false).date(from: dateStr)
                     guard let dd = date, range.contains(dd) else { return false }
                 } else if !includeIfMissing {
                     return false
@@ -148,4 +153,23 @@ public struct JournalFilter: Sendable {
         jf.custom = custom
         return jf.build()
     }
+}
+
+// MARK: - ISO8601 formatter cache (P6c)
+//
+// `JournalFilter.build()`'s returned closure is `@Sendable` and may run
+// concurrently across threads (see the call site's comment). Each thread
+// gets its own cached `ISO8601DateFormatter` via `Thread.current
+// .threadDictionary`, so instances are never read or written across
+// threads -- the same "no cross-thread sharing" guarantee the original
+// per-call `ISO8601DateFormatter()` construction relied on -- but the
+// allocation is amortized to once per thread instead of twice per call.
+private func cachedISO8601Formatter(fractional: Bool) -> ISO8601DateFormatter {
+    let key = fractional ? "vindex.journal.iso8601.frac" : "vindex.journal.iso8601.plain"
+    let dict = Thread.current.threadDictionary
+    if let f = dict[key] as? ISO8601DateFormatter { return f }
+    let f = ISO8601DateFormatter()
+    if fractional { f.formatOptions = [.withInternetDateTime, .withFractionalSeconds] }
+    dict[key] = f
+    return f
 }

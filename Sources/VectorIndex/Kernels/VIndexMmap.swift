@@ -213,6 +213,87 @@ internal final class IndexMmap {
     private(set) public var codeGroupG: Int = 0
     private(set) public var idBits: Int = 64
 
+    /// Total bytes hashed by `updateSectionCRC`/`recomputeAllSectionCRCs` over this handle's
+    /// lifetime. Instrumentation for the P4 deferred-CRC design: per-commit full-section CRC
+    /// recompute was the O(N^2) driver for durable ingestion (`mmap_append_commit` used to call
+    /// `updateSectionCRC` 3-4x per commit, each hashing the *entire* section). Commits must add
+    /// zero to this counter; only `flush()`/`close()`/unclean-reopen WAL repair should.
+    internal private(set) var crcBytesHashed: Int = 0
+
+    /// Number of `msync(2)` syscalls issued by `msyncPageAligned` over this handle's lifetime
+    /// (P5). Instrumentation for the ranged-flush fix: before P5, `msyncPageAligned` ignored its
+    /// `ptr`/`length` parameters and always flushed the entire mapping, so every one of the
+    /// (post-P4) 3-4 per-commit call sites paid for an `fileSize`-sized `msync` regardless of how
+    /// few bytes actually changed. Now each call flushes only the page-aligned range that was
+    /// actually touched.
+    internal private(set) var msyncCallCount: Int = 0
+
+    /// Total bytes covered by all `msync(2)` calls issued by `msyncPageAligned` over this
+    /// handle's lifetime (P5) -- the page-aligned, mapping-clamped range passed to each syscall,
+    /// summed. Paired with `msyncCallCount` as the deterministic gate for "ranged flush, not
+    /// whole-mapping flush": a tiny commit must add at most a few pages per call, not `fileSize`.
+    /// Incremented only after the underlying `msync(2)` call succeeds (fix round 1), so this
+    /// counter -- like `msyncCallCount` -- means "successfully flushed", not merely "attempted".
+    internal private(set) var msyncBytesFlushed: Int = 0
+
+    /// Number of `msync(2)` calls issued by `msyncPageAligned` that returned a nonzero result
+    /// (fix round 1). `msync` failing (EIO, ENOMEM, disk full, ...) means the page range was NOT
+    /// durably written back; every throwing call site surfaces that as a thrown error instead of
+    /// silently continuing, so in practice this counter stays 0 except on paths that deliberately
+    /// swallow the throw (e.g. `deinit`'s `try? close()`) -- it exists so even those paths leave
+    /// an observable trace that a flush failed, instead of the counters simply looking identical
+    /// to a fully successful run.
+    internal private(set) var msyncFailureCount: Int = 0
+
+    /// Set once resources are released (via `close()` or the test-only `_abandonWithoutClose()`)
+    /// so a subsequent `deinit`-triggered `close()` call is a safe no-op instead of a double
+    /// `Darwin.close(fd)`/`munmap` (the `fd` value can be reused by an unrelated open by then).
+    private var released = false
+
+    /// Set to `true` only at the very end of a fully-successful `indexInit()` (fix round 1, C1).
+    /// If `indexInit()` throws partway through (corrupt-CRC, misaligned section, unknown
+    /// section type, ...), `open()`'s local `idx` reference count drops to zero and `deinit`
+    /// runs `try? close()` on the half-initialized instance. Without this gate, a writable
+    /// `close()` would call `flush()` → `recomputeAllSectionCRCs()`, which recomputes CRCs from
+    /// whatever bytes are currently on disk — including the *corrupt* bytes that just failed
+    /// verification — and persists them, self-certifying the corruption and permanently
+    /// destroying detectability on every future open. `close()` only calls `flush()` when this
+    /// is `true`, i.e. only for handles that actually completed `indexInit()`.
+    private var initialized = false
+
+    /// `false` exactly while `base` is dangling: `ensureFileCapacity`'s remap clears this right
+    /// before `munmap`-ing the old mapping, and only sets it back once the replacement `mmap()`
+    /// call succeeds (fix round 1, I3). If that `mmap()` fails, `ensureFileCapacity` throws with
+    /// this still `false`, and `base` stays dangling for the rest of this handle's life (the
+    /// growth path itself is out of scope for that repair — see the task-3 brief). `flush()` and
+    /// `close()`'s own msync/munmap both check this before touching `base`, so a later `close()`
+    /// (including the one `deinit` runs) degrades to releasing just the file descriptors instead
+    /// of dereferencing/rewriting through a pointer into unmapped (possibly since-reused) address
+    /// space.
+    private var mappingValid = true
+
+    /// Set when `mmap_append_begin`'s growth branch's call to `writeListDescOffsets` throws
+    /// (fix round 2). `writeListDescOffsets` writes the new `idsOff`/`codesOff`/`vecsOff`/
+    /// `capacity`/strides into the mapped ListsDesc record via `memcpy`/`writeLE*` *before*
+    /// calling `msyncPageAligned` on that record — those writes land in the live mapping
+    /// immediately (mmap writes are visible to the same process's own mapping independent of
+    /// `msync`), regardless of whether the flush that follows succeeds. If `msyncPageAligned`
+    /// then throws, the growth branch's own `tailIDs`/`tailCodes`/`tailVecs` watermark update
+    /// (a few lines later, only reached on success) never runs — so the on-disk descriptor now
+    /// claims a region (`newIDsOff`/`newCodesOff`/`newVecsOff`, `newCapacity`) that this
+    /// handle's in-memory watermarks don't know about. A later growth on this *same* live
+    /// handle would then compute its next offset from the stale (lower) watermark, silently
+    /// overlapping the region the descriptor already claims — cross-list aliasing with no error
+    /// signal. Reopening is unaffected and safe: the WAL growth sentinel written earlier in the
+    /// same branch (fix round 1, I2) routes the next open through WAL replay + CRC recompute +
+    /// a fresh tail rebuild (`indexInit`'s TOC-loop, and `ensureFileCapacity`'s own post-remap
+    /// rebuild, both scan every list descriptor from scratch). Rather than try to repair the
+    /// watermarks in place on a handle whose underlying storage is already failing I/O, this
+    /// flag poisons the handle for further growth: `mmap_append_begin` throws immediately on
+    /// entry once this is `true`, directing the caller to reopen instead of risking silent
+    /// corruption on a handle that can no longer be trusted to track free space correctly.
+    private var growthPoisoned = false
+
     private var secCentroids: UnsafePointer<Float>?
     private var secCodebooks: UnsafePointer<Float>?
     private var secCentroidNorms: UnsafePointer<Float>?
@@ -365,10 +446,72 @@ internal final class IndexMmap {
     public var fileEndianness: Endian { fileEndian }
 
     public func close() throws {
+        guard !released else { return }
+        released = true
+        // Clean-shutdown path (P4): recompute+persist every section CRC and truncate the WAL
+        // to 0 bytes *before* unmapping. An empty WAL is this format's clean/unclean marker
+        // (see indexInit's walDirty branch) — only writable handles hold a WAL fd, so this is
+        // a no-op for read-only handles (flush() itself also guards on opts.readOnly).
+        // `initialized` (C1) additionally gates this: a handle whose indexInit() never finished
+        // must not self-certify whatever bytes are currently on disk. flush() independently
+        // re-checks `mappingValid` (I3) before touching `base`.
+        //
+        // flush()'s error (if any) is captured rather than propagated immediately: `released`
+        // is already latched above, so an early `throw` here would skip the munmap/fd cleanup
+        // below and — because `released` blocks any later retry, including the one `deinit`
+        // would otherwise attempt — leak the mapping and both file descriptors permanently.
+        // Resources are always released; a flush failure is still surfaced to the caller, just
+        // after cleanup has run.
+        var flushError: Error?
+        if !opts.readOnly && initialized {
+            do { try flush() } catch { flushError = error }
+        }
         if walFD >= 0 { _ = Darwin.close(walFD); walFD = -1 }
-        _ = msync(base, Int(fileSize), MS_SYNC)
-        _ = munmap(base, Int(fileSize))
+        // I3: `base` is dangling whenever a growth-triggered remap's `mmap()` call failed after
+        // its `munmap()` of the old mapping already ran (see ensureFileCapacity). Touching `base`
+        // in that state — even via msync/munmap — is unsafe (undefined behavior; on some
+        // platforms these can also fail loudly rather than silently). Skip both and still release
+        // the file descriptors below.
+        if mappingValid {
+            _ = msync(base, Int(fileSize), MS_SYNC)
+            _ = munmap(base, Int(fileSize))
+        }
         _ = Darwin.close(fd)
+        if let flushError { throw flushError }
+    }
+
+    /// Test-only: releases OS resources (WAL fd, mapping, file fd) WITHOUT running `flush()` —
+    /// no section-CRC recompute, no WAL truncate. Simulates exactly what a process crash leaves
+    /// on disk (payload bytes and the ListsDesc length bump already durable per-commit via their
+    /// own msyncs; section CRCs stale; WAL non-empty) so tests can exercise the unclean-reopen
+    /// repair path without an actual crash. Marks the handle released so a later `deinit` does
+    /// not attempt a second, corrupting close. Not part of the durability contract — production
+    /// code must always call `close()`.
+    internal func _abandonWithoutClose() {
+        guard !released else { return }
+        released = true
+        if walFD >= 0 { _ = Darwin.close(walFD); walFD = -1 }
+        if mappingValid { _ = munmap(base, Int(fileSize)) }
+        _ = Darwin.close(fd)
+    }
+
+    /// Test-only (fix round 1, I3): marks the mapping invalid WITHOUT actually unmapping it, so
+    /// tests can verify `close()`/`flush()` skip all `base`-touching work when this invariant is
+    /// violated — exactly what `ensureFileCapacity` leaves behind after `munmap()` succeeds but
+    /// the replacement `mmap()` fails — without needing to force a real remap failure (OS/
+    /// environment-dependent, not reliably reproducible in a portable unit test). The real
+    /// mapping underneath is untouched; if the caller wants a fully clean teardown after this,
+    /// it must not rely on the (now `mappingValid`-gated) msync/munmap in `close()`.
+    internal func _simulateDanglingMapping() {
+        mappingValid = false
+    }
+
+    /// Test-only (fix round 2): sets `growthPoisoned` directly, without forcing a real
+    /// growth-path `msync` failure (not reliably/safely reproducible in a portable unit test --
+    /// see `growthPoisoned`'s doc comment and the task-4 report's fix-round-2 section for why).
+    /// Lets tests verify `mmap_append_begin` refuses to continue on a poisoned handle.
+    internal func _simulateGrowthPoisoned() {
+        growthPoisoned = true
     }
 
     private func slice(_ e: HostTOCEntry) -> UnsafeMutableRawPointer {
@@ -379,9 +522,48 @@ internal final class IndexMmap {
     private struct HostTOCEntry { var type: SectionType; var offset: UInt64; var size: UInt64; var align: UInt32; var flags: UInt32; var crc32: UInt32 }
     private func mapSection(_ ty: SectionType) -> HostTOCEntry? { tocByType[ty] }
 
-    @inline(__always) private func msyncPageAligned(_ ptr: UnsafeMutableRawPointer, _ length: Int) {
-        // Robust: flush whole mapping to avoid sub-page msync pitfalls on macOS
-        _ = msync(base, Int(fileSize), MS_SYNC)
+    /// Flushes exactly the touched `[ptr, ptr+length)` range to disk (P5), not the whole mapping.
+    /// `msync(2)` requires a page-aligned address and rejects a length that runs past the mapping,
+    /// so the start is rounded down to a page boundary, the end rounded up, and the result clamped
+    /// to `[base, base+fileSize)` before the syscall. Every existing call site already passes the
+    /// actual touched `ptr`/`length` (ids/codes/vecs memcpy destinations, the 64-byte ListsDesc
+    /// record, the 36-byte TOC entry, ...) -- this function previously discarded both parameters
+    /// and flushed `fileSize` bytes unconditionally, making every commit's 3-4 msync calls pay for
+    /// a whole-mapping flush regardless of how few bytes changed.
+    ///
+    /// Throws (fix round 1) when the underlying `msync(2)` call fails (EIO, ENOMEM, disk full,
+    /// ...): every call site sits inside a `throws` function (verified by audit -- see the task-4
+    /// report's fix-round-1 section), so a failed flush now surfaces as a thrown error instead of
+    /// being silently discarded. This matters specifically for `mmap_append_commit`: its contract
+    /// is "returning means the payload is durable," so a flush failure on the commit path MUST
+    /// prevent that return, not just log/count it. `msyncCallCount`/`msyncBytesFlushed` are
+    /// incremented only after the syscall succeeds, so they mean "successfully flushed";
+    /// `msyncFailureCount` is incremented on failure, before the throw, so telemetry stays honest
+    /// even on the few paths that deliberately swallow the error (`deinit`'s `try? close()`).
+    @inline(__always) private func msyncPageAligned(_ ptr: UnsafeMutableRawPointer, _ length: Int) throws {
+        guard length > 0 else { return }
+        let pageSize = Int(getpagesize())
+        let baseAddr = Int(bitPattern: base)
+        let start = Int(bitPattern: ptr)
+        // Round start down to a page boundary, end up, and clamp to the mapping.
+        let alignedStart = max(start & ~(pageSize - 1), baseAddr)
+        let alignedEnd = min((start + length + pageSize - 1) & ~(pageSize - 1),
+                             baseAddr + Int(fileSize))
+        let len = alignedEnd - alignedStart
+        guard len > 0 else { return }
+        let rc = msync(UnsafeMutableRawPointer(bitPattern: alignedStart)!, len, MS_SYNC)
+        if rc != 0 {
+            let err = errno
+            msyncFailureCount &+= 1
+            throw ErrorBuilder(.fileIOError, operation: "vindex_msync")
+                .message("Failed to flush mapped pages to disk")
+                .info("path", path)
+                .info("bytes", "\(len)")
+                .info("errno", "\(err)")
+                .build()
+        }
+        msyncCallCount &+= 1
+        msyncBytesFlushed &+= len
     }
 
     @inline(__always) private func writeLE32(_ p: UnsafeMutableRawPointer, _ v: UInt32) {
@@ -395,6 +577,28 @@ internal final class IndexMmap {
 
     private func indexInit() throws {
         debugLog("indexInit: tocCount=\(tocCount) fileSize=\(fileSize)")
+        // P4: the WAL file is the clean/unclean marker. A non-empty WAL means the last writer
+        // did not reach a clean flush()/close() (crash, or process still holding the handle
+        // elsewhere) — section CRCs are therefore untrustworthy until WAL replay + a recompute
+        // repairs them (done below, after the WAL fd is opened). Computed once, up front, so
+        // both the strict-verification gate below and the later repair branch agree.
+        let walDirty = walIsNonEmpty()
+        // Task 16a (audit finding): a read-only handle never opens a WAL fd (see the
+        // `!opts.readOnly` guard below), so it can never run the replay+recompute repair that a
+        // writable open performs for a dirty container. Before this guard, a dirty container
+        // opened read-only fell through the `!walDirty` clause of the strict-verification gate
+        // just below and got NEITHER verification NOR repair -- `opts.verifyCRCs = true` silently
+        // became a no-op instead of the loud failure a caller asking for verification expects.
+        // Fail loud here instead: a read-only caller that explicitly wants CRC verification on a
+        // container this handle cannot currently trust (and cannot repair) must be told so, with
+        // a clear path forward (reopen writable to repair). A read-only caller that opted OUT of
+        // verification (`verifyCRCs = false`) is unaffected -- it explicitly accepted this risk.
+        if opts.readOnly && walDirty && opts.verifyCRCs {
+            throw ErrorBuilder(.corruptedData, operation: "vindex_init")
+                .message("Container is unclean (crash-dirty WAL) and cannot be CRC-verified read-only; open writable to replay the WAL and repair the container, or pass verifyCRCs=false to accept the risk")
+                .info("wal_path", walPath)
+                .build()
+        }
         // Parse TOC as packed entries (36 bytes each)
         let DISK_TOC_ENTRY_SIZE = 36
         let tocRaw = UnsafeRawPointer(base).advanced(by: Int(toHost(header.toc_offset, fileEndian: fileEndian)))
@@ -423,7 +627,7 @@ internal final class IndexMmap {
                     .info("actual_alignment", "\(off % UInt64(al))")
                     .build()
             }
-            if opts.verifyCRCs && sz > 0 {
+            if opts.verifyCRCs && sz > 0 && !walDirty {
                 let p = UnsafeRawPointer(base).advanced(by: Int(off))
                 let crc = CRC32.hash(p, Int(sz))
                 let stored = readLE32(te.advanced(by: 28))
@@ -485,7 +689,24 @@ internal final class IndexMmap {
                     .info("errno", "\(errno)")
                     .build()
             }
+            if walDirty {
+                // Unclean-reopen repair (P4): strict section-CRC verification was skipped above
+                // because it cannot be trusted yet. Replay the WAL (its append/commit records are
+                // individually CRC'd — see mmap_wal_replay) to reconcile list lengths to the last
+                // committed payload, then recompute+persist every section CRC from the
+                // now-consistent bytes, and truncate the WAL back to empty (clean) so this repair
+                // doesn't repeat on the next open.
+                try mmap_wal_replay()
+                try recomputeAllSectionCRCs()
+                try msyncPageAligned(base, Int(fileSize))
+                try truncateWAL()
+            }
         }
+        // C1: only reached if every step above succeeded. Gates close()'s flush() call so a
+        // handle whose indexInit() threw (corrupt section CRC, misaligned section, ...) never
+        // has its (corrupt) on-disk bytes "repaired" into self-certified CRCs by the deinit ->
+        // close() path that runs when open()'s failed-init `idx` reference is released.
+        initialized = true
     }
 
     public func mmapCentroids() -> (ptr: UnsafePointer<Float>, kc: Int, d: Int)? {
@@ -567,7 +788,7 @@ internal final class IndexMmap {
                 memset(UnsafeMutableRawPointer(mutating: basePtr).advanced(by: blob.count), 0, maxSize - blob.count)
             }
         }
-        msyncPageAligned(UnsafeMutableRawPointer(mutating: basePtr), maxSize)
+        try msyncPageAligned(UnsafeMutableRawPointer(mutating: basePtr), maxSize)
         // Update CRC in TOC entry in-place
         try updateSectionCRC(.idMap)
     }
@@ -592,11 +813,75 @@ internal final class IndexMmap {
         let off = readLE64(UnsafeRawPointer(entryPtr).advanced(by: 4))
         let sz  = Int(readLE64(UnsafeRawPointer(entryPtr).advanced(by: 12)))
         let p = UnsafeRawPointer(base).advanced(by: Int(off))
+        crcBytesHashed += sz
         let newCRC = CRC32.hash(p, sz)
         writeLE32(entryPtr.advanced(by: 28), newCRC)
-        msyncPageAligned(entryPtr, DISK_TOC_ENTRY_SIZE)
+        try msyncPageAligned(entryPtr, DISK_TOC_ENTRY_SIZE)
         // also refresh cache
         if var e = tocByType[ty] { e.crc32 = newCRC; tocByType[ty] = e }
+    }
+
+    /// Recomputes and persists every section's CRC (P4). O(total container bytes), called only
+    /// from `flush()`/`close()` and from the unclean-reopen repair branch of `indexInit` — never
+    /// from the per-commit hot path.
+    private func recomputeAllSectionCRCs() throws {
+        for ty in tocByType.keys { try updateSectionCRC(ty) }
+    }
+
+    /// `ftruncate(walFD, 0)` + reset the write offset back to the start + `fsync`. Guards on
+    /// `walFD >= 0` so it is a no-op for read-only handles (which never open a WAL fd). Resetting
+    /// the offset matters: `writeWalAppend`/`writeWalCommit` write via the fd's current position
+    /// (no `O_APPEND`), so without the `lseek` back to 0 the next append after a flush would land
+    /// at the old (pre-truncate) offset, leaving a sparse hole of zero bytes that still makes the
+    /// file's `st_size` read as non-empty — silently defeating the "empty WAL ⇒ clean" marker.
+    private func truncateWAL() throws {
+        guard walFD >= 0 else { return }
+        if ftruncate(walFD, 0) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "vindex_wal_truncate")
+                .message("Failed to truncate WAL file")
+                .info("wal_path", walPath)
+                .info("errno", "\(errno)")
+                .build()
+        }
+        if lseek(walFD, 0, SEEK_SET) == -1 {
+            throw ErrorBuilder(.fileIOError, operation: "vindex_wal_truncate")
+                .message("Failed to reset WAL write offset after truncate")
+                .info("wal_path", walPath)
+                .info("errno", "\(errno)")
+                .build()
+        }
+        if fsync(walFD) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "vindex_wal_truncate")
+                .message("Failed to fsync WAL file after truncate")
+                .info("wal_path", walPath)
+                .info("errno", "\(errno)")
+                .build()
+        }
+    }
+
+    /// True when the WAL file exists and is non-empty — this format's unclean-shutdown marker
+    /// (P4). A missing WAL (never opened writable) or a zero-length WAL (freshly created, or
+    /// truncated by a prior clean `flush()`/`close()`) both mean "clean". Uses `stat(2)` on the
+    /// path rather than `walFD` so the check also works for read-only opens, which never open a
+    /// WAL fd at all.
+    private func walIsNonEmpty() -> Bool {
+        var st = stat()
+        guard stat(walPath, &st) == 0 else { return false }
+        return st.st_size > 0
+    }
+
+    /// Recomputes+persists all section CRCs, syncs the mapping, then truncates the WAL to mark
+    /// the container clean (P4). Internal class, so this is zero public-surface-area impact.
+    /// No-op for read-only handles (nothing to write back) and — fix round 1, I3 — no-op whenever
+    /// `mappingValid` is `false`, since `recomputeAllSectionCRCs()`/`msyncPageAligned` both
+    /// dereference `base`, which is left dangling by a failed growth-triggered remap (see
+    /// `ensureFileCapacity`). Called by `close()` before unmapping, and by `indexInit()`'s
+    /// unclean-reopen repair branch after WAL replay.
+    public func flush() throws {
+        guard !opts.readOnly, mappingValid else { return }
+        try recomputeAllSectionCRCs()
+        try msyncPageAligned(base, Int(fileSize))
+        try truncateWAL()
     }
 
     @inline(__always) public func snapshotListLength(listID: Int) -> Int {
@@ -625,8 +910,30 @@ internal final class IndexMmap {
     private struct WalCommit { var tag: UInt32; var listID: UInt32; var newLen: UInt32; var crc32: UInt32 }
     private let WAL_APPEND_TAG: UInt32 = 0xAABBCCDD
     private let WAL_COMMIT_TAG: UInt32 = 0xDDCCBBAA
+    /// Fix round 1, I2: written (4 raw bytes, no payload) as the very first on-disk mutation of
+    /// `mmap_append_begin`'s growth branch, before `ensureFileCapacity`/the relocation memcpys
+    /// touch IDs/Codes/Vecs. Growth mutates those sections directly (outside the commit/WAL
+    /// protocol — `writeListDescOffsets` only refreshes ListsDesc's own CRC), so without this a
+    /// crash between a growth event and its still-pending `mmap_append_commit` would leave an
+    /// *empty* WAL (this format's clean marker) next to now-stale IDs/Codes CRCs, and the next
+    /// open would strict-verify and throw a false-positive corruption error on an otherwise-fine
+    /// container. Writing this sentinel first makes the WAL pessimistically non-empty for the
+    /// whole duration of the growth+append+commit sequence, so an unclean reopen always routes
+    /// through replay+recompute instead of strict verification. `mmap_wal_replay` recognizes and
+    /// skips it (does not `break` — real records may still follow).
+    private let WAL_GROWTH_SENTINEL_TAG: UInt32 = 0x53454E54 // ASCII "SENT", arbitrary/distinct from the tags above
 
     public func mmap_append_begin(listID: Int, addLen: Int) throws -> AppendReservation {
+        // Fix round 2: a previous growth-path flush failure already left the on-disk ListsDesc
+        // record ahead of this handle's in-memory tail watermarks (see `growthPoisoned`'s doc
+        // comment) -- refuse any further growth on this handle rather than risk computing an
+        // overlapping region. Reopening the container is the tested recovery path.
+        guard !growthPoisoned else {
+            throw ErrorBuilder(.mmapError, operation: "mmap_append_begin")
+                .message("Handle is poisoned after a failed growth-path flush; reopen the container to recover")
+                .info("list_id", "\(listID)")
+                .build()
+        }
         guard !opts.readOnly, listID >= 0, listID < kc else {
             throw ErrorBuilder(.invalidRange, operation: "mmap_append_begin")
                 .message("Invalid list ID or index is read-only")
@@ -654,6 +961,13 @@ internal final class IndexMmap {
         if addLen <= 0 { return AppendReservation(listID: listID, oldLen: oldLen, addLen: 0, idsFileOffset: currIDsOff, codesFileOffset: currCodesOff, vecsFileOffset: currVecsOff, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride) }
 
         if need > cap {
+            // I2: pessimistically mark the WAL non-empty *before* any on-disk mutation below
+            // (ensureFileCapacity's ftruncate/remap, the IDs/Codes/Vecs relocation memcpys, and
+            // writeListDescOffsets, which only refreshes ListsDesc's own CRC). None of that is
+            // covered by the append/commit WAL protocol below — it happens here, in begin, not
+            // commit — so without this a crash before the matching mmap_append_commit call would
+            // leave an empty WAL (this format's clean marker) next to stale IDs/Codes CRCs.
+            try writeWalSentinel()
             guard mapSection(.ids) != nil else {
                 throw ErrorBuilder(.capacityExceeded, operation: "mmap_append_begin")
                     .message("Cannot grow IDs section")
@@ -749,7 +1063,17 @@ internal final class IndexMmap {
                 }
             }
 
-            writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
+            do {
+                try writeListDescOffsets(listID: listID, idsOff: newIDsOff, codesOff: newCodesOff, vecsOff: newVecsOffUsed, newCapacity: newCap, idsStride: idsStride, codesStride: codesStride, vecsStride: vecsStride)
+            } catch {
+                // Fix round 2: writeListDescOffsets already wrote the new offsets/capacity into
+                // the mapped ListsDesc record before the throw (its msyncPageAligned failed) --
+                // tailIDs/tailCodes/tailVecs below are now stale relative to that on-disk claim.
+                // See `growthPoisoned`'s doc comment for the full hazard and why reopening,
+                // rather than in-place repair, is the chosen recovery path.
+                growthPoisoned = true
+                throw error
+            }
             tailIDs = alignUp(newIDsOff &+ idsBytes, 64); tailCodes = alignUp(newCodesOff &+ codesBytes, 64)
             currIDsOff = newIDsOff
             currCodesOff = newCodesOff
@@ -790,9 +1114,11 @@ internal final class IndexMmap {
             }
             let dst = idsBase.advanced(by: Int(relOff))
             memcpy(dst, ids, Int(bytes))
-            msyncPageAligned(dst, Int(bytes))
-            // Update CRC for IDs section after write
-            try updateSectionCRC(.ids)
+            try msyncPageAligned(dst, Int(bytes))
+            // P4: IDs section CRC freshness is deferred to flush()/close() (or unclean-reopen
+            // repair) instead of recomputed here. Recomputing the whole section's CRC on every
+            // commit made N appends O(N^2) — the WAL append/commit records above already make
+            // this write crash-recoverable; only checksum *freshness* moves later.
         }
         if let codes = codesSrc, let codesBase = secCodes {
             guard let e = tocByType[.codes] else {
@@ -812,9 +1138,8 @@ internal final class IndexMmap {
             }
             let dst = codesBase.advanced(by: Int(relOff))
             memcpy(dst, codes, Int(bytes))
-            msyncPageAligned(dst, Int(bytes))
-            // Update CRC for Codes section after write
-            try updateSectionCRC(.codes)
+            try msyncPageAligned(dst, Int(bytes))
+            // P4: Codes section CRC freshness deferred — see the IDs branch above.
         }
         if res.vecsStride > 0, let vecs = vecsSrc, let vecsBase = secVecs {
             guard let e = tocByType[.vecs] else {
@@ -834,19 +1159,19 @@ internal final class IndexMmap {
             }
             let dst = vecsBase.advanced(by: Int(relOff))
             memcpy(dst, vecs, Int(bytes))
-            msyncPageAligned(dst, Int(bytes))
-            // Update CRC for Vecs section after write
-            try updateSectionCRC(.vecs)
+            try msyncPageAligned(dst, Int(bytes))
+            // P4: Vecs section CRC freshness deferred — see the IDs branch above.
         }
         let newLen = res.oldLen + res.addLen
-        // Update length in packed ListsDesc record and sync
+        // Update length in packed ListsDesc record and sync. This write (and its msync) is what
+        // makes the length bump durable at commit-return time — unchanged by P4, and still
+        // independent of ListsDesc's *CRC*, which (like IDs/Codes/Vecs above) is no longer
+        // refreshed here; it is recomputed by flush()/close()/unclean-reopen repair instead.
         if let base = listsDescBase {
             let rec = base.advanced(by: res.listID * 64)
             writeLE32(rec.advanced(by: 4), UInt32(truncatingIfNeeded: newLen))
-            msyncPageAligned(rec, 64)
+            try msyncPageAligned(rec, 64)
         }
-        // Update CRC for ListsDesc after length update
-        try updateSectionCRC(.listsDesc)
         try writeWalCommit(listID: res.listID, newLen: newLen)
     }
 
@@ -872,7 +1197,12 @@ internal final class IndexMmap {
         while true {
             guard let tagBytes = readExact(4) else { break }
             let tag = tagBytes.withUnsafeBytes { UInt32(littleEndian: $0.load(as: UInt32.self)) }
-            if tag == WAL_APPEND_TAG {
+            if tag == WAL_GROWTH_SENTINEL_TAG {
+                // I2: no payload beyond the tag — skip and keep replaying. Unlike an unrecognized
+                // tag, this must NOT stop replay: real append/commit records for the growth's
+                // eventual commit (or from unrelated later commits) can follow it in the log.
+                continue
+            } else if tag == WAL_APPEND_TAG {
                 guard let rest = readExact(recordSizeAppend - 4) else { break }
                 // rest = listID(4) oldLen(4) delta(4) idsOff(8) codesOff(8) vecsOff(8) crc32(4) = 40 bytes
                 let storedCRC = rest.withUnsafeBytes { UInt32(littleEndian: $0.load(fromByteOffset: 36, as: UInt32.self)) }
@@ -904,13 +1234,17 @@ internal final class IndexMmap {
                 if i >= 0 && i < kc {
                     let rec = base.advanced(by: i * 64)
                     writeLE32(rec.advanced(by: 4), nl)
-                    msyncPageAligned(rec, 64)
+                    try msyncPageAligned(rec, 64)
                 }
             }
         }
     }
 
-    private func writeListDescOffsets(listID: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64, newCapacity: Int, idsStride: Int, codesStride: Int, vecsStride: Int) {
+    /// `throws` (fix round 1): now propagates a failed `msyncPageAligned` instead of discarding
+    /// it. Its only call site (`mmap_append_begin`'s growth branch) is itself `throws`, so this
+    /// was the one call site among the 10 audited for the msync-failure fix that did NOT already
+    /// sit in a throwing context -- promoting it to `throws` was required to surface the error.
+    private func writeListDescOffsets(listID: Int, idsOff: UInt64, codesOff: UInt64, vecsOff: UInt64, newCapacity: Int, idsStride: Int, codesStride: Int, vecsStride: Int) throws {
         guard let base = listsDescBase else { return }
         let rec = base.advanced(by: listID * 64)
         // Write packed LE fields
@@ -921,7 +1255,7 @@ internal final class IndexMmap {
         writeLE32(rec.advanced(by: 40), UInt32(truncatingIfNeeded: idsStride))
         writeLE32(rec.advanced(by: 44), UInt32(truncatingIfNeeded: codesStride))
         writeLE32(rec.advanced(by: 48), UInt32(truncatingIfNeeded: vecsStride))
-        msyncPageAligned(rec, 64)
+        try msyncPageAligned(rec, 64)
         _ = try? updateSectionCRC(.listsDesc)
     }
 
@@ -961,6 +1295,11 @@ internal final class IndexMmap {
             // Remap
             _ = msync(base, Int(fileSize), MS_SYNC)
             _ = munmap(base, Int(fileSize))
+            // I3: `base` is dangling from this point until the remap below succeeds. If `mmap()`
+            // fails, this stays `false` for the rest of the handle's life — flush()/close() check
+            // it before ever dereferencing `base` again. Deliberately not attempting any repair
+            // of the wider growth path here (out of scope for this fix — see the task-3 brief).
+            mappingValid = false
             let newMap = mmap(nil, Int(newSize), prot, MAP_SHARED, fd, 0)
             if newMap == MAP_FAILED {
                 throw ErrorBuilder(.mmapError, operation: "ensure_file_capacity")
@@ -971,6 +1310,7 @@ internal final class IndexMmap {
             }
             base = newMap!
             fileSize = newSize
+            mappingValid = true
             // Rebuild TOC map (packed)
             tocByType.removeAll(keepingCapacity: true)
             let tocOff = Int(toHost(header.toc_offset, fileEndian: fileEndian))
@@ -1074,6 +1414,31 @@ internal final class IndexMmap {
         if fsync(walFD) != 0 {
             throw ErrorBuilder(.fileIOError, operation: "wal_write_commit")
                 .message("Failed to fsync WAL file")
+                .info("errno", "\(errno)")
+                .build()
+        }
+    }
+
+    /// Fix round 1, I2: writes the 4-byte growth sentinel (see `WAL_GROWTH_SENTINEL_TAG`) and
+    /// fsyncs. No payload, no CRC of its own — its only job is to make `st_size > 0` true before
+    /// `mmap_append_begin`'s growth branch mutates IDs/Codes/Vecs directly. Guards on `walFD >= 0`
+    /// defensively; callers only reach this from an already-writable append path, where
+    /// `indexInit()` guarantees the WAL fd is open.
+    private func writeWalSentinel() throws {
+        guard walFD >= 0 else { return }
+        var tag = WAL_GROWTH_SENTINEL_TAG.littleEndian
+        let wrote = withUnsafeBytes(of: &tag) { write(walFD, $0.baseAddress!, $0.count) }
+        if wrote != MemoryLayout<UInt32>.size {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_sentinel")
+                .message("Failed to write WAL growth sentinel record")
+                .info("expected_bytes", "\(MemoryLayout<UInt32>.size)")
+                .info("written_bytes", "\(wrote)")
+                .info("errno", "\(errno)")
+                .build()
+        }
+        if fsync(walFD) != 0 {
+            throw ErrorBuilder(.fileIOError, operation: "wal_write_sentinel")
+                .message("Failed to fsync WAL file after growth sentinel")
                 .info("errno", "\(errno)")
                 .build()
         }

@@ -701,13 +701,18 @@ func rangeScanL2_earlyExit(
     var outCount = 0
     let usingReservoir = (config.reservoir != nil)
 
+    // P6c: `part` hoisted above the block loop (previously reallocated every
+    // R=8-row block -- O(n/R) allocations per call). Capacity R covers every
+    // block including the final partial one (blockR <= R); zero-filled per
+    // block below instead of at allocation time.
+    let part = UnsafeMutableBufferPointer<Float>.allocate(capacity: R)
+    defer { part.deallocate() }
+
     var blockStart = 0
     while blockStart < n {
         let blockEnd = min(blockStart + R, n)
         let blockR = blockEnd - blockStart
 
-        let part = UnsafeMutableBufferPointer<Float>.allocate(capacity: blockR)
-        defer { part.deallocate() }
         for r in 0..<blockR { part[r] = 0 }
 
         var aliveMask: UInt16 = (blockR == 16) ? 0xFFFF : ((1 << blockR) - 1)
