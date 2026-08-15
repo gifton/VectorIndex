@@ -1,0 +1,23 @@
+{
+  "benchmark" : "hnsw_knn_graph",
+  "build_sec" : 0.26511395799999998,
+  "dim" : 384,
+  "edges" : 45000,
+  "efc" : 200,
+  "efs" : 96,
+  "host" : {
+    "cpu" : "Apple M3 Max",
+    "device" : "Mac15,9",
+    "memoryGB" : 48,
+    "os" : "macOS 26.5.2"
+  },
+  "insert_sec" : 2.7234800830000001,
+  "k" : 15,
+  "knn_clusters" : 0,
+  "m" : 16,
+  "n" : 3000,
+  "points_per_sec" : 11315.888543295787,
+  "recall_at_k" : 0.95559999999999146,
+  "recall_sample" : 1000,
+  "seed" : 42
+}

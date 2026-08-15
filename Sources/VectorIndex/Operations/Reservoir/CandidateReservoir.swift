@@ -39,16 +39,17 @@ public struct ReservoirOptions: Sendable {
   /// speed without having to know their stream's score order upfront.
   ///
   /// Measured guidance (`ReservoirModeBenchmarks`, C ∈ {64, 1024}, 100k pushes in 1k
-  /// batches, release build, median of 7 trials, measured 2026-08-07):
+  /// batches, release build, median of 7 trials, re-measured 2026-08-15 on a quiet
+  /// machine — an earlier 2026-08-07 measurement under heavy background load overstated
+  /// the ratios ~5×; direction and ranking were unchanged):
   /// - Streams where the top-C stabilizes early (ascending or random score order, i.e. most
-  ///   pushes end up rejected against tau): `.heap` and `.adaptive` are **~20-100× faster**
-  ///   than `.block` (e.g. C=1024 random: 26.9 ns/push heap, 27.0 ns/push adaptive vs.
-  ///   2789.4 ns/push block; C=64 ascending: 13.0 ns heap, 12.9 ns adaptive vs. 707.9 ns block).
+  ///   pushes end up rejected against tau): `.heap` and `.adaptive` are **~6-19× faster**
+  ///   than `.block` (e.g. C=1024 random: 25.9 ns/push heap, 25.4 ns/push adaptive vs.
+  ///   487.0 ns/push block; C=64 ascending: 11.7 ns heap, 12.3 ns adaptive vs. 136.6 ns block).
   /// - Fully monotonic *improving* (descending-score) streams, where nearly every push
-  ///   replaces the heap root: all three modes converge to comparable cost (within ~2× of
-  ///   each other) -- no mode shows a decisive win here. `.adaptive` tracked within ~1.6× of
-  ///   `.heap` despite its brief `.block` warm-up, and was measured fastest of the three at
-  ///   C=1024 in one run.
+  ///   replaces the heap root: all three modes converge to comparable cost (within ~1.1-1.7×
+  ///   of each other) -- no mode shows a decisive win here (C=1024: 282.3 heap / 285.0
+  ///   adaptive / 314.4 block ns/push).
   /// - `.adaptive` switched exactly once per query in every measured cell and produced results
   ///   identical to `.heap` (see `CandidateReservoirTests.testAdaptiveSampledSwitchMatchesPureHeapResults`).
   ///   `.block` never compares against tau (it appends unconditionally and prunes

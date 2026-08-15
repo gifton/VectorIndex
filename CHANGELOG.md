@@ -5,6 +5,51 @@ convention: the minor digit signals breaking changes.
 
 ## [Unreleased] — 0.2.0
 
+### Performance
+
+Phase 3 (P1–P7 + carried items). Numbers below are quiet-machine measurements
+(2026-08-15, M3 Max, `caffeinate`, attested in `.bench/baseline-0.2.0-quiet/`
+and `.bench/post-phase3/` READMEs); items marked *dev-gate* were measured as
+same-load back-to-back A/Bs during development and have no quiet-machine
+multi-run requalification.
+
+- **mmap ingestion: quadratic eliminated.** Deferred section CRCs (commits skip
+  per-section CRC recomputation; `flush()`/unclean-open replay recompute) plus
+  ranged page-aligned `msync`. Append throughput at the 4-point sweep went from
+  544.7/291.8/151.9/77.2 commits/s (halving per size doubling) to
+  9412/10030/10212/10265 (near-flat) — **17–133×** depending on container size.
+- **HNSW build −10.3%** (median-of-3 per side: 5.572 s → 4.998 s at n=5000,
+  d=384, M=16, efC=200): `searchLayer` rewritten on a (distance, arrival-order)
+  binary heap with batched candidate scoring. Graphs are **bit-identical** to
+  the previous implementation (determinism-gated; recallAvg 0.4145 exact match)
+  and single-query/batch search throughput is at parity (−1.3%/+1.4%,
+  median-of-3). knn-graph insert measured −14%/−8% as *dev-gate*.
+- **IVF `optimize()` −6.6%** (median-of-3: 66.6 ms → 62.2 ms at n=5000,
+  nlist=64) via single-pass materialization and assignment reuse — and now
+  **deterministic across processes** (sorted store materialization; recall
+  bit-identical at 0.9565000000000008 where the previous implementation drew
+  randomly from a 0.72–1.0 range per process). Cosine/dot list assignment is
+  GEMM-batched and tiled (bounded ~32 MiB transient, replacing an O(n·k)
+  allocation). IVF search latency measured −14% / QPS +16% as *dev-gate*
+  (5-run); quiet-machine single-query is at parity-to-slightly-better (+2.7%).
+- **IVF batch centroid probes** via `cblas_sgemm` with exact score parity
+  (60/60 + 40/40 including d=384); batch-QPS gains at nlist=64 are
+  noise-dominated (honest 5-run mean +0.8%) — the win is structural headroom at
+  larger nlist, not a headline number.
+- **PQ training:** SIMD `l2Sq` (dual-SIMD4, 7.28× micro-benchmark, *dev-gate*)
+  and the streaming k-means++ seeder reduced O(n·ks²) → O(n·ks), bit-identical
+  seeding.
+- **Allocation hoists** on ScoreBlock's fallback path, RangeQuery early-exit,
+  ExactRerank batch scratch, and JournalFilter's per-call date formatters
+  (thread-local caching), with first-ever direct test coverage for the first
+  two paths.
+- Cosine F16 inv-norms now delegate to the shared 16-wide `l2NormSquared`
+  (removes the sixth hand-rolled sum-of-squares copy; parity-gated).
+- Reservoir mode guidance re-measured on quiet hardware and documented on
+  `ReservoirOptions.mode`: heap/adaptive are ~6–19× faster than block on
+  early-stabilizing streams; all modes within ~1.7× on monotonic-improving
+  streams; block fastest in 0 of 18 cells.
+
 ### Changed
 
 - Telemetry consolidated onto the push-callback recorders and the dedup pull API,

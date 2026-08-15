@@ -1,0 +1,27 @@
+{
+  "batch" : 32,
+  "benchmark" : "mmap_append",
+  "m" : 16,
+  "points" : [
+    {
+      "commits" : 1000,
+      "commitsPerSec" : 544.72386019748842,
+      "seconds" : 1.8357925420000001
+    },
+    {
+      "commits" : 2000,
+      "commitsPerSec" : 291.7678858090519,
+      "seconds" : 6.8547640000000003
+    },
+    {
+      "commits" : 4000,
+      "commitsPerSec" : 151.88876671530718,
+      "seconds" : 26.335061416999999
+    },
+    {
+      "commits" : 8000,
+      "commitsPerSec" : 77.188008806167659,
+      "seconds" : 103.6430415
+    }
+  ]
+}
