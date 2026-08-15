@@ -379,33 +379,59 @@ public actor IVFIndex: VectorIndexProtocol, AccelerableIndex {
             // a single call, replacing both the L2-only kernel path (wrong
             // metric) and a per-vector nearestCentroidIndex rescan (right
             // metric, but N separate scalar calls) with one batched pass.
+            //
+            // Task 16b (audit): a single n*kc score buffer is transient
+            // O(n*kc*4B) -- at n=500k, kc=2048 that's ~4 GB, an OOM cliff
+            // the pre-Phase-3 per-vector rescan didn't have. Tile over
+            // points instead: process rows in blocks of `tileRows`, one
+            // CentroidBatchScore.run per tile into a scratch buffer sized
+            // tileRows*kc, allocated ONCE and reused across tiles. Bound:
+            // tileRows = min(n, 4096) => scratch <= 4096*kc*4B; at
+            // kc=2048 that's 4096*2048*4 = 33,554,432 bytes (~32 MiB),
+            // independent of n. `cblas_sgemm` (inside CentroidBatchScore
+            // .run) processes each row of `queries` independently -- no
+            // cross-row accumulation or state -- so slicing the point
+            // dimension into tiles cannot change any row's score in exact
+            // or floating-point arithmetic versus the single n-row call:
+            // this is a memory-shape change only, not an algorithm change.
+            // The per-row argmin below (index-ascending tie-break) and
+            // list assignment are byte-for-byte the same as the untiled
+            // version, just walked tile-by-tile instead of all at once.
             let kc = centroids.count
-            var scores = [Float](repeating: 0, count: n * kc)
-            let ok = flatData.withUnsafeBufferPointer { qb in
-                centroidsFlat.withUnsafeBufferPointer { cb -> Bool in
-                    CentroidBatchScore.run(
-                        queries: qb.baseAddress!, q: n,
-                        centroids: cb.baseAddress!, kc: kc, d: d,
-                        metric: metric,
-                        centroidNormsSq: centroidNormsSq, centroidInvNorms: centroidInvNorms,
-                        queriesAreNormalized: false,
-                        out: &scores)
+            let tileRows = max(1, min(n, 4096))
+            var scores = [Float](repeating: 0, count: tileRows * kc)
+            var tileStart = 0
+            while tileStart < n {
+                let rows = min(tileRows, n - tileStart)
+                let ok = flatData.withUnsafeBufferPointer { qb in
+                    centroidsFlat.withUnsafeBufferPointer { cb -> Bool in
+                        CentroidBatchScore.run(
+                            queries: qb.baseAddress! + tileStart * d, q: rows,
+                            centroids: cb.baseAddress!, kc: kc, d: d,
+                            metric: metric,
+                            centroidNormsSq: centroidNormsSq, centroidInvNorms: centroidInvNorms,
+                            queriesAreNormalized: false,
+                            out: &scores)
+                    }
                 }
-            }
-            precondition(ok, "CentroidBatchScore must support cosine/dotProduct")
-            for (i, id) in orderedIDs.enumerated() {
-                let base = i * kc
-                var best = -1
-                var bestScore = Float.infinity
-                for ci in 0..<kc {
-                    let s = scores[base + ci]
-                    // Index-ascending first-min-wins (strict `<`, ascending
-                    // ci), matching nearestCentroidIndex's tie-break.
-                    if s < bestScore { bestScore = s; best = ci }
+                precondition(ok, "CentroidBatchScore must support cosine/dotProduct")
+                for r in 0..<rows {
+                    let i = tileStart + r
+                    let id = orderedIDs[i]
+                    let base = r * kc
+                    var best = -1
+                    var bestScore = Float.infinity
+                    for ci in 0..<kc {
+                        let s = scores[base + ci]
+                        // Index-ascending first-min-wins (strict `<`, ascending
+                        // ci), matching nearestCentroidIndex's tie-break.
+                        if s < bestScore { bestScore = s; best = ci }
+                    }
+                    guard best >= 0, lists.indices.contains(best) else { continue }
+                    lists[best].append(id)
+                    idToListIndex[id] = best
                 }
-                guard best >= 0, lists.indices.contains(best) else { continue }
-                lists[best].append(id)
-                idToListIndex[id] = best
+                tileStart += rows
             }
         default:
             // manhattan/chebyshev: CentroidBatchScore has no GEMM form for
