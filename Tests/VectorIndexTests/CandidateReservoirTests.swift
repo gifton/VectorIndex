@@ -232,28 +232,28 @@ final class CandidateReservoirTests: XCTestCase {
     }
 
     // Task 16c: Pin telemetry.accepted on heap mode's two accept paths: heapInsert (size < C)
-    // and replaceRoot (size >= C). Small capacity with ASCENDING scores (L2: later is worse),
-    // so early items fill the heap, and subsequent better-scoring items trigger tau-rejection.
-    // We stream a mix: enough to fill (exercises heapInsert), then stream better items (triggers
-    // replaceRoot on some, tau-rejection on the worst). The key invariant: accepted must
-    // reconcile exactly, and accepted > capacity proves replaceRoot incremented (since
-    // heapInsert alone would yield exactly capacity).
+    // and replaceRoot (size >= C). Small capacity with DESCENDING scores (worst first, then
+    // strictly improving), so early items fill the heap via heapInsert with bad candidates,
+    // and all subsequent items are strictly better and must route through replaceRoot.
+    // With unique stream of size N and capacity C: accepted == N (all accepted, C fills +
+    // (N-C) replacements). This genuinely discriminates: if replaceRoot didn't increment,
+    // accepted would equal C and both assertions fail.
     func testTelemetryTracksAcceptedHeapMode() {
         let capacity = 6
         let reservoir = CandidateReservoir(
             capacity: capacity, metric: .l2,
             options: ReservoirOptions(mode: .heap, telemetry: true)
         )
-        // ASCENDING scores (L2: higher is worse, so later items are worse): ids 0-19,
-        // scores 0.0-19.0. Heap fills with ids 0-5 (scores 0-5), then ids 6-11 are
-        // all worse than root (score 5) so rejected by tau. Ids 12-19 have scores
-        // 12-19, all worse than worst, so also tau-rejected. Then one dedup (id 3)
-        // and one NaN.
+        // DESCENDING scores (L2: smaller is better, so worst first, then improving):
+        // ids 0-19, scores 19.0, 18.0, ..., 0.0. Heap fills ids 0-5 with scores 19.0-14.0
+        // via heapInsert (worst 6 candidates). Ids 6-19 have scores 13.0-0.0, all strictly
+        // better than root (14.0), so all must route through replaceRoot. Expected: all 20
+        // unique items accepted. Then one dedup (id 5) and one NaN.
         let uniqueCount = 20
         var ids: [Int64] = (0..<uniqueCount).map { Int64($0) }
-        var scores: [Float] = (0..<uniqueCount).map { Float($0) }
-        ids.append(3)  // repeated id
-        scores.append(3.0)
+        var scores: [Float] = (0..<uniqueCount).reversed().map { Float($0) }  // 19.0 down to 0.0
+        ids.append(5)  // repeated id
+        scores.append(15.0)
         ids.append(999) // NaN score
         scores.append(Float.nan)
 
@@ -270,15 +270,15 @@ final class CandidateReservoirTests: XCTestCase {
         let t = reservoir.telemetry
         XCTAssertEqual(t.pushed, Int64(ids.count))
         XCTAssertEqual(t.rejectedInvalid, 1, "the NaN-score entry must be rejected as invalid")
-        XCTAssertEqual(t.rejectedDedup, 1, "the repeated id-3 entry must be rejected by dedup")
-        // In heap mode: ids 0-5 accepted (heapInsert), 6-19 tau-rejected, id 3 dedup-rejected, 999 invalid-rejected.
-        XCTAssertGreaterThanOrEqual(t.rejectedTau, 14, "ids 6-19 (14 items) must be tau-rejected in heap mode")
+        XCTAssertEqual(t.rejectedDedup, 1, "the repeated id-5 entry must be rejected by dedup")
+        // In heap mode: ids 0-5 accepted (heapInsert fills), ids 6-19 accepted (replaceRoot),
+        // id 5 dedup-rejected, 999 invalid-rejected. No tau rejections (all 20 unique are better or fill).
+        XCTAssertEqual(t.rejectedTau, 0, "strictly-improving stream must have no tau rejections")
         XCTAssertEqual(
             t.accepted, t.pushed - t.rejectedTau - t.rejectedDedup - t.rejectedInvalid,
             "accepted must reconcile exactly against the batch's outcome tally"
         )
-        XCTAssertGreaterThanOrEqual(t.accepted, Int64(capacity),
-                                     "heap mode must accept at least capacity items (heapInsert at size<C)")
+        XCTAssertEqual(t.accepted, 20, "all 20 unique items must be accepted (C fills + (N-C) replaceRoot)")
     }
 
     // Task 16c: Pin telemetry.accepted on adaptive mode's block-phase accept path.
