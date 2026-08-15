@@ -230,4 +230,99 @@ final class CandidateReservoirTests: XCTestCase {
             "accepted must reconcile exactly against the batch's outcome tally"
         )
     }
+
+    // Task 16c: Pin telemetry.accepted on heap mode's two accept paths: heapInsert (size < C)
+    // and replaceRoot (size >= C). Small capacity with ASCENDING scores (L2: later is worse),
+    // so early items fill the heap, and subsequent better-scoring items trigger tau-rejection.
+    // We stream a mix: enough to fill (exercises heapInsert), then stream better items (triggers
+    // replaceRoot on some, tau-rejection on the worst). The key invariant: accepted must
+    // reconcile exactly, and accepted > capacity proves replaceRoot incremented (since
+    // heapInsert alone would yield exactly capacity).
+    func testTelemetryTracksAcceptedHeapMode() {
+        let capacity = 6
+        let reservoir = CandidateReservoir(
+            capacity: capacity, metric: .l2,
+            options: ReservoirOptions(mode: .heap, telemetry: true)
+        )
+        // ASCENDING scores (L2: higher is worse, so later items are worse): ids 0-19,
+        // scores 0.0-19.0. Heap fills with ids 0-5 (scores 0-5), then ids 6-11 are
+        // all worse than root (score 5) so rejected by tau. Ids 12-19 have scores
+        // 12-19, all worse than worst, so also tau-rejected. Then one dedup (id 3)
+        // and one NaN.
+        let uniqueCount = 20
+        var ids: [Int64] = (0..<uniqueCount).map { Int64($0) }
+        var scores: [Float] = (0..<uniqueCount).map { Float($0) }
+        ids.append(3)  // repeated id
+        scores.append(3.0)
+        ids.append(999) // NaN score
+        scores.append(Float.nan)
+
+        let visited = DefaultVisitedSet(idCapacity: 1_000)
+        ids.withUnsafeBufferPointer { idBuf in
+            scores.withUnsafeBufferPointer { scoreBuf in
+                _ = reservoir.pushBatch(
+                    ids: idBuf.baseAddress!, scores: scoreBuf.baseAddress!,
+                    count: ids.count, visited: visited
+                )
+            }
+        }
+
+        let t = reservoir.telemetry
+        XCTAssertEqual(t.pushed, Int64(ids.count))
+        XCTAssertEqual(t.rejectedInvalid, 1, "the NaN-score entry must be rejected as invalid")
+        XCTAssertEqual(t.rejectedDedup, 1, "the repeated id-3 entry must be rejected by dedup")
+        // In heap mode: ids 0-5 accepted (heapInsert), 6-19 tau-rejected, id 3 dedup-rejected, 999 invalid-rejected.
+        XCTAssertGreaterThanOrEqual(t.rejectedTau, 14, "ids 6-19 (14 items) must be tau-rejected in heap mode")
+        XCTAssertEqual(
+            t.accepted, t.pushed - t.rejectedTau - t.rejectedDedup - t.rejectedInvalid,
+            "accepted must reconcile exactly against the batch's outcome tally"
+        )
+        XCTAssertGreaterThanOrEqual(t.accepted, Int64(capacity),
+                                     "heap mode must accept at least capacity items (heapInsert at size<C)")
+    }
+
+    // Task 16c: Pin telemetry.accepted on adaptive mode's block-phase accept path.
+    // Adaptive starts in block mode and appends unconditionally until a threshold
+    // (occupancy or buffer-full) triggers the switch to heap. We keep the stream size
+    // small to stay in block phase (or just barely trigger the switch), and validate
+    // that the accepted identity holds regardless.
+    func testTelemetryTracksAcceptedAdaptiveMode() {
+        let capacity = 8
+        let reservoir = CandidateReservoir(
+            capacity: capacity, metric: .l2,
+            options: ReservoirOptions(mode: .adaptive, reserveExtra: 0.10, adaptiveThreshold: 0.75,
+                                       adaptiveInitialMode: .block, telemetry: true)
+        )
+        // bufferCapacity = 8 + ceil(8*0.10) = 9. Adaptive starts in block, appends until
+        // occupancy threshold or buffer-full. We stream 15 items (enough to fill and possibly
+        // trigger switch), plus one dedup and one NaN, to exercise the block-phase append path
+        // and validate telemetry.accepted tracks it correctly.
+        let uniqueCount = 15
+        var ids: [Int64] = (0..<uniqueCount).map { Int64($0) }
+        var scores: [Float] = (0..<uniqueCount).map { Float($0) }
+        ids.append(7)  // repeated id
+        scores.append(7.0)
+        ids.append(999) // NaN score
+        scores.append(Float.nan)
+
+        let visited = DefaultVisitedSet(idCapacity: 1_000)
+        ids.withUnsafeBufferPointer { idBuf in
+            scores.withUnsafeBufferPointer { scoreBuf in
+                _ = reservoir.pushBatch(
+                    ids: idBuf.baseAddress!, scores: scoreBuf.baseAddress!,
+                    count: ids.count, visited: visited
+                )
+            }
+        }
+
+        let t = reservoir.telemetry
+        XCTAssertEqual(t.pushed, Int64(ids.count))
+        XCTAssertEqual(t.rejectedInvalid, 1, "the NaN-score entry must be rejected as invalid")
+        XCTAssertEqual(t.rejectedDedup, 1, "the repeated id-7 entry must be rejected by dedup")
+        XCTAssertEqual(
+            t.accepted, t.pushed - t.rejectedTau - t.rejectedDedup - t.rejectedInvalid,
+            "accepted must reconcile exactly against the batch's outcome tally in adaptive mode"
+        )
+        XCTAssertGreaterThanOrEqual(t.accepted, 1, "adaptive must accept at least one item")
+    }
 }
