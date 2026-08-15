@@ -246,9 +246,10 @@ final class CandidateReservoirTests: XCTestCase {
         )
         // DESCENDING scores (L2: smaller is better, so worst first, then improving):
         // ids 0-19, scores 19.0, 18.0, ..., 0.0. Heap fills ids 0-5 with scores 19.0-14.0
-        // via heapInsert (worst 6 candidates). Ids 6-19 have scores 13.0-0.0, all strictly
-        // better than root (14.0), so all must route through replaceRoot. Expected: all 20
-        // unique items accepted. Then one dedup (id 5) and one NaN.
+        // via heapInsert, establishing root = 19.0 (the worst/largest score). Ids 6-19 have
+        // scores 13.0-0.0, all strictly better than current root, so all must route through
+        // replaceRoot, which repeatedly replaces the worst with a better candidate. Expected:
+        // all 20 unique items accepted. Then one dedup (id 5) and one NaN.
         let uniqueCount = 20
         var ids: [Int64] = (0..<uniqueCount).map { Int64($0) }
         var scores: [Float] = (0..<uniqueCount).reversed().map { Float($0) }  // 19.0 down to 0.0
