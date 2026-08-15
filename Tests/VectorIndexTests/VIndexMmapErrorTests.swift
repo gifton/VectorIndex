@@ -285,6 +285,59 @@ final class VIndexMmapErrorTests: XCTestCase {
         try reopened2.close()
     }
 
+    /// Task 16a (audit finding): a READ-ONLY open of a crash-dirty container with
+    /// `verifyCRCs = true` must fail loud, not silently skip verification. Before this fix,
+    /// `indexInit`'s strict-CRC gate was `opts.verifyCRCs && sz > 0 && !walDirty` for ALL opens,
+    /// and the replay+recompute repair only ran `if !opts.readOnly` — so a dirty container opened
+    /// read-only got neither verification nor repair, and `opts.verifyCRCs = true` became a
+    /// silent no-op. Reuses `testUncleanCloseThenReopenRecomputesCRCsViaWAL`'s crash simulation
+    /// (`_abandonWithoutClose()` after a commit, leaving the WAL non-empty i.e. "dirty") but,
+    /// unlike that test, goes straight to a READ-ONLY reopen (no interim writable repair) to
+    /// exercise exactly the gap the audit flagged.
+    func testReadOnlyOpenOfDirtyContainerWithVerifyCRCsThrows() throws {
+        let path = tempPath()
+        let m = 4
+        var mmap: IndexMmap? = try VIndexContainerBuilder.createMinimalContainer(
+            path: path, format: .pq8, k_c: 1, m: m, d: 0, idCap: 16, payloadCap: 16, includeIDMap: false)
+        defer {
+            _ = try? FileManager.default.removeItem(atPath: path)
+            _ = try? FileManager.default.removeItem(atPath: path + ".wal")
+        }
+
+        let n = 3
+        let ids: [UInt64] = [10, 11, 12]
+        let codes = [UInt8](repeating: 7, count: n * m)
+        let res = try mmap!.mmap_append_begin(listID: 0, addLen: n)
+        try ids.withUnsafeBufferPointer { idBuf in
+            try codes.withUnsafeBufferPointer { codeBuf in
+                try mmap!.mmap_append_commit(res,
+                    idsSrc: UnsafeRawPointer(idBuf.baseAddress!),
+                    codesSrc: UnsafeRawPointer(codeBuf.baseAddress!),
+                    vecsSrc: nil)
+            }
+        }
+
+        // Simulate a crash: drop the handle WITHOUT close(), so flush() never runs and the WAL
+        // is left non-empty (dirty).
+        mmap!._abandonWithoutClose()
+        mmap = nil
+
+        var reopenOpts = MmapOpts(); reopenOpts.readOnly = true; reopenOpts.verifyCRCs = true
+        do {
+            _ = try IndexMmap.open(path: path, opts: reopenOpts)
+            XCTFail("Expected a read-only open of a dirty container with verifyCRCs=true to throw")
+        } catch let e as VectorIndexError {
+            // Reuses .corruptedData (Data Integrity family): the same kind this file already
+            // throws for "read-only handle, CRC verification can't be trusted" (see the
+            // ListsDesc-mismatch branch in indexInit()) rather than adding a new IndexErrorKind
+            // case, since this task's change surface is scoped to VIndexMmap.swift +
+            // VIndexMmapErrorTests.swift only.
+            XCTAssertEqual(e.kind, .corruptedData)
+            XCTAssertTrue(e.message.lowercased().contains("writable") || e.message.lowercased().contains("repair"),
+                "error should direct the caller toward a writable open to repair the container")
+        }
+    }
+
     // MARK: - P5: ranged page-aligned msync + per-commit flush accounting
 
     /// Failing-first test for P5: `msyncPageAligned` must honor its `ptr`/`length` parameters

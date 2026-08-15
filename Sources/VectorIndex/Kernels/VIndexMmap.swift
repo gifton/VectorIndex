@@ -583,6 +583,22 @@ internal final class IndexMmap {
         // repairs them (done below, after the WAL fd is opened). Computed once, up front, so
         // both the strict-verification gate below and the later repair branch agree.
         let walDirty = walIsNonEmpty()
+        // Task 16a (audit finding): a read-only handle never opens a WAL fd (see the
+        // `!opts.readOnly` guard below), so it can never run the replay+recompute repair that a
+        // writable open performs for a dirty container. Before this guard, a dirty container
+        // opened read-only fell through the `!walDirty` clause of the strict-verification gate
+        // just below and got NEITHER verification NOR repair -- `opts.verifyCRCs = true` silently
+        // became a no-op instead of the loud failure a caller asking for verification expects.
+        // Fail loud here instead: a read-only caller that explicitly wants CRC verification on a
+        // container this handle cannot currently trust (and cannot repair) must be told so, with
+        // a clear path forward (reopen writable to repair). A read-only caller that opted OUT of
+        // verification (`verifyCRCs = false`) is unaffected -- it explicitly accepted this risk.
+        if opts.readOnly && walDirty && opts.verifyCRCs {
+            throw ErrorBuilder(.corruptedData, operation: "vindex_init")
+                .message("Container is unclean (crash-dirty WAL) and cannot be CRC-verified read-only; open writable to replay the WAL and repair the container, or pass verifyCRCs=false to accept the risk")
+                .info("wal_path", walPath)
+                .build()
+        }
         // Parse TOC as packed entries (36 bytes each)
         let DISK_TOC_ENTRY_SIZE = 36
         let tocRaw = UnsafeRawPointer(base).advanced(by: Int(toHost(header.toc_offset, fileEndian: fileEndian)))
